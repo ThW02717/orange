@@ -1,5 +1,6 @@
 .section .text.boot
 .global _start
+.global secondary_start
 
 _start:
     la sp, _stack_top
@@ -18,3 +19,11 @@ bss_done:
 loop:
     wfi
     j loop
+
+secondary_start:
+    mv sp, a1
+    call secondary_main
+
+secondary_loop:
+    wfi
+    j secondary_loop

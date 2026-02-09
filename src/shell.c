@@ -101,6 +101,11 @@ static void print_info(void) {
     unsigned long impl_id = (unsigned long)sbi_get_impl_id();
     unsigned long impl_ver = (unsigned long)sbi_get_impl_version();
     unsigned long mimpid = (unsigned long)sbi_get_mimpid();
+    unsigned long spec_major = (spec >> 24) & 0x7fUL;
+    unsigned long spec_minor = spec & 0x00ffffffUL;
+    unsigned long impl_major = (impl_ver >> 16) & 0xffUL;
+    unsigned long impl_minor = (impl_ver >> 8) & 0xffUL;
+    unsigned long impl_patch = impl_ver & 0xffUL;
 
     uart_send_string("core id: ");
     uart_send_dec(g_hartid);
@@ -112,6 +117,11 @@ static void print_info(void) {
 
     uart_send_string("sbi spec: ");
     uart_send_hex(spec);
+    uart_send_string(" (");
+    uart_send_dec(spec_major);
+    uart_send_string(".");
+    uart_send_dec(spec_minor);
+    uart_send_string(")");
     uart_send_string("\n");
 
     uart_send_string("sbi impl id: ");
@@ -120,11 +130,56 @@ static void print_info(void) {
 
     uart_send_string("sbi impl version: ");
     uart_send_hex(impl_ver);
+    uart_send_string(" (");
+    uart_send_dec(impl_major);
+    uart_send_string(".");
+    uart_send_dec(impl_minor);
+    uart_send_string(".");
+    uart_send_dec(impl_patch);
+    uart_send_string(", decoded)");
     uart_send_string("\n");
 
     uart_send_string("mimpid: ");
     uart_send_hex(mimpid);
     uart_send_string("\n");
+}
+
+static const char* hsm_state_name(long st) {
+    switch (st) {
+        case SBI_HSM_STATE_STARTED: return "started";
+        case SBI_HSM_STATE_STOPPED: return "stopped";
+        case SBI_HSM_STATE_START_PENDING: return "start_pending";
+        case SBI_HSM_STATE_STOP_PENDING: return "stop_pending";
+        case SBI_HSM_STATE_SUSPENDED: return "suspended";
+        case SBI_HSM_STATE_SUSPEND_PENDING: return "suspend_pending";
+        case SBI_HSM_STATE_RESUME_PENDING: return "resume_pending";
+        default: return "unknown";
+    }
+}
+
+static void print_cores(void) {
+    unsigned long core;
+    long hsm = sbi_probe_extension(SBI_EXT_HSM);
+    uart_send_string("sbi hsm support: ");
+    uart_send_hex((unsigned long)hsm);
+    uart_send_string("\n");
+
+    for (core = 0; core < 8; core++) {
+        long st = sbi_hart_get_status(core);
+        uart_send_string("core ");
+        uart_send_dec(core);
+        uart_send_string(": ");
+        if (st < 0) {
+            uart_send_string("err=");
+            uart_send_hex((unsigned long)st);
+        } else {
+            uart_send_string(hsm_state_name(st));
+            uart_send_string(" (");
+            uart_send_hex((unsigned long)st);
+            uart_send_string(")");
+        }
+        uart_send_string("\n");
+    }
 }
 
 void processCommand(shell_t* shell) {
@@ -137,7 +192,7 @@ void processCommand(shell_t* shell) {
         uart_send_string("  help   - Show this message\n");
         uart_send_string("  hello  - Print Hello World!\n");
         uart_send_string("  info   - Print core and SBI info\n");
-        uart_send_string("  reboot - Reboot board via SBI legacy call\n");
+        uart_send_string("  cores  - Show HSM status for core 0..7\n");
         return;
     }
 
@@ -151,16 +206,8 @@ void processCommand(shell_t* shell) {
         return;
     }
 
-    if (streq(shell->command, "reboot")) {
-        long has_srst = sbi_probe_extension(0x53525354);
-        if (has_srst <= 0) {
-            uart_send_string("reboot not supported by current SBI, skip.\n");
-            return;
-        }
-
-        uart_send_string("Rebooting...\n");
-        sbi_system_reboot();
-        uart_send_string("reboot request returned unexpectedly.\n");
+    if (streq(shell->command, "cores")) {
+        print_cores();
         return;
     }
 
