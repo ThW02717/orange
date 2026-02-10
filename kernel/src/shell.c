@@ -3,13 +3,22 @@
 #include "uart.h"
 #include "string.h"
 #include "sbi.h"
+#include "fdt.h"
+#include "cpio.h"
 
 static unsigned long g_hartid = 0;
 static unsigned long g_dtb = 0;
+static uint64_t g_initrd_start = 0;
+static uint64_t g_initrd_end = 0;
 
 void shell_set_context(unsigned long hartid, unsigned long dtb_addr) {
     g_hartid = hartid;
     g_dtb = dtb_addr;
+    g_initrd_start = 0;
+    g_initrd_end = 0;
+    if (g_dtb != 0) {
+        fdt_get_initrd_range((const void *)g_dtb, &g_initrd_start, &g_initrd_end);
+    }
 }
 
 static int is_space(char c) {
@@ -106,6 +115,13 @@ static void print_info(void) {
     unsigned long impl_major = (impl_ver >> 16) & 0xffUL;
     unsigned long impl_minor = (impl_ver >> 8) & 0xffUL;
     unsigned long impl_patch = impl_ver & 0xffUL;
+    uint64_t mem_base = 0;
+    uint64_t mem_size = 0;
+    int mem_ok = -1;
+
+    if (g_dtb != 0) {
+        mem_ok = fdt_get_memory_region((const void *)g_dtb, &mem_base, &mem_size);
+    }
 
     uart_send_string("core id: ");
     uart_send_dec(g_hartid);
@@ -113,6 +129,30 @@ static void print_info(void) {
 
     uart_send_string("dtb addr: ");
     uart_send_hex(g_dtb);
+    uart_send_string("\n");
+
+    uart_send_string("initrd: ");
+    if (g_initrd_start != 0 && g_initrd_end > g_initrd_start) {
+        uart_send_string("start=");
+        uart_send_hex((unsigned long)g_initrd_start);
+        uart_send_string(" end=");
+        uart_send_hex((unsigned long)g_initrd_end);
+        uart_send_string(" size=");
+        uart_send_hex((unsigned long)(g_initrd_end - g_initrd_start));
+    } else {
+        uart_send_string("none");
+    }
+    uart_send_string("\n");
+
+    uart_send_string("memory: ");
+    if (mem_ok == 0) {
+        uart_send_string("base=");
+        uart_send_hex((unsigned long)mem_base);
+        uart_send_string(" size=");
+        uart_send_hex((unsigned long)mem_size);
+    } else {
+        uart_send_string("unknown");
+    }
     uart_send_string("\n");
 
     uart_send_string("sbi spec: ");
@@ -182,37 +222,173 @@ static void print_cores(void) {
     }
 }
 
+static void split_first_arg(char *line, char **cmd, char **arg) {
+    char *p = line;
+    while (is_space(*p)) {
+        p++;
+    }
+    *cmd = p;
+    while (*p != '\0' && !is_space(*p)) {
+        p++;
+    }
+    if (*p != '\0') {
+        *p++ = '\0';
+    }
+    while (is_space(*p)) {
+        p++;
+    }
+    *arg = (*p == '\0') ? 0 : p;
+}
+
+static void uart_send_bytes(const uint8_t *data, unsigned long size) {
+    unsigned long i;
+    for (i = 0; i < size; i++) {
+        char c = (char)data[i];
+        if (c == '\n') {
+            uart_send('\r');
+        }
+        uart_send(c);
+    }
+}
+
+struct ls_ctx {
+    unsigned int count;
+};
+
+static void ls_cb(const char *name, const void *data, unsigned long size,
+                  unsigned int mode, void *ctx) {
+    struct ls_ctx *st = (struct ls_ctx *)ctx;
+    unsigned int type = mode & 0170000U;
+    const char *print_name = name;
+    (void)data;
+
+    if (name[0] == '.' && name[1] == '/' && name[2] != '\0') {
+        print_name = name + 2;
+    }
+
+    uart_send_dec(size);
+    uart_send_string(" ");
+    uart_send_string(print_name);
+    if (type == 0040000U && !(print_name[0] == '.' && print_name[1] == '\0')) {
+        uart_send_string("/");
+    }
+    uart_send_string("\n");
+    st->count++;
+}
+
+static void cmd_ls(void) {
+    struct ls_ctx st;
+    st.count = 0;
+    if (g_initrd_start == 0 || g_initrd_end <= g_initrd_start) {
+        uart_send_string("initrd not available\n");
+        return;
+    }
+    if (cpio_iterate((const void *)g_initrd_start, (const void *)g_initrd_end,
+                     ls_cb, &st) != 0) {
+        uart_send_string("cpio parse error\n");
+        return;
+    }
+    uart_send_string("Total ");
+    uart_send_dec(st.count);
+    uart_send_string(" files.\n");
+}
+
+static void cmd_cat(const char *arg) {
+    const void *data = 0;
+    unsigned long size = 0;
+    unsigned int mode = 0;
+    char alt[128];
+
+    if (g_initrd_start == 0 || g_initrd_end <= g_initrd_start) {
+        uart_send_string("initrd not available\n");
+        return;
+    }
+    if (arg == 0 || arg[0] == '\0') {
+        uart_send_string("usage: cat <file>\n");
+        return;
+    }
+
+    if (cpio_find((const void *)g_initrd_start, (const void *)g_initrd_end,
+                  arg, &data, &size, &mode) != 0) {
+        if (arg[0] != '.' || arg[1] != '/') {
+            unsigned int i = 0;
+            unsigned int j = 0;
+            alt[i++] = '.';
+            alt[i++] = '/';
+            while (arg[j] != '\0' && i + 1 < sizeof(alt)) {
+                alt[i++] = arg[j++];
+            }
+            alt[i] = '\0';
+            if (cpio_find((const void *)g_initrd_start, (const void *)g_initrd_end,
+                          alt, &data, &size, &mode) != 0) {
+                uart_send_string("file not found\n");
+                return;
+            }
+        } else {
+            uart_send_string("file not found\n");
+            return;
+        }
+    }
+
+    if ((mode & 0170000U) == 0040000U) {
+        uart_send_string("is a directory\n");
+        return;
+    }
+
+    uart_send_bytes((const uint8_t *)data, size);
+    if (size == 0 || ((const uint8_t *)data)[size - 1] != '\n') {
+        uart_send_string("\n");
+    }
+}
+
 void processCommand(shell_t* shell) {
+    char *cmd;
+    char *arg;
+
     if (shell->command[0] == '\0') {
         return;
     }
 
-    if (streq(shell->command, "help")) {
+    split_first_arg(shell->command, &cmd, &arg);
+
+    if (streq(cmd, "help")) {
         uart_send_string("Available commands:\n");
         uart_send_string("  help   - Show this message\n");
         uart_send_string("  hello  - Print Hello World!\n");
         uart_send_string("  info   - Print core and SBI info\n");
         uart_send_string("  cores  - Show HSM status for core 0..7\n");
+        uart_send_string("  ls     - List initrd files\n");
+        uart_send_string("  cat    - Show initrd file content\n");
         return;
     }
 
-    if (streq(shell->command, "hello")) {
+    if (streq(cmd, "hello")) {
         uart_send_string("Hello World!\n");
         return;
     }
 
-    if (streq(shell->command, "info")) {
+    if (streq(cmd, "info")) {
         print_info();
         return;
     }
 
-    if (streq(shell->command, "cores")) {
+    if (streq(cmd, "cores")) {
         print_cores();
         return;
     }
 
+    if (streq(cmd, "ls")) {
+        cmd_ls();
+        return;
+    }
+
+    if (streq(cmd, "cat")) {
+        cmd_cat(arg);
+        return;
+    }
+
     uart_send_string("Unknown command: ");
-    uart_send_string(shell->command);
+    uart_send_string(cmd);
     uart_send_string("\n");
 
 

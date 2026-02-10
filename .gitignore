@@ -1,0 +1,11 @@
+bootloader/build/
+bootloader/*.elf
+bootloader/*.bin
+bootloader/*.fit
+kernel/build/
+kernel/*.elf
+kernel/*.bin
+kernel/*.fit
+initramfs.cpio
+kernel/initramfs.cpio
+rootfs/
