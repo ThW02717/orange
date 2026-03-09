@@ -5,19 +5,43 @@
 #include "sbi.h"
 #include "fdt.h"
 #include "cpio.h"
+#include "memory.h"
 
 static unsigned long g_hartid = 0;
 static unsigned long g_dtb = 0;
 static uint64_t g_initrd_start = 0;
 static uint64_t g_initrd_end = 0;
+static uint64_t g_initrd_hint_start = 0;
+static uint64_t g_initrd_hint_end = 0;
 
-void shell_set_context(unsigned long hartid, unsigned long dtb_addr) {
+static int initrd_hint_valid(uint64_t start, uint64_t end) {
+    if (start == 0 || end <= start) {
+        return 0;
+    }
+    if ((end - start) > (256UL * 1024UL * 1024UL)) {
+        return 0;
+    }
+    return 1;
+}
+
+void shell_set_context(unsigned long hartid, unsigned long dtb_addr,
+                       uint64_t initrd_start_hint, uint64_t initrd_end_hint) {
     g_hartid = hartid;
     g_dtb = dtb_addr;
+    g_initrd_hint_start = initrd_start_hint;
+    g_initrd_hint_end = initrd_end_hint;
     g_initrd_start = 0;
     g_initrd_end = 0;
     if (g_dtb != 0) {
-        fdt_get_initrd_range((const void *)g_dtb, &g_initrd_start, &g_initrd_end);
+        if (fdt_get_initrd_range((const void *)g_dtb, &g_initrd_start, &g_initrd_end) != 0) {
+            g_initrd_start = 0;
+            g_initrd_end = 0;
+        }
+    }
+    if ((g_initrd_start == 0 || g_initrd_end <= g_initrd_start) &&
+        initrd_hint_valid(g_initrd_hint_start, g_initrd_hint_end)) {
+        g_initrd_start = g_initrd_hint_start;
+        g_initrd_end = g_initrd_hint_end;
     }
 }
 
@@ -115,12 +139,19 @@ static void print_info(void) {
     unsigned long impl_major = (impl_ver >> 16) & 0xffUL;
     unsigned long impl_minor = (impl_ver >> 8) & 0xffUL;
     unsigned long impl_patch = impl_ver & 0xffUL;
-    uint64_t mem_base = 0;
-    uint64_t mem_size = 0;
-    int mem_ok = -1;
+    struct fdt_mem_region mem_regions[FDT_MAX_MEM_REGIONS];
+    uint64_t mem_total = 0;
+    int mem_count = 0;
+    int i;
 
     if (g_dtb != 0) {
-        mem_ok = fdt_get_memory_region((const void *)g_dtb, &mem_base, &mem_size);
+        mem_count = fdt_get_memory_regions((const void *)g_dtb, mem_regions, FDT_MAX_MEM_REGIONS);
+        if (mem_count < 0) {
+            mem_count = 0;
+        }
+        for (i = 0; i < mem_count; i++) {
+            mem_total += mem_regions[i].size;
+        }
     }
 
     uart_send_string("core id: ");
@@ -145,15 +176,24 @@ static void print_info(void) {
     uart_send_string("\n");
 
     uart_send_string("memory: ");
-    if (mem_ok == 0) {
-        uart_send_string("base=");
-        uart_send_hex((unsigned long)mem_base);
-        uart_send_string(" size=");
-        uart_send_hex((unsigned long)mem_size);
+    if (mem_count > 0) {
+        uart_send_string("regions=");
+        uart_send_dec((unsigned long)mem_count);
+        uart_send_string(" total=");
+        uart_send_hex((unsigned long)mem_total);
     } else {
         uart_send_string("unknown");
     }
     uart_send_string("\n");
+    for (i = 0; i < mem_count; i++) {
+        uart_send_string("memory[");
+        uart_send_dec((unsigned long)i);
+        uart_send_string("]: base=");
+        uart_send_hex((unsigned long)mem_regions[i].base);
+        uart_send_string(" size=");
+        uart_send_hex((unsigned long)mem_regions[i].size);
+        uart_send_string("\n");
+    }
 
     uart_send_string("sbi spec: ");
     uart_send_hex(spec);
@@ -341,6 +381,27 @@ static void cmd_cat(const char *arg) {
     }
 }
 
+static void cmd_allocdemo(void) {
+    void *p1;
+    void *p2;
+    void *k1;
+    void *k2;
+
+    uart_send_string("allocator demo start\n");
+
+    p1 = p_alloc(1);
+    p2 = p_alloc(3);
+    p_free(p1);
+    p_free(p2);
+
+    k1 = kmalloc(80);
+    k2 = kmalloc(3000);
+    kfree(k1);
+    kfree(k2);
+
+    uart_send_string("allocator demo done\n");
+}
+
 void processCommand(shell_t* shell) {
     char *cmd;
     char *arg;
@@ -359,6 +420,7 @@ void processCommand(shell_t* shell) {
         uart_send_string("  cores  - Show HSM status for core 0..7\n");
         uart_send_string("  ls     - List initrd files\n");
         uart_send_string("  cat    - Show initrd file content\n");
+        uart_send_string("  allocdemo - Run allocator demo\n");
         return;
     }
 
@@ -384,6 +446,11 @@ void processCommand(shell_t* shell) {
 
     if (streq(cmd, "cat")) {
         cmd_cat(arg);
+        return;
+    }
+
+    if (streq(cmd, "allocdemo")) {
+        cmd_allocdemo();
         return;
     }
 

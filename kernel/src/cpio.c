@@ -2,7 +2,7 @@
 #include "cpio.h"
 
 #define CPIO_NEWC_MAGIC "070701"
-
+// new ASCII format
 struct cpio_newc_header {
     char c_magic[6];
     char c_ino[8];
@@ -19,7 +19,7 @@ struct cpio_newc_header {
     char c_namesize[8];
     char c_check[8];
 };
-
+// static: only this c file can use
 static unsigned int hex_to_u32(const char *s) {
     unsigned int v = 0;
     unsigned int i;
@@ -55,8 +55,8 @@ static int str_eq(const char *a, const char *b) {
 }
 
 int cpio_iterate(const void *start, const void *end, cpio_iter_fn fn, void *ctx) {
-    const uint8_t *cur = (const uint8_t *)start;
-    const uint8_t *limit = end ? (const uint8_t *)end : 0;
+    const uint8_t *cur = (const uint8_t *)start; // at start
+    const uint8_t *limit = end ? (const uint8_t *)end : 0; // set end
 
     if (start == 0 || fn == 0) {
         return -1;
@@ -85,7 +85,7 @@ int cpio_iterate(const void *start, const void *end, cpio_iter_fn fn, void *ctx)
         namesz = hex_to_u32(hdr->c_namesize);
         filesz = hex_to_u32(hdr->c_filesize);
         mode = hex_to_u32(hdr->c_mode);
-
+        // after header is name
         name = (const char *)(cur + sizeof(*hdr));
         if (limit && (const uint8_t *)(name + namesz) > limit) {
             return -1;
@@ -98,8 +98,10 @@ int cpio_iterate(const void *start, const void *end, cpio_iter_fn fn, void *ctx)
         if (str_eq(name, "TRAILER!!!")) {
             return 0;
         }
-
+        // The byte we skip
         name_pad = align4(sizeof(*hdr) + namesz) - (unsigned int)(sizeof(*hdr) + namesz);
+
+        // data
         data = (const uint8_t *)(name + namesz + name_pad);
         if (limit && data > limit) {
             return -1;

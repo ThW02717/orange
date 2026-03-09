@@ -3,6 +3,7 @@
 #include "uart.h" 
 #include "shell.h"
 #include "sbi.h"
+#include "memory.h"
 
 static volatile unsigned long bootstrap_hart = ~0UL;
 static volatile unsigned int greet_ticket = 0;
@@ -39,7 +40,8 @@ void secondary_main(unsigned long hartid) {
     }
 }
 
-void kernel_main(unsigned long hartid, unsigned long dtb_addr) {
+void kernel_main(unsigned long hartid, unsigned long dtb_addr,
+                 unsigned long initrd_start_hint, unsigned long initrd_end_hint) {
     unsigned int stack_slot = 0;
     unsigned long target_hart;
 
@@ -54,7 +56,8 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr) {
     }
 
     /* Keep bootloader UART state first to avoid serial regressions. */
-    shell_set_context(hartid, dtb_addr);
+    shell_set_context(hartid, dtb_addr, (uint64_t)initrd_start_hint, (uint64_t)initrd_end_hint);
+    memory_init((const void *)dtb_addr, (uint64_t)initrd_start_hint, (uint64_t)initrd_end_hint);
 
     for (target_hart = 0; target_hart < MAX_CORES; target_hart++) {
         long ret;
