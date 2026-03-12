@@ -13,6 +13,8 @@
 // malloc small and large
 #define KMALLOC_TAG_SMALL 0x4D53U
 #define KMALLOC_TAG_LARGE 0x4D4CU
+#define SLAB_MAGIC       0x534C4142U // "SLAB"
+#define KMALLOC_MAX_SLAB_SIZE 2048U
 // TODO
 // kmalloc_header remove
 // Slab Reclamation
@@ -30,6 +32,19 @@ struct reserve_range {
     uint64_t start;
     uint64_t end;
 };
+
+enum page_kind {
+    PAGE_KIND_NONE = 0,
+    PAGE_KIND_SLAB,
+    PAGE_KIND_LARGE,
+};
+
+enum slab_state {
+    SLAB_EMPTY = 0,
+    SLAB_PARTIAL,
+    SLAB_FULL,
+};
+
 // TODO Modify: store what's the byte
 struct kmalloc_header {
     uint16_t tag;
@@ -40,6 +55,38 @@ struct kmalloc_header {
 struct kmalloc_free_chunk {
     struct kmalloc_free_chunk *next;
 };
+
+struct slab_header;
+// Slab page doubly linked list in kmem_cache
+struct slab_link {
+    struct slab_header *prev;
+    struct slab_header *next;
+    
+};
+
+
+// manage diffrernt size object
+struct kmem_cache {
+    unsigned int class_idx; // Size class
+    unsigned int obj_size;  // Object size
+    unsigned int obj_align; // Object alignment
+    unsigned int obj_stride;
+    struct slab_header *slabs_partial;
+    struct slab_header *slabs_full;
+    struct slab_header *slabs_empty;
+};
+struct slab_header {
+    struct slab_link link;
+    struct kmem_cache *cache;
+    void *freelist; // Head of free objects inside this slab page
+    unsigned int inuse; // allocated object
+    unsigned int capacity;
+    enum slab_state state; // partial, full or empty
+    unsigned int magic;
+};
+
+
+
 // RAM region
 static struct mem_region_info g_regions[FDT_MAX_MEM_REGIONS];
 static unsigned int g_region_count = 0;
@@ -55,16 +102,25 @@ static int g_startup_ready = 0;
 static int16_t *g_frame_state = 0; // VAL/F/X
 static int32_t *g_free_next = 0;
 static int32_t g_free_lists[MEMORY_BUDDY_MAX_ORDER + 1];
+static enum page_kind *g_page_kind = 0;
 // is buddy +kmalloc  ok
 static int g_memory_ready = 0;
 
 // slab allocate thing
-static const uint16_t g_kmalloc_classes[] = { 32U, 64U, 128U, 256U, 512U, 1024U, 2048U };
-#define KMALLOC_CLASS_COUNT ((unsigned int)(sizeof(g_kmalloc_classes) / sizeof(g_kmalloc_classes[0]))) // avoid hardcore 7
+// kmem_cache for each class
+
+static const uint16_t g_kmalloc_classes[] = { 16U, 32U, 64U, 128U, 256U, 512U, 1024U, 2048U };
+#define KMALLOC_CLASS_COUNT ((unsigned int)(sizeof(g_kmalloc_classes) / sizeof(g_kmalloc_classes[0])))
+static struct kmem_cache g_kmem_caches[KMALLOC_CLASS_COUNT];
 static struct kmalloc_free_chunk *g_kmalloc_freelist[KMALLOC_CLASS_COUNT];
 // Linker
 extern char _phys_start;
 extern char _phys_end;
+
+/////////////////////////////////////////////////* HELPER FUNCTION*/////////////////////////////////////////////
+
+
+
 // Is initrd good?
 static int initrd_hint_valid(uint64_t start, uint64_t end) {
     if (start == 0 || end <= start) {
@@ -109,6 +165,186 @@ static int is_alloc_head_tag(int16_t tag) {
 static unsigned int order_from_alloc_tag(int16_t tag) {
     return (unsigned int)(FRAME_ALLOC_BASE - tag);
 }
+
+/*Slab page list helper*/
+static void cache_add_partial(struct kmem_cache *cache, struct slab_header *slab) {
+    if (cache == 0 || slab == 0) {
+        return;
+    }
+
+    slab->cache = cache;
+    slab->state = SLAB_PARTIAL;
+    slab->link.prev = 0;
+    slab->link.next = cache->slabs_partial;
+    if (cache->slabs_partial != 0) {
+        cache->slabs_partial->link.prev = slab;
+    }
+    cache->slabs_partial = slab;
+}
+static void cache_add_full(struct kmem_cache *cache, struct slab_header *slab) {
+    if (cache == 0 || slab == 0) {
+        return;
+    }
+
+    slab->cache = cache;
+    slab->state = SLAB_FULL;
+    slab->link.prev = 0;
+    slab->link.next = cache->slabs_full;
+    if (cache->slabs_full != 0) {
+        cache->slabs_full->link.prev = slab;
+    }
+    cache->slabs_full = slab;
+}
+static void cache_remove_slab(struct slab_header *slab) {
+    struct kmem_cache *cache;
+
+    if (slab == 0 || slab->cache == 0) {
+        return;
+    }
+    // which size cache
+    cache = slab->cache;
+
+    if (slab->link.prev != 0) {
+        slab->link.prev->link.next = slab->link.next;
+    } else {
+        if (slab->state == SLAB_PARTIAL) {
+            cache->slabs_partial = slab->link.next;
+        } else if (slab->state == SLAB_FULL) {
+            cache->slabs_full = slab->link.next;
+        } else {
+            cache->slabs_empty = slab->link.next;
+        }
+    }
+
+    if (slab->link.next != 0) {
+        slab->link.next->link.prev = slab->link.prev;
+    }
+
+    slab->link.prev = 0;
+    slab->link.next = 0;
+}
+
+static void cache_move_partial_to_full(struct kmem_cache *cache, struct slab_header *slab) {
+    if (cache == 0 || slab == 0) {
+        return;
+    }
+
+    cache_remove_slab(slab);
+    cache_add_full(cache, slab);
+}
+
+static void cache_move_full_to_partial(struct kmem_cache *cache, struct slab_header *slab) {
+    if (cache == 0 || slab == 0) {
+        return;
+    }
+
+    cache_remove_slab(slab);
+    cache_add_partial(cache, slab);
+}
+
+/*object  list helper*/
+static void slab_push_free(struct slab_header *slab, void *obj) {
+    struct kmalloc_free_chunk *chunk;
+
+    if (slab == 0 || obj == 0) {
+        return;
+    }
+
+    chunk = (struct kmalloc_free_chunk *)obj;
+    chunk->next = (struct kmalloc_free_chunk *)slab->freelist;
+    slab->freelist = obj;
+}
+
+static void *slab_pop_free(struct slab_header *slab) {
+    struct kmalloc_free_chunk *chunk;
+
+    if (slab == 0 || slab->freelist == 0) {
+        return 0;
+    }
+
+    chunk = (struct kmalloc_free_chunk *)slab->freelist;
+    slab->freelist = chunk->next;
+    return (void *)chunk;
+}
+
+static int size_to_class(unsigned long size) {
+    unsigned int i;
+
+    if (size == 0 || size > KMALLOC_MAX_SLAB_SIZE) {
+        return -1;
+    }
+
+    for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
+        if (size <= (unsigned long)g_kmalloc_classes[i]) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static unsigned int class_to_size(unsigned int class_idx) {
+    if (class_idx >= KMALLOC_CLASS_COUNT) {
+        return 0;
+    }
+    return (unsigned int)g_kmalloc_classes[class_idx];
+}
+
+static unsigned int slab_calc_stride(unsigned int obj_size, unsigned int align) {
+    if (obj_size == 0) {
+        return 0;
+    }
+    if (align == 0) {
+        align = 1;
+    }
+    return (unsigned int)align_up_u64((uint64_t)obj_size, (uint64_t)align);
+}
+
+static void *slab_object_start(void *page_base, struct kmem_cache *cache) {
+    uint64_t base;
+    uint64_t start;
+
+    if (page_base == 0 || cache == 0) {
+        return 0;
+    }
+
+    base = (uint64_t)(uintptr_t)page_base;
+    start = align_up_u64(base + sizeof(struct slab_header), (uint64_t)cache->obj_align);
+    return (void *)(uintptr_t)start;
+}
+
+static unsigned int slab_calc_capacity(void *page_base, struct kmem_cache *cache) {
+    uint64_t base;
+    uint64_t start;
+    uint64_t usable;
+
+    if (page_base == 0 || cache == 0 || cache->obj_stride == 0) {
+        return 0;
+    }
+
+    base = (uint64_t)(uintptr_t)page_base;
+    start = (uint64_t)(uintptr_t)slab_object_start(page_base, cache);
+    if (start < base || start >= (base + PAGE_SIZE)) {
+        return 0;
+    }
+
+    usable = (base + PAGE_SIZE) - start;
+    return (unsigned int)(usable / (uint64_t)cache->obj_stride);
+}
+
+static enum page_kind page_kind_get(uint64_t idx) {
+    if (idx >= g_total_pages || g_page_kind == 0) {
+        return PAGE_KIND_NONE;
+    }
+    return g_page_kind[idx];
+}
+
+static void page_kind_set(uint64_t idx, enum page_kind kind) {
+    if (idx >= g_total_pages || g_page_kind == 0) {
+        return;
+    }
+    g_page_kind[idx] = kind;
+}
+
 // Enclosure babbaa
 void memory_reserve(uint64_t start, uint64_t size) {
     uint64_t end;
@@ -388,8 +624,9 @@ static int buddy_setup_metadata(void) {
     uint64_t state_bytes = g_total_pages * sizeof(int16_t);
     // Freelist size : page index
     uint64_t next_bytes = g_total_pages * sizeof(int32_t);
+    uint64_t kind_bytes = g_total_pages * sizeof(enum page_kind);
     uint64_t i;
-
+    // for buddy allocator
     g_frame_state = (int16_t *)startup_alloc(state_bytes, 8U);
     if (g_frame_state == 0) {
         return -1;
@@ -398,10 +635,16 @@ static int buddy_setup_metadata(void) {
     if (g_free_next == 0) {
         return -1;
     }
+    // for slab allocator reclaim
+    g_page_kind = (enum page_kind *)startup_alloc(kind_bytes, 8U);
+    if (g_page_kind == 0) {
+        return -1;
+    }
     // Default for safety
     for (i = 0; i < g_total_pages; i++) {
         g_frame_state[i] = FRAME_USED;
         g_free_next[i] = -1;
+        g_page_kind[i] = PAGE_KIND_NONE;
     }
     // Default
     for (i = 0; i <= MEMORY_BUDDY_MAX_ORDER; i++) {
@@ -468,7 +711,7 @@ void *p_alloc(unsigned int pages) {
         return 0;
     }
     // pop the pages we need
-    idx32 = freelist_pop(cur_order);
+    idx32 = freelist_pop(cur_order);kfree
     if (idx32 < 0) {
         return 0;
     }
@@ -812,6 +1055,13 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
     }
 
     for (i = 0; i < (int)KMALLOC_CLASS_COUNT; i++) {
+        g_kmem_caches[i].class_idx = (unsigned int)i;
+        g_kmem_caches[i].obj_size = (unsigned int)g_kmalloc_classes[i];
+        g_kmem_caches[i].obj_align = (unsigned int)g_kmalloc_classes[i];
+        g_kmem_caches[i].obj_stride = (unsigned int)g_kmalloc_classes[i];
+        g_kmem_caches[i].slabs_partial = 0;
+        g_kmem_caches[i].slabs_full = 0;
+        g_kmem_caches[i].slabs_empty = 0;
         g_kmalloc_freelist[i] = 0;
     }
 
