@@ -99,7 +99,7 @@ static uint64_t g_startup_end = 0;
 static int g_startup_ready = 0;
 // Buddy System thing
 // TODO listhead version
-static int16_t *g_frame_state = 0; // VAL/F/X
+static int16_t *g_frame_state = 0; // Buddy state only: VAL/F/X
 static int32_t *g_free_next = 0;
 static int32_t g_free_lists[MEMORY_BUDDY_MAX_ORDER + 1];
 static enum page_kind *g_page_kind = 0;
@@ -825,8 +825,13 @@ static int kmalloc_find_class(unsigned long size) {
 }
 
 static int kmalloc_refill_class(unsigned int class_idx) {
+    // request one page for slab
     void *page = p_alloc(1U);
+    struct kmem_cache *cache;
+    struct slab_header *slab;
+    void *obj_start;
     uint64_t base;
+    uint64_t page_idx;
     uint64_t chunks;
     uint64_t i;
     uint64_t chunk_size;
@@ -834,20 +839,42 @@ static int kmalloc_refill_class(unsigned int class_idx) {
     if (page == 0) {
         return -1;
     }
-
+    // Initialization for our new slab page. Buddy ownership/state stays in g_frame_state.
     base = (uint64_t)(uintptr_t)page;
-    chunk_size = (uint64_t)g_kmalloc_classes[class_idx];
-    chunks = PAGE_SIZE / chunk_size;
-    if (chunks == 0) {
+    if (pa_to_index(base, &page_idx, 0) != 0) {
+        p_free(page);
         return -1;
     }
+    page_kind_set(page_idx, PAGE_KIND_SLAB);
 
-    for (i = 0; i < chunks; i++) {
-        uint64_t caddr = base + i * chunk_size;
-        struct kmalloc_free_chunk *chunk = (struct kmalloc_free_chunk *)(uintptr_t)caddr;
-        chunk->next = g_kmalloc_freelist[class_idx];
-        g_kmalloc_freelist[class_idx] = chunk;
+    cache = &g_kmem_caches[class_idx];
+    slab = (struct slab_header *)page;
+    slab->link.prev = 0;
+    slab->link.next = 0;
+    slab->magic = SLAB_MAGIC;
+    slab->cache = cache;
+    slab->freelist = 0;
+    slab->inuse = 0;
+    slab->capacity = slab_calc_capacity(page, cache);
+    slab->state = SLAB_PARTIAL;
+
+    obj_start = slab_object_start(page, cache);
+    chunk_size = (uint64_t)cache->obj_stride;
+    chunks = slab->capacity;
+    if (chunks == 0) {
+        page_kind_set(page_idx, PAGE_KIND_NONE);
+        p_free(page);
+        return -1;
     }
+    // Slide the page into many object
+    for (i = 0; i < chunks; i++) {
+        uint64_t caddr = (uint64_t)(uintptr_t)obj_start + i * chunk_size;
+        void *obj = (void *)(uintptr_t)caddr;
+        slab_push_free(slab, obj);
+    }
+    // Refill now populates per-slab freelist only; do not push objects into g_kmalloc_freelist.
+    // Link it to the kmem cache
+    cache_add_partial(cache, slab);
     return 0;
 }
 
@@ -1056,9 +1083,10 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
 
     for (i = 0; i < (int)KMALLOC_CLASS_COUNT; i++) {
         g_kmem_caches[i].class_idx = (unsigned int)i;
-        g_kmem_caches[i].obj_size = (unsigned int)g_kmalloc_classes[i];
-        g_kmem_caches[i].obj_align = (unsigned int)g_kmalloc_classes[i];
-        g_kmem_caches[i].obj_stride = (unsigned int)g_kmalloc_classes[i];
+        g_kmem_caches[i].obj_size = class_to_size((unsigned int)i);
+        g_kmem_caches[i].obj_align = g_kmem_caches[i].obj_size;
+        g_kmem_caches[i].obj_stride =
+            slab_calc_stride(g_kmem_caches[i].obj_size, g_kmem_caches[i].obj_align);
         g_kmem_caches[i].slabs_partial = 0;
         g_kmem_caches[i].slabs_full = 0;
         g_kmem_caches[i].slabs_empty = 0;
