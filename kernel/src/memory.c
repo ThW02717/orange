@@ -10,13 +10,12 @@
 #define FRAME_BUDDY ((int16_t)-1)
 #define FRAME_USED  ((int16_t)-2)
 #define FRAME_ALLOC_BASE ((int16_t)-100)
-// malloc small and large
-#define KMALLOC_TAG_SMALL 0x4D53U
-#define KMALLOC_TAG_LARGE 0x4D4CU
 #define SLAB_MAGIC       0x534C4142U // "SLAB"
 #define KMALLOC_MAX_SLAB_SIZE 2048U
+#define KMEM_CACHE_EMPTY_LIMIT 1U
+#define POISON_FREE_OBJECT 0xAAU
+#define POISON_RECLAIM_PAGE 0xCCU
 // TODO
-// kmalloc_header remove
 // Slab Reclamation
 // Thread-Safe / Interrupt-Safe
 
@@ -44,13 +43,6 @@ enum slab_state {
     SLAB_PARTIAL,
     SLAB_FULL,
 };
-
-// TODO Modify: store what's the byte
-struct kmalloc_header {
-    uint16_t tag;
-    uint16_t class_idx;
-    uint32_t pages;
-};
 // Intrusive linked list
 struct kmalloc_free_chunk {
     struct kmalloc_free_chunk *next;
@@ -71,6 +63,7 @@ struct kmem_cache {
     unsigned int obj_size;  // Object size
     unsigned int obj_align; // Object alignment
     unsigned int obj_stride;
+    unsigned int empty_count;
     struct slab_header *slabs_partial;
     struct slab_header *slabs_full;
     struct slab_header *slabs_empty;
@@ -105,6 +98,11 @@ static int32_t g_free_lists[MEMORY_BUDDY_MAX_ORDER + 1];
 static enum page_kind *g_page_kind = 0;
 // is buddy +kmalloc  ok
 static int g_memory_ready = 0;
+static uint64_t g_page_alloc_count = 0;
+static uint64_t g_page_free_count = 0;
+static uint64_t g_object_alloc_count = 0;
+static uint64_t g_object_free_count = 0;
+static uint64_t g_slab_reclaim_count = 0;
 
 // slab allocate thing
 // kmem_cache for each class
@@ -112,7 +110,6 @@ static int g_memory_ready = 0;
 static const uint16_t g_kmalloc_classes[] = { 16U, 32U, 64U, 128U, 256U, 512U, 1024U, 2048U };
 #define KMALLOC_CLASS_COUNT ((unsigned int)(sizeof(g_kmalloc_classes) / sizeof(g_kmalloc_classes[0])))
 static struct kmem_cache g_kmem_caches[KMALLOC_CLASS_COUNT];
-static struct kmalloc_free_chunk *g_kmalloc_freelist[KMALLOC_CLASS_COUNT];
 // Linker
 extern char _phys_start;
 extern char _phys_end;
@@ -153,6 +150,88 @@ static void log_hex_u64(uint64_t value) {
     uart_send_string("0x");
     uart_send_hex((unsigned long)value);
 }
+
+static void log_page_range(uint64_t start_idx, unsigned int order) {
+    uint64_t end_idx = start_idx + (1ULL << order) - 1ULL;
+
+    uart_send_string("[");
+    uart_send_dec((unsigned long)start_idx);
+    uart_send_string(", ");
+    uart_send_dec((unsigned long)end_idx);
+    uart_send_string("]");
+}
+
+static unsigned int slab_list_count(struct slab_header *head) {
+    unsigned int n = 0;
+    while (head != 0) {
+        n++;
+        head = head->link.next;
+    }
+    return n;
+}
+
+static unsigned int freelist_count_order(unsigned int order) {
+    unsigned int n = 0;
+    int32_t cur = g_free_lists[order];
+
+    while (cur >= 0) {
+        n++;
+        cur = g_free_next[(uint64_t)cur];
+    }
+    return n;
+}
+
+static void poison_memory(void *ptr, uint64_t size, uint8_t value) {
+    uint8_t *p = (uint8_t *)ptr;
+    uint64_t i;
+
+    if (ptr == 0) {
+        return;
+    }
+    for (i = 0; i < size; i++) {
+        p[i] = value;
+    }
+}
+
+static void slab_log_invariant_error(unsigned int class_idx, const char *list_name,
+                                     struct slab_header *slab, const char *reason) {
+    log_prefix();
+    uart_send_string("[Invariant] class ");
+    uart_send_dec(class_idx);
+    uart_send_string(" ");
+    uart_send_string(list_name);
+    uart_send_string(" slab ");
+    log_hex_u64((uint64_t)(uintptr_t)slab);
+    uart_send_string(": ");
+    uart_send_string(reason);
+    uart_send_string("\n");
+}
+
+static int slab_check_list_invariants(unsigned int class_idx, const char *list_name,
+                                      struct slab_header *head, enum slab_state expected_state) {
+    int ok = 1;
+
+    while (head != 0) {
+        if (head->state != expected_state) {
+            slab_log_invariant_error(class_idx, list_name, head, "state mismatch");
+            ok = 0;
+        }
+        if (expected_state == SLAB_PARTIAL && head->freelist == 0) {
+            slab_log_invariant_error(class_idx, list_name, head, "partial slab has empty freelist");
+            ok = 0;
+        }
+        if (expected_state == SLAB_FULL && head->inuse != head->capacity) {
+            slab_log_invariant_error(class_idx, list_name, head, "full slab inuse != capacity");
+            ok = 0;
+        }
+        if (expected_state == SLAB_EMPTY && head->inuse != 0) {
+            slab_log_invariant_error(class_idx, list_name, head, "empty slab inuse != 0");
+            ok = 0;
+        }
+        head = head->link.next;
+    }
+    return ok;
+}
 // Buddy Page account
 static int16_t alloc_tag_from_order(unsigned int order) {
     return (int16_t)(FRAME_ALLOC_BASE - (int16_t)order);
@@ -165,6 +244,8 @@ static int is_alloc_head_tag(int16_t tag) {
 static unsigned int order_from_alloc_tag(int16_t tag) {
     return (unsigned int)(FRAME_ALLOC_BASE - tag);
 }
+
+static int pa_to_index(uint64_t pa, uint64_t *idx_out, unsigned int *rid_out);
 
 /*Slab page list helper*/
 static void cache_add_partial(struct kmem_cache *cache, struct slab_header *slab) {
@@ -195,6 +276,23 @@ static void cache_add_full(struct kmem_cache *cache, struct slab_header *slab) {
     }
     cache->slabs_full = slab;
 }
+
+static void cache_add_empty(struct kmem_cache *cache, struct slab_header *slab) {
+    if (cache == 0 || slab == 0) {
+        return;
+    }
+
+    slab->cache = cache;
+    slab->state = SLAB_EMPTY;
+    slab->link.prev = 0;
+    slab->link.next = cache->slabs_empty;
+    if (cache->slabs_empty != 0) {
+        cache->slabs_empty->link.prev = slab;
+    }
+    cache->slabs_empty = slab;
+    cache->empty_count++;
+}
+
 static void cache_remove_slab(struct slab_header *slab) {
     struct kmem_cache *cache;
 
@@ -220,6 +318,10 @@ static void cache_remove_slab(struct slab_header *slab) {
         slab->link.next->link.prev = slab->link.prev;
     }
 
+    if (slab->state == SLAB_EMPTY && cache->empty_count > 0) {
+        cache->empty_count--;
+    }
+
     slab->link.prev = 0;
     slab->link.next = 0;
 }
@@ -234,6 +336,15 @@ static void cache_move_partial_to_full(struct kmem_cache *cache, struct slab_hea
 }
 
 static void cache_move_full_to_partial(struct kmem_cache *cache, struct slab_header *slab) {
+    if (cache == 0 || slab == 0) {
+        return;
+    }
+
+    cache_remove_slab(slab);
+    cache_add_partial(cache, slab);
+}
+
+static void cache_move_empty_to_partial(struct kmem_cache *cache, struct slab_header *slab) {
     if (cache == 0 || slab == 0) {
         return;
     }
@@ -265,6 +376,23 @@ static void *slab_pop_free(struct slab_header *slab) {
     chunk = (struct kmalloc_free_chunk *)slab->freelist;
     slab->freelist = chunk->next;
     return (void *)chunk;
+}
+
+static int slab_freelist_contains(struct slab_header *slab, void *obj) {
+    struct kmalloc_free_chunk *cur;
+
+    if (slab == 0 || obj == 0) {
+        return 0;
+    }
+
+    cur = (struct kmalloc_free_chunk *)slab->freelist;
+    while (cur != 0) {
+        if ((void *)cur == obj) {
+            return 1;
+        }
+        cur = cur->next;
+    }
+    return 0;
 }
 
 static int size_to_class(unsigned long size) {
@@ -382,10 +510,22 @@ void memory_reserve(uint64_t start, uint64_t size) {
     g_reserve_count++;
     // logging
     log_prefix();
-    uart_send_string("reserve start=");
+    uart_send_string("[Reserve] Reserve address [");
     log_hex_u64(rs);
-    uart_send_string(" size=");
-    log_hex_u64(re - rs);
+    uart_send_string(", ");
+    log_hex_u64(re);
+    uart_send_string(").");
+    {
+        uint64_t start_idx;
+        uint64_t end_idx;
+        if (pa_to_index(rs, &start_idx, 0) == 0 && pa_to_index(re - PAGE_SIZE, &end_idx, 0) == 0) {
+            uart_send_string(" Range of pages: [");
+            uart_send_dec((unsigned long)start_idx);
+            uart_send_string(", ");
+            uart_send_dec((unsigned long)(end_idx + 1ULL));
+            uart_send_string(")");
+        }
+    }
     uart_send_string("\n");
 }
 // check if reserve
@@ -530,6 +670,15 @@ static void freelist_push(unsigned int order, uint64_t idx) {
     int32_t i32 = (int32_t)idx;
     g_free_next[idx] = g_free_lists[order];
     g_free_lists[order] = i32;
+
+    log_prefix();
+    uart_send_string("[+] Add page ");
+    uart_send_dec((unsigned long)idx);
+    uart_send_string(" to order ");
+    uart_send_dec(order);
+    uart_send_string(". Range of pages: ");
+    log_page_range(idx, order);
+    uart_send_string("\n");
 }
 
 /////////////////////////////////////////////////////* FREE LIST*///////////////////////////////////////////
@@ -539,6 +688,15 @@ static int32_t freelist_pop(unsigned int order) {
     if (head >= 0) {
         g_free_lists[order] = g_free_next[(uint64_t)head];
         g_free_next[(uint64_t)head] = -1;
+
+        log_prefix();
+        uart_send_string("[-] Remove page ");
+        uart_send_dec((unsigned long)head);
+        uart_send_string(" from order ");
+        uart_send_dec(order);
+        uart_send_string(". Range of pages: ");
+        log_page_range((uint64_t)head, order);
+        uart_send_string("\n");
     }
     return head;
 }
@@ -557,6 +715,15 @@ static int freelist_remove(unsigned int order, uint64_t idx) {
                 g_free_next[(uint64_t)prev] = next;
             }
             g_free_next[idx] = -1;
+
+            log_prefix();
+            uart_send_string("[-] Remove page ");
+            uart_send_dec((unsigned long)idx);
+            uart_send_string(" from order ");
+            uart_send_dec(order);
+            uart_send_string(". Range of pages: ");
+            log_page_range(idx, order);
+            uart_send_string("\n");
             return 0;
         }
         prev = cur;
@@ -583,6 +750,14 @@ static int buddy_index(uint64_t idx, unsigned int order, uint64_t *out) {
     }
 
     *out = g_regions[rid].first_idx + buddy_local;
+    log_prefix();
+    uart_send_string("[*] Buddy found! buddy idx: ");
+    uart_send_dec((unsigned long)*out);
+    uart_send_string(" for page ");
+    uart_send_dec((unsigned long)idx);
+    uart_send_string(" with order ");
+    uart_send_dec(order);
+    uart_send_string("\n");
     return 0;
 }
 // MERGE
@@ -711,7 +886,7 @@ void *p_alloc(unsigned int pages) {
         return 0;
     }
     // pop the pages we need
-    idx32 = freelist_pop(cur_order);kfree
+    idx32 = freelist_pop(cur_order);
     if (idx32 < 0) {
         return 0;
     }
@@ -727,8 +902,12 @@ void *p_alloc(unsigned int pages) {
 
         if (index_to_pa(buddy_idx, &buddy_pa) == 0) {
             log_prefix();
-            uart_send_string("split release order=");
+            uart_send_string("[+] Add split page ");
+            uart_send_dec((unsigned long)buddy_idx);
+            uart_send_string(" to order ");
             uart_send_dec(cur_order);
+            uart_send_string(". Range of pages: ");
+            log_page_range(buddy_idx, cur_order);
             uart_send_string(" addr=");
             log_hex_u64(buddy_pa);
             uart_send_string("\n");
@@ -743,14 +922,26 @@ void *p_alloc(unsigned int pages) {
     }
 
     log_prefix();
-    uart_send_string("p_alloc pages=");
-    uart_send_dec(pages);
-    uart_send_string(" order=");
-    uart_send_dec(need_order);
-    uart_send_string(" addr=");
+    uart_send_string("[Page] Allocate ");
     log_hex_u64(pa);
+    uart_send_string(" at order ");
+    uart_send_dec(need_order);
+    uart_send_string(", page ");
+    uart_send_dec((unsigned long)idx);
+    uart_send_string(". Next address at order ");
+    uart_send_dec(need_order);
+    uart_send_string(": ");
+    if (index_to_pa(idx + (1ULL << need_order), &pa) == 0) {
+        log_hex_u64(pa);
+    } else {
+        uart_send_string("none");
+    }
     uart_send_string("\n");
 
+    if (index_to_pa(idx, &pa) != 0) {
+        return 0;
+    }
+    g_page_alloc_count++;
     return (void *)(uintptr_t)pa;
 }
 
@@ -804,24 +995,27 @@ void p_free(void *ptr) {
     freelist_push(merged_order, merged_idx);
 
     log_prefix();
-    uart_send_string("p_free addr=");
+    uart_send_string("[Page] Free ");
     log_hex_u64(pa);
-    uart_send_string(" order=");
-    uart_send_dec(order);
-    uart_send_string(" merged_order=");
+    uart_send_string(" and add back to order ");
     uart_send_dec(merged_order);
-    uart_send_string("\n");
-}
-
-static int kmalloc_find_class(unsigned long size) {
-    unsigned long need = size + sizeof(struct kmalloc_header);
-    unsigned int i;
-    for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
-        if (need <= (unsigned long)g_kmalloc_classes[i]) {
-            return (int)i;
+    uart_send_string(", page ");
+    uart_send_dec((unsigned long)merged_idx);
+    uart_send_string(". Next address at order ");
+    uart_send_dec(merged_order);
+    uart_send_string(": ");
+    if (g_free_lists[merged_order] >= 0) {
+        uint64_t next_pa = 0;
+        if (index_to_pa((uint64_t)g_free_lists[merged_order], &next_pa) == 0) {
+            log_hex_u64(next_pa);
+        } else {
+            uart_send_string("none");
         }
+    } else {
+        uart_send_string("none");
     }
-    return -1;
+    uart_send_string("\n");
+    g_page_free_count++;
 }
 
 static int kmalloc_refill_class(unsigned int class_idx) {
@@ -872,112 +1066,412 @@ static int kmalloc_refill_class(unsigned int class_idx) {
         void *obj = (void *)(uintptr_t)caddr;
         slab_push_free(slab, obj);
     }
-    // Refill now populates per-slab freelist only; do not push objects into g_kmalloc_freelist.
-    // Link it to the kmem cache
+    // Refill now populates this slab page's freelist and links it into the cache.
     cache_add_partial(cache, slab);
     return 0;
 }
 
 void *kmalloc(unsigned long size) {
-    int cls;
-    struct kmalloc_header *hdr;
-    void *ret;
-
     if (!g_memory_ready || size == 0UL) {
         return 0;
     }
+    // Slab Path
+    if (size <= KMALLOC_MAX_SLAB_SIZE) {
+        int cls = size_to_class(size);
+        struct kmem_cache *cache;
+        struct slab_header *slab;
+        void *obj;
 
-    cls = kmalloc_find_class(size);
-    if (cls >= 0) {
-        struct kmalloc_free_chunk *chunk;
-
-        if (g_kmalloc_freelist[(unsigned int)cls] == 0) {
-            if (kmalloc_refill_class((unsigned int)cls) != 0) {
-                return 0;
-            }
-        }
-
-        chunk = g_kmalloc_freelist[(unsigned int)cls];
-        g_kmalloc_freelist[(unsigned int)cls] = chunk->next;
-
-        hdr = (struct kmalloc_header *)chunk;
-        hdr->tag = KMALLOC_TAG_SMALL;
-        hdr->class_idx = (uint16_t)cls;
-        hdr->pages = 0U;
-        ret = (void *)((uint8_t *)hdr + sizeof(struct kmalloc_header));
-
-        log_prefix();
-        uart_send_string("kmalloc size=");
-        uart_send_dec(size);
-        uart_send_string(" class=");
-        uart_send_dec((unsigned long)cls);
-        uart_send_string(" addr=");
-        log_hex_u64((uint64_t)(uintptr_t)ret);
-        uart_send_string("\n");
-
-        return ret;
-    }
-
-    {
-        unsigned long total = size + sizeof(struct kmalloc_header);
-        unsigned long pages = (total + PAGE_SIZE - 1UL) / PAGE_SIZE;
-        void *base = p_alloc((unsigned int)pages);
-        if (base == 0) {
+        if (cls < 0) {
             return 0;
         }
 
-        hdr = (struct kmalloc_header *)base;
-        hdr->tag = KMALLOC_TAG_LARGE;
-        hdr->class_idx = 0xFFFFU;
-        hdr->pages = (uint32_t)pages;
-        ret = (void *)((uint8_t *)hdr + sizeof(struct kmalloc_header));
+        cache = &g_kmem_caches[(unsigned int)cls];
+        if (cache->slabs_partial == 0) {
+            if (cache->slabs_empty != 0) {
+                cache_move_empty_to_partial(cache, cache->slabs_empty);
+            } else if (kmalloc_refill_class((unsigned int)cls) != 0) {
+                return 0;
+            }
+        }
+        // Safety check
+        if (cache->slabs_partial == 0) {
+            log_prefix();
+            uart_send_string("[Error] kmalloc no partial slab after refill/reuse for class ");
+            uart_send_dec((unsigned long)cls);
+            uart_send_string("\n");
+            return 0;
+        }
+        // Find the first partial slab that still has a free object.
+        slab = cache->slabs_partial;
+        while (slab != 0 && slab->freelist == 0) {
+            slab = slab->link.next;
+        }
+        if (slab == 0) {
+            log_prefix();
+            uart_send_string("[Error] kmalloc partial list exhausted for class ");
+            uart_send_dec((unsigned long)cls);
+            uart_send_string("\n");
+            return 0;
+        }
+        // Get free objet
+        obj = slab_pop_free(slab);
+        if (obj == 0) {
+            log_prefix();
+            uart_send_string("[Error] kmalloc slab_pop_free failed for class ");
+            uart_send_dec((unsigned long)cls);
+            uart_send_string(", page ");
+            log_hex_u64((uint64_t)(uintptr_t)slab);
+            uart_send_string("\n");
+            return 0;
+        }
+        // If full......
+        slab->inuse++;
+        if (slab->inuse == slab->capacity) {
+            cache_move_partial_to_full(cache, slab);
+        }
+        // For observabiliy
+        log_prefix();
+        uart_send_string("[Object] Allocate ");
+        log_hex_u64((uint64_t)(uintptr_t)obj);
+        uart_send_string(" at object size ");
+        uart_send_dec(cache->obj_size);
+        uart_send_string(" (class ");
+        uart_send_dec((unsigned long)cls);
+        uart_send_string(", inuse ");
+        uart_send_dec(slab->inuse);
+        uart_send_string("/");
+        uart_send_dec(slab->capacity);
+        uart_send_string(")");
+        uart_send_string("\n");
+        g_object_alloc_count++;
+        return obj;
+    }
+    // Large path
+    {
+        void *base;
+        uint64_t base_idx;
+        // round the value bilibala
+        unsigned long pages = (size + PAGE_SIZE - 1UL) / PAGE_SIZE;
+
+        base = p_alloc((unsigned int)pages);
+        if (base == 0) {
+            return 0;
+        }
+        if (pa_to_index((uint64_t)(uintptr_t)base, &base_idx, 0) != 0) {
+            p_free(base);
+            return 0;
+        }
+        page_kind_set(base_idx, PAGE_KIND_LARGE);
 
         log_prefix();
-        uart_send_string("kmalloc size=");
-        uart_send_dec(size);
-        uart_send_string(" pages=");
-        uart_send_dec(pages);
-        uart_send_string(" addr=");
-        log_hex_u64((uint64_t)(uintptr_t)ret);
+        uart_send_string("[Page] Allocate ");
+        log_hex_u64((uint64_t)(uintptr_t)base);
+        uart_send_string(" at order ");
+        {
+            unsigned int order = 0;
+            while ((1ULL << order) < (uint64_t)pages) {
+                order++;
+            }
+            uart_send_dec(order);
+            uart_send_string(", page ");
+            uart_send_dec((unsigned long)base_idx);
+            uart_send_string(". Next address at order ");
+            uart_send_dec(order);
+            uart_send_string(": ");
+            if (base_idx + (1ULL << order) < g_total_pages) {
+                uint64_t next_pa = 0;
+                if (index_to_pa(base_idx + (1ULL << order), &next_pa) == 0) {
+                    log_hex_u64(next_pa);
+                } else {
+                    uart_send_string("none");
+                }
+            } else {
+                uart_send_string("none");
+            }
+        }
         uart_send_string("\n");
-
-        return ret;
+        return base;
     }
 }
 
 void kfree(void *ptr) {
-    struct kmalloc_header *hdr;
+    uint64_t page_base;
+    uint64_t page_idx;
+    uint64_t ptr_addr;
+    enum page_kind kind;
 
     if (!g_memory_ready || ptr == 0) {
         return;
     }
-
-    hdr = (struct kmalloc_header *)((uint8_t *)ptr - sizeof(struct kmalloc_header));
-    if (hdr->tag == KMALLOC_TAG_SMALL) {
-        unsigned int cls = (unsigned int)hdr->class_idx;
-        struct kmalloc_free_chunk *chunk;
-        if (cls >= KMALLOC_CLASS_COUNT) {
-            return;
-        }
-        chunk = (struct kmalloc_free_chunk *)hdr;
-        chunk->next = g_kmalloc_freelist[cls];
-        g_kmalloc_freelist[cls] = chunk;
-
+    ptr_addr = (uint64_t)(uintptr_t)ptr;
+    page_base = align_down_u64((uint64_t)(uintptr_t)ptr, PAGE_SIZE);
+    if (pa_to_index(page_base, &page_idx, 0) != 0) {
         log_prefix();
-        uart_send_string("kfree small addr=");
-        log_hex_u64((uint64_t)(uintptr_t)ptr);
+        uart_send_string("[Error] kfree invalid page base for ptr ");
+        log_hex_u64(ptr_addr);
+        uart_send_string("\n");
+        return;
+    }
+    kind = page_kind_get(page_idx);
+
+    if (kind == PAGE_KIND_NONE) {
+        log_prefix();
+        uart_send_string("[Error] kfree page kind NONE for ptr ");
+        log_hex_u64(ptr_addr);
+        uart_send_string(", page ");
+        log_hex_u64(page_base);
         uart_send_string("\n");
         return;
     }
 
-    if (hdr->tag == KMALLOC_TAG_LARGE) {
+    if (kind == PAGE_KIND_SLAB) {
+        struct slab_header *slab = (struct slab_header *)(uintptr_t)page_base;
+        struct kmem_cache *cache;
+        uint64_t obj_start;
+        uint64_t obj_end;
+        uint64_t offset;
+
+        if (slab->magic != SLAB_MAGIC) {
+            log_prefix();
+            uart_send_string("[Error] kfree slab magic mismatch at page ");
+            log_hex_u64(page_base);
+            uart_send_string(" for ptr ");
+            log_hex_u64(ptr_addr);
+            uart_send_string("\n");
+            return;
+        }
+        cache = slab->cache;
+        if (cache == 0 || cache->obj_stride == 0) {
+            log_prefix();
+            uart_send_string("[Error] kfree slab cache metadata invalid at page ");
+            log_hex_u64(page_base);
+            uart_send_string("\n");
+            return;
+        }
+
+        obj_start = (uint64_t)(uintptr_t)slab_object_start((void *)(uintptr_t)page_base, cache);
+        obj_end = obj_start + (uint64_t)cache->obj_stride * (uint64_t)slab->capacity;
+        if (ptr_addr < obj_start || ptr_addr >= obj_end) {
+            log_prefix();
+            uart_send_string("[Error] kfree slab ptr out of object range: ptr ");
+            log_hex_u64(ptr_addr);
+            uart_send_string(", range [");
+            log_hex_u64(obj_start);
+            uart_send_string(", ");
+            log_hex_u64(obj_end);
+            uart_send_string(")\n");
+            return;
+        }
+
+        offset = ptr_addr - obj_start;
+        if ((offset % (uint64_t)cache->obj_stride) != 0) {
+            log_prefix();
+            uart_send_string("[Error] kfree slab ptr misaligned to object stride: ptr ");
+            log_hex_u64(ptr_addr);
+            uart_send_string(", stride ");
+            uart_send_dec(cache->obj_stride);
+            uart_send_string("\n");
+            return;
+        }
+        if (slab->inuse == 0) {
+            log_prefix();
+            uart_send_string("[Error] kfree slab underflow attempt at ptr ");
+            log_hex_u64(ptr_addr);
+            uart_send_string("\n");
+            return;
+        }
+        // double free defense
+        if (slab_freelist_contains(slab, ptr)) {
+            log_prefix();
+            uart_send_string("[Object] Double free detected at ");
+            log_hex_u64(ptr_addr);
+            uart_send_string("\n");
+            return;
+        }
+
+        poison_memory(ptr, cache->obj_size, POISON_FREE_OBJECT);
+        slab_push_free(slab, ptr);
+        slab->inuse--;
+        g_object_free_count++;
+        if (slab->state == SLAB_FULL) {
+            cache_move_full_to_partial(cache, slab);
+        }
+        if (slab->inuse == 0) {
+            cache_remove_slab(slab);
+            if (cache->empty_count < KMEM_CACHE_EMPTY_LIMIT) {
+                cache_add_empty(cache, slab);
+
+                log_prefix();
+                uart_send_string("[Object] Free ");
+                log_hex_u64(ptr_addr);
+                uart_send_string(" at object size ");
+                uart_send_dec(cache->obj_size);
+                uart_send_string(". [Slab] Keep empty page ");
+                log_hex_u64(page_base);
+                uart_send_string("\n");
+            } else {
+                page_kind_set(page_idx, PAGE_KIND_NONE);
+                slab->magic = 0;
+                slab->cache = 0;
+                slab->freelist = 0;
+                poison_memory((void *)(uintptr_t)page_base, PAGE_SIZE, POISON_RECLAIM_PAGE);
+
+                log_prefix();
+                uart_send_string("[Object] Free ");
+                log_hex_u64(ptr_addr);
+                uart_send_string(" at object size ");
+                uart_send_dec(cache->obj_size);
+                uart_send_string(". [Slab] Reclaim page ");
+                log_hex_u64(page_base);
+                uart_send_string("\n");
+                g_slab_reclaim_count++;
+                p_free((void *)(uintptr_t)page_base);
+            }
+            return;
+        }
+        slab->state = SLAB_PARTIAL;
         log_prefix();
-        uart_send_string("kfree large addr=");
-        log_hex_u64((uint64_t)(uintptr_t)ptr);
-        uart_send_string(" pages=");
-        uart_send_dec((unsigned long)hdr->pages);
+        uart_send_string("[Object] Free ");
+        log_hex_u64(ptr_addr);
+        uart_send_string(" at object size ");
+        uart_send_dec(cache->obj_size);
         uart_send_string("\n");
-        p_free((void *)hdr);
+        return;
+    }
+
+    if (kind == PAGE_KIND_LARGE) {
+        int16_t tag = g_frame_state[page_idx];
+        if ((ptr_addr & (PAGE_SIZE - 1U)) != 0U) {
+            log_prefix();
+            uart_send_string("[Error] kfree large ptr not page-aligned: ");
+            log_hex_u64(ptr_addr);
+            uart_send_string("\n");
+            return;
+        }
+        if (!is_alloc_head_tag(tag)) {
+            log_prefix();
+            uart_send_string("[Error] kfree large ptr is not allocation head: ptr ");
+            log_hex_u64(ptr_addr);
+            uart_send_string(", page ");
+            uart_send_dec((unsigned long)page_idx);
+            uart_send_string("\n");
+            return;
+        }
+        page_kind_set(page_idx, PAGE_KIND_NONE);
+
+        log_prefix();
+        uart_send_string("[Page] Free ");
+        log_hex_u64(ptr_addr);
+        uart_send_string("\n");
+        p_free((void *)(uintptr_t)page_base);
+        return;
+    }
+
+    log_prefix();
+    uart_send_string("[Error] kfree unknown page kind for ptr ");
+    log_hex_u64(ptr_addr);
+    uart_send_string("\n");
+}
+
+void memory_print_slabinfo(void) {
+    unsigned int i;
+
+    uart_send_string("Slab caches:\n");
+    uart_send_string("class size stride partial full empty\n");
+    for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
+        uart_send_dec(i);
+        uart_send_string(" ");
+        uart_send_dec(g_kmem_caches[i].obj_size);
+        uart_send_string(" ");
+        uart_send_dec(g_kmem_caches[i].obj_stride);
+        uart_send_string(" ");
+        uart_send_dec(slab_list_count(g_kmem_caches[i].slabs_partial));
+        uart_send_string(" ");
+        uart_send_dec(slab_list_count(g_kmem_caches[i].slabs_full));
+        uart_send_string(" ");
+        uart_send_dec(slab_list_count(g_kmem_caches[i].slabs_empty));
+        uart_send_string("\n");
+    }
+}
+
+void memory_print_buddyinfo(void) {
+    unsigned int order;
+    uint64_t total_free_pages = 0;
+
+    uart_send_string("Buddy free lists:\n");
+    uart_send_string("order blocks pages\n");
+    for (order = 0; order <= MEMORY_BUDDY_MAX_ORDER; order++) {
+        unsigned int blocks = freelist_count_order(order);
+        uint64_t pages = (uint64_t)blocks << order;
+
+        if (blocks == 0) {
+            continue;
+        }
+        total_free_pages += pages;
+        uart_send_dec(order);
+        uart_send_string(" ");
+        uart_send_dec(blocks);
+        uart_send_string(" ");
+        uart_send_dec((unsigned long)pages);
+        uart_send_string("\n");
+    }
+    uart_send_string("total_free_pages: ");
+    uart_send_dec((unsigned long)total_free_pages);
+    uart_send_string("\n");
+}
+
+void memory_print_memstat(void) {
+    uart_send_string("Allocator stats:\n");
+    uart_send_string("page_allocs: ");
+    uart_send_dec((unsigned long)g_page_alloc_count);
+    uart_send_string("\n");
+    uart_send_string("page_frees: ");
+    uart_send_dec((unsigned long)g_page_free_count);
+    uart_send_string("\n");
+    uart_send_string("object_allocs: ");
+    uart_send_dec((unsigned long)g_object_alloc_count);
+    uart_send_string("\n");
+    uart_send_string("object_frees: ");
+    uart_send_dec((unsigned long)g_object_free_count);
+    uart_send_string("\n");
+    uart_send_string("slab_reclaims: ");
+    uart_send_dec((unsigned long)g_slab_reclaim_count);
+    uart_send_string("\n");
+    uart_send_string("total_pages: ");
+    uart_send_dec((unsigned long)g_total_pages);
+    uart_send_string("\n");
+    uart_send_string("empty_slab_limit: ");
+    uart_send_dec((unsigned long)KMEM_CACHE_EMPTY_LIMIT);
+    uart_send_string("\n");
+    uart_send_string("poison_free_object: 0x");
+    uart_send_hex((unsigned long)POISON_FREE_OBJECT);
+    uart_send_string("\n");
+    uart_send_string("poison_reclaim_page: 0x");
+    uart_send_hex((unsigned long)POISON_RECLAIM_PAGE);
+    uart_send_string("\n");
+}
+
+void memory_debug_check_slabs(void) {
+    unsigned int i;
+    int ok = 1;
+
+    for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
+        if (!slab_check_list_invariants(i, "partial", g_kmem_caches[i].slabs_partial, SLAB_PARTIAL)) {
+            ok = 0;
+        }
+        if (!slab_check_list_invariants(i, "full", g_kmem_caches[i].slabs_full, SLAB_FULL)) {
+            ok = 0;
+        }
+        if (!slab_check_list_invariants(i, "empty", g_kmem_caches[i].slabs_empty, SLAB_EMPTY)) {
+            ok = 0;
+        }
+    }
+
+    if (ok) {
+        uart_send_string("slabcheck: OK\n");
+    } else {
+        uart_send_string("slabcheck: FAILED\n");
     }
 }
 
@@ -1087,10 +1581,10 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
         g_kmem_caches[i].obj_align = g_kmem_caches[i].obj_size;
         g_kmem_caches[i].obj_stride =
             slab_calc_stride(g_kmem_caches[i].obj_size, g_kmem_caches[i].obj_align);
+        g_kmem_caches[i].empty_count = 0;
         g_kmem_caches[i].slabs_partial = 0;
         g_kmem_caches[i].slabs_full = 0;
         g_kmem_caches[i].slabs_empty = 0;
-        g_kmalloc_freelist[i] = 0;
     }
 
     buddy_build_initial_state();

@@ -10,6 +10,7 @@ typedef struct Shell{
 
 void processCommand(shell_t* shell);
 void runAShell(int32_t pid);
-void shell_set_context(unsigned long hartid, unsigned long dtb_addr);
+void shell_set_context(unsigned long hartid, unsigned long dtb_addr,
+                       uint64_t initrd_start_hint, uint64_t initrd_end_hint);
 
 #endif

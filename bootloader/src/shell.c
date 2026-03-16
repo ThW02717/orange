@@ -2,17 +2,22 @@
 #include "shell.h"
 #include "uart.h"
 #include "string.h"
-#include "sbi.h"
 
 static unsigned long g_hartid = 0;
 static unsigned long g_dtb = 0;
-#define UART_BOOT_MAGIC 0x544F4F42UL /* "BOOT" */
+#define UART_BOOT_BUNDLE_MAGIC 0x324F4F42UL /* "BOO2" */
 #define UART_BOOT_MAX_SIZE (16UL * 1024UL * 1024UL)
+#define UART_INITRD_MAX_SIZE (64UL * 1024UL * 1024UL)
+#define UART_BOOT_BUNDLE_MAX_SIZE (UART_BOOT_MAX_SIZE + UART_INITRD_MAX_SIZE + 16UL)
 #ifdef QEMU
 #define UART_BOOT_LOAD_ADDR 0x82000000UL
+#define UART_INITRD_LOAD_ADDR 0x88000000UL
 #else
 #define UART_BOOT_LOAD_ADDR 0x20000000UL
+#define UART_INITRD_LOAD_ADDR 0x46100000UL
 #endif
+static unsigned long g_initrd_start = 0;
+static unsigned long g_initrd_end = 0;
 
 void shell_set_context(unsigned long hartid, unsigned long dtb_addr) {
     g_hartid = hartid;
@@ -103,92 +108,6 @@ static void getCommand(char* buffer, int max_len) {
     }
 }
 
-static void print_info(void) {
-    unsigned long spec = (unsigned long)sbi_get_spec_version();
-    unsigned long impl_id = (unsigned long)sbi_get_impl_id();
-    unsigned long impl_ver = (unsigned long)sbi_get_impl_version();
-    unsigned long mimpid = (unsigned long)sbi_get_mimpid();
-    unsigned long spec_major = (spec >> 24) & 0x7fUL;
-    unsigned long spec_minor = spec & 0x00ffffffUL;
-    unsigned long impl_major = (impl_ver >> 16) & 0xffUL;
-    unsigned long impl_minor = (impl_ver >> 8) & 0xffUL;
-    unsigned long impl_patch = impl_ver & 0xffUL;
-
-    uart_send_string("core id: ");
-    uart_send_dec(g_hartid);
-    uart_send_string("\n");
-
-    uart_send_string("dtb addr: ");
-    uart_send_hex(g_dtb);
-    uart_send_string("\n");
-
-    uart_send_string("sbi spec: ");
-    uart_send_hex(spec);
-    uart_send_string(" (");
-    uart_send_dec(spec_major);
-    uart_send_string(".");
-    uart_send_dec(spec_minor);
-    uart_send_string(")");
-    uart_send_string("\n");
-
-    uart_send_string("sbi impl id: ");
-    uart_send_hex(impl_id);
-    uart_send_string("\n");
-
-    uart_send_string("sbi impl version: ");
-    uart_send_hex(impl_ver);
-    uart_send_string(" (");
-    uart_send_dec(impl_major);
-    uart_send_string(".");
-    uart_send_dec(impl_minor);
-    uart_send_string(".");
-    uart_send_dec(impl_patch);
-    uart_send_string(", decoded)");
-    uart_send_string("\n");
-
-    uart_send_string("mimpid: ");
-    uart_send_hex(mimpid);
-    uart_send_string("\n");
-}
-
-static const char* hsm_state_name(long st) {
-    switch (st) {
-        case SBI_HSM_STATE_STARTED: return "started";
-        case SBI_HSM_STATE_STOPPED: return "stopped";
-        case SBI_HSM_STATE_START_PENDING: return "start_pending";
-        case SBI_HSM_STATE_STOP_PENDING: return "stop_pending";
-        case SBI_HSM_STATE_SUSPENDED: return "suspended";
-        case SBI_HSM_STATE_SUSPEND_PENDING: return "suspend_pending";
-        case SBI_HSM_STATE_RESUME_PENDING: return "resume_pending";
-        default: return "unknown";
-    }
-}
-
-static void print_cores(void) {
-    unsigned long core;
-    long hsm = sbi_probe_extension(SBI_EXT_HSM);
-    uart_send_string("sbi hsm support: ");
-    uart_send_hex((unsigned long)hsm);
-    uart_send_string("\n");
-
-    for (core = 0; core < 8; core++) {
-        long st = sbi_hart_get_status(core);
-        uart_send_string("core ");
-        uart_send_dec(core);
-        uart_send_string(": ");
-        if (st < 0) {
-            uart_send_string("err=");
-            uart_send_hex((unsigned long)st);
-        } else {
-            uart_send_string(hsm_state_name(st));
-            uart_send_string(" (");
-            uart_send_hex((unsigned long)st);
-            uart_send_string(")");
-        }
-        uart_send_string("\n");
-    }
-}
-
 static unsigned long recv_u32_le(void) {
     unsigned long v = 0;
     v |= (unsigned long)(uint8_t)uart_recv();
@@ -206,6 +125,26 @@ static void recv_bytes(void *dst, unsigned long size) {
     }
 }
 
+static uint32_t load_u32_le(const uint8_t *p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static void copy_bytes(uint8_t *dst, const uint8_t *src, unsigned long size) {
+    unsigned long i;
+    if (dst < src) {
+        for (i = 0; i < size; i++) {
+            dst[i] = src[i];
+        }
+    } else if (dst > src) {
+        for (i = size; i > 0; i--) {
+            dst[i - 1] = src[i - 1];
+        }
+    }
+}
+
 static unsigned long checksum_bytes(const uint8_t *data, unsigned long size) {
     unsigned long sum = 0;
     unsigned long i;
@@ -216,39 +155,23 @@ static unsigned long checksum_bytes(const uint8_t *data, unsigned long size) {
     return sum;
 }
 
-static void boot_load_and_jump(void) {
-    unsigned long magic;
-    unsigned long size;
-    unsigned long expected_sum;
+static int uart_load_image_payload(uint8_t *dst, unsigned long max_size,
+                                   unsigned long load_addr,
+                                   unsigned long size, unsigned long expected_sum,
+                                   unsigned long *size_out) {
     unsigned long actual_sum;
-    uint8_t *dst = (uint8_t *)UART_BOOT_LOAD_ADDR;
-    void (*next_kernel)(unsigned long, unsigned long);
 
-    uart_send_string("UART loader ready\n");
-    uart_send_string("send header <magic,size,checksum> then payload\n");
-
-    magic = recv_u32_le();
-    size = recv_u32_le();
-    expected_sum = recv_u32_le();
-
-    if (magic != UART_BOOT_MAGIC) {
-        uart_send_string("load fail: bad magic ");
-        uart_send_hex(magic);
-        uart_send_string("\n");
-        return;
-    }
-
-    if (size == 0 || size > UART_BOOT_MAX_SIZE) {
+    if (size == 0 || size > max_size) {
         uart_send_string("load fail: bad size ");
         uart_send_dec(size);
         uart_send_string("\n");
-        return;
+        return -1;
     }
 
     uart_send_string("loading ");
     uart_send_dec(size);
     uart_send_string(" bytes to ");
-    uart_send_hex(UART_BOOT_LOAD_ADDR);
+    uart_send_hex(load_addr);
     uart_send_string("\n");
 
     recv_bytes(dst, size);
@@ -260,18 +183,108 @@ static void boot_load_and_jump(void) {
         uart_send_string(" got=");
         uart_send_hex(actual_sum);
         uart_send_string("\n");
+        return -1;
+    }
+
+    if (size_out != 0) {
+        *size_out = size;
+    }
+    return 0;
+}
+
+static void boot_load_and_jump(void) {
+    unsigned long magic;
+    unsigned long size;
+    unsigned long expected_sum;
+    uint8_t *dst = (uint8_t *)UART_BOOT_LOAD_ADDR;
+    void (*next_kernel)(unsigned long, unsigned long, unsigned long, unsigned long);
+
+    uart_send_string("UART loader ready for kernel+initrd bundle\n");
+    uart_send_string("send header <magic,size,checksum> then payload\n");
+    magic = recv_u32_le();
+    size = recv_u32_le();
+    expected_sum = recv_u32_le();
+
+    if (magic == UART_BOOT_BUNDLE_MAGIC) {
+        const uint8_t *bundle = dst;
+        uint32_t kernel_size;
+        uint32_t initrd_size;
+        uint32_t kernel_sum;
+        uint32_t initrd_sum;
+        const uint8_t *kernel_src;
+        const uint8_t *initrd_src;
+        unsigned long total_needed;
+
+        if (uart_load_image_payload(dst, UART_BOOT_BUNDLE_MAX_SIZE, UART_BOOT_LOAD_ADDR,
+                                    size, expected_sum, 0) != 0) {
+            return;
+        }
+
+        if (size < 16UL) {
+            uart_send_string("load fail: bundle too small\n");
+            return;
+        }
+
+        kernel_size = load_u32_le(bundle);
+        initrd_size = load_u32_le(bundle + 4);
+        kernel_sum = load_u32_le(bundle + 8);
+        initrd_sum = load_u32_le(bundle + 12);
+
+        total_needed = 16UL + (unsigned long)kernel_size + (unsigned long)initrd_size;
+        if (kernel_size == 0U || kernel_size > UART_BOOT_MAX_SIZE ||
+            initrd_size == 0U ||
+            initrd_size > UART_INITRD_MAX_SIZE || total_needed != size) {
+            uart_send_string("load fail: bad bundle layout\n");
+            return;
+        }
+
+        kernel_src = bundle + 16;
+        initrd_src = kernel_src + kernel_size;
+
+        if (checksum_bytes(kernel_src, (unsigned long)kernel_size) != (unsigned long)kernel_sum ||
+            checksum_bytes(initrd_src, (unsigned long)initrd_size) != (unsigned long)initrd_sum) {
+            uart_send_string("load fail: bad bundle checksum\n");
+            return;
+        }
+
+        copy_bytes((uint8_t *)UART_BOOT_LOAD_ADDR, kernel_src, (unsigned long)kernel_size);
+        copy_bytes((uint8_t *)UART_INITRD_LOAD_ADDR, initrd_src, (unsigned long)initrd_size);
+        g_initrd_start = UART_INITRD_LOAD_ADDR;
+        g_initrd_end = UART_INITRD_LOAD_ADDR + (unsigned long)initrd_size;
+        if (g_initrd_end < g_initrd_start) {
+            g_initrd_start = 0;
+            g_initrd_end = 0;
+            uart_send_string("load fail: initrd range overflow\n");
+            return;
+        }
+        uart_send_string("bundle ok: kernel=");
+        uart_send_dec(kernel_size);
+        uart_send_string(" initrd=");
+        uart_send_dec(initrd_size);
+        uart_send_string("\n");
+    } else {
+        uart_send_string("load fail: bad magic ");
+        uart_send_hex(magic);
+        uart_send_string(" (expect BOO2 bundle)\n");
         return;
     }
 
     uart_send_string("load ok, jump ");
     uart_send_hex(UART_BOOT_LOAD_ADDR);
+    if (g_initrd_end > g_initrd_start) {
+        uart_send_string(" (initrd ");
+        uart_send_hex(g_initrd_start);
+        uart_send_string("-");
+        uart_send_hex(g_initrd_end);
+        uart_send_string(")");
+    }
     uart_send_string("\n");
 
     asm volatile("fence rw, rw" ::: "memory");
     asm volatile(".word 0x0000100f" ::: "memory");
 
-    next_kernel = (void (*)(unsigned long, unsigned long))UART_BOOT_LOAD_ADDR;
-    next_kernel(g_hartid, g_dtb);
+    next_kernel = (void (*)(unsigned long, unsigned long, unsigned long, unsigned long))UART_BOOT_LOAD_ADDR;
+    next_kernel(g_hartid, g_dtb, g_initrd_start, g_initrd_end);
     uart_send_string("loaded image returned\n");
 }
 
@@ -283,30 +296,12 @@ void processCommand(shell_t* shell) {
     if (streq(shell->command, "help")) {
         uart_send_string("Available commands:\n");
         uart_send_string("  help   - Show this message\n");
-        uart_send_string("  hello  - Print Hello World!\n");
-        uart_send_string("  info   - Print core and SBI info\n");
-        uart_send_string("  cores  - Show HSM status for core 0..7\n");
-        uart_send_string("  load   - Load kernel via UART and jump\n");
-        return;
-    }
-
-    if (streq(shell->command, "hello")) {
-        uart_send_string("Hello World!\n");
+        uart_send_string("  load   - Load kernel+initrd bundle via UART and jump\n");
         return;
     }
 
     if (streq(shell->command, "load")) {
         boot_load_and_jump();
-        return;
-    }
-
-    if (streq(shell->command, "info")) {
-        print_info();
-        return;
-    }
-
-    if (streq(shell->command, "cores")) {
-        print_cores();
         return;
     }
 

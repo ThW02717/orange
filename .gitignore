@@ -8,4 +8,3 @@ kernel/*.bin
 kernel/*.fit
 initramfs.cpio
 kernel/initramfs.cpio
-rootfs/

@@ -11,6 +11,9 @@ INC_DIR   := include
 LINKER    := linker.ld
 ITS_FILE  := kernel.its
 DTB_FILE  := x1_orangepi-rv2.dtb
+ROOTFS_DIR := rootfs
+INITRAMFS := initramfs.cpio
+ROOTFS_FILES := $(shell [ -d $(ROOTFS_DIR) ] && find $(ROOTFS_DIR) -print)
 
 C_SRCS    := $(wildcard $(SRC_DIR)/*.c)
 ASM_SRCS  := $(wildcard $(SRC_DIR)/*.S)
@@ -57,7 +60,14 @@ kernel.elf: $(BUILD_DIR)/kernel_board.elf
 kernel.bin: $(BUILD_DIR)/kernel_board.elf
 	$(OBJCOPY) -O binary -S $< $@
 
-kernel.fit: kernel.bin $(ITS_FILE) $(DTB_FILE)
+$(INITRAMFS): $(ROOTFS_FILES)
+	@if [ ! -d "$(ROOTFS_DIR)" ]; then \
+		echo "Missing $(ROOTFS_DIR)/ directory"; \
+		exit 1; \
+	fi
+	cd $(ROOTFS_DIR) && find . -print0 | LC_ALL=C sort -z | cpio --null -o -H newc --owner=0:0 > ../$@
+
+kernel.fit: kernel.bin $(ITS_FILE) $(DTB_FILE) $(INITRAMFS)
 	$(MKIMAGE) -f $(ITS_FILE) $@
 
 qemu: $(BUILD_DIR)/kernel_qemu.elf
@@ -67,6 +77,6 @@ qemu-bin: $(BUILD_DIR)/kernel_qemu.elf
 	$(OBJCOPY) -O binary -S $< build/kernel_qemu.bin
 
 clean:
-	rm -rf $(BUILD_DIR) kernel.elf kernel.bin kernel.fit
+	rm -rf $(BUILD_DIR) kernel.elf kernel.bin kernel.fit $(INITRAMFS)
 
 -include $(BOARD_DEPS) $(QEMU_DEPS)

@@ -421,6 +421,10 @@ void processCommand(shell_t* shell) {
         uart_send_string("  ls     - List initrd files\n");
         uart_send_string("  cat    - Show initrd file content\n");
         uart_send_string("  allocdemo - Run allocator demo\n");
+        uart_send_string("  memstat  - Show allocator counters\n");
+        uart_send_string("  slabinfo - Show slab cache state\n");
+        uart_send_string("  buddyinfo - Show buddy free-list state\n");
+        uart_send_string("  slabcheck - Run slab invariant checks\n");
         return;
     }
 
@@ -451,6 +455,26 @@ void processCommand(shell_t* shell) {
 
     if (streq(cmd, "allocdemo")) {
         cmd_allocdemo();
+        return;
+    }
+
+    if (streq(cmd, "memstat")) {
+        memory_print_memstat();
+        return;
+    }
+
+    if (streq(cmd, "slabinfo")) {
+        memory_print_slabinfo();
+        return;
+    }
+
+    if (streq(cmd, "buddyinfo")) {
+        memory_print_buddyinfo();
+        return;
+    }
+
+    if (streq(cmd, "slabcheck")) {
+        memory_debug_check_slabs();
         return;
     }
 

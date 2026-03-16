@@ -4,6 +4,7 @@ SECTIONS
 {
     /* Default load address targets UART-loaded board kernel. */
     . = DEFINED(KERNEL_LOAD_ADDR) ? KERNEL_LOAD_ADDR : 0x20000000;
+    _phys_start = .;
 
     .text : {
         KEEP(*(.text.boot))
@@ -34,4 +35,5 @@ SECTIONS
     . = ALIGN(16);
     . += 0x4000;
     _stack_top = .;
+    _phys_end = .;
 }
