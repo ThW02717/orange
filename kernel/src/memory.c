@@ -181,6 +181,16 @@ static unsigned int freelist_count_order(unsigned int order) {
     return n;
 }
 
+static uint64_t total_free_pages_count(void) {
+    unsigned int order;
+    uint64_t total = 0;
+
+    for (order = 0; order <= MEMORY_BUDDY_MAX_ORDER; order++) {
+        total += (uint64_t)freelist_count_order(order) << order;
+    }
+    return total;
+}
+
 static void poison_memory(void *ptr, uint64_t size, uint8_t value) {
     uint8_t *p = (uint8_t *)ptr;
     uint64_t i;
@@ -1421,6 +1431,62 @@ void memory_print_buddyinfo(void) {
     uart_send_string("\n");
 }
 
+int memory_check_slabs_ok(void) {
+    unsigned int i;
+    int ok = 1;
+
+    for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
+        if (!slab_check_list_invariants(i, "partial", g_kmem_caches[i].slabs_partial, SLAB_PARTIAL)) {
+            ok = 0;
+        }
+        if (!slab_check_list_invariants(i, "full", g_kmem_caches[i].slabs_full, SLAB_FULL)) {
+            ok = 0;
+        }
+        if (!slab_check_list_invariants(i, "empty", g_kmem_caches[i].slabs_empty, SLAB_EMPTY)) {
+            ok = 0;
+        }
+    }
+
+    return ok;
+}
+
+void memory_get_stats(struct memory_stats_snapshot *out) {
+    if (out == 0) {
+        return;
+    }
+
+    out->page_allocs = g_page_alloc_count;
+    out->page_frees = g_page_free_count;
+    out->object_allocs = g_object_alloc_count;
+    out->object_frees = g_object_free_count;
+    out->slab_reclaims = g_slab_reclaim_count;
+    out->total_pages = g_total_pages;
+    out->free_pages = total_free_pages_count();
+    out->empty_slab_limit = KMEM_CACHE_EMPTY_LIMIT;
+}
+
+int memory_get_slab_class_snapshot(unsigned int class_idx, struct memory_slab_class_snapshot *out) {
+    struct kmem_cache *cache;
+
+    if (out == 0 || class_idx >= KMALLOC_CLASS_COUNT) {
+        return -1;
+    }
+
+    cache = &g_kmem_caches[class_idx];
+    out->class_idx = class_idx;
+    out->obj_size = cache->obj_size;
+    out->obj_stride = cache->obj_stride;
+    out->partial_count = slab_list_count(cache->slabs_partial);
+    out->full_count = slab_list_count(cache->slabs_full);
+    out->empty_count = slab_list_count(cache->slabs_empty);
+    out->cached_empty_count = cache->empty_count;
+    return 0;
+}
+
+int memory_class_for_size(unsigned long size) {
+    return size_to_class(size);
+}
+
 void memory_print_memstat(void) {
     uart_send_string("Allocator stats:\n");
     uart_send_string("page_allocs: ");
@@ -1453,22 +1519,7 @@ void memory_print_memstat(void) {
 }
 
 void memory_debug_check_slabs(void) {
-    unsigned int i;
-    int ok = 1;
-
-    for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
-        if (!slab_check_list_invariants(i, "partial", g_kmem_caches[i].slabs_partial, SLAB_PARTIAL)) {
-            ok = 0;
-        }
-        if (!slab_check_list_invariants(i, "full", g_kmem_caches[i].slabs_full, SLAB_FULL)) {
-            ok = 0;
-        }
-        if (!slab_check_list_invariants(i, "empty", g_kmem_caches[i].slabs_empty, SLAB_EMPTY)) {
-            ok = 0;
-        }
-    }
-
-    if (ok) {
+    if (memory_check_slabs_ok()) {
         uart_send_string("slabcheck: OK\n");
     } else {
         uart_send_string("slabcheck: FAILED\n");

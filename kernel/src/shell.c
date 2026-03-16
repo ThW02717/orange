@@ -6,6 +6,7 @@
 #include "fdt.h"
 #include "cpio.h"
 #include "memory.h"
+#include "memory_test.h"
 
 static unsigned long g_hartid = 0;
 static unsigned long g_dtb = 0;
@@ -421,6 +422,7 @@ void processCommand(shell_t* shell) {
         uart_send_string("  ls     - List initrd files\n");
         uart_send_string("  cat    - Show initrd file content\n");
         uart_send_string("  allocdemo - Run allocator demo\n");
+        uart_send_string("  kmtest <name> - Run allocator tests\n");
         uart_send_string("  memstat  - Show allocator counters\n");
         uart_send_string("  slabinfo - Show slab cache state\n");
         uart_send_string("  buddyinfo - Show buddy free-list state\n");
@@ -455,6 +457,11 @@ void processCommand(shell_t* shell) {
 
     if (streq(cmd, "allocdemo")) {
         cmd_allocdemo();
+        return;
+    }
+
+    if (streq(cmd, "kmtest")) {
+        memory_run_kmtest(arg);
         return;
     }
 

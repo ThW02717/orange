@@ -38,12 +38,14 @@ The allocator also exposes shell-visible observability commands so the internal 
 - `slabinfo`
 - `buddyinfo`
 - `slabcheck`
+- `kmtest <name>`
 
 These commands make it possible to demonstrate allocator behavior directly, including:
 
 - slab state transitions after allocation
 - empty slab reuse vs. reclaim
 - large allocation / free effects on buddy free lists
+- allocator regression checks through `kmtest all`
 
 `KMEM_CACHE_EMPTY_LIMIT` is a policy choice, not a correctness requirement. In the current version, each cache keeps at most one empty slab page as a warm spare to reduce unnecessary buddy allocator churn.
 
@@ -58,10 +60,30 @@ Current shell commands include:
 - `ls`
 - `cat <file>`
 - `allocdemo`
+- `kmtest <name>`
 - `memstat`
 - `slabinfo`
 - `buddyinfo`
 - `slabcheck`
+
+Allocator test commands currently include:
+
+- `kmtest basic`
+- `kmtest boundary`
+- `kmtest slab`
+- `kmtest multislab`
+- `kmtest reclaim`
+- `kmtest large`
+- `kmtest buddy`
+- `kmtest invalid`
+- `kmtest stress`
+- `kmtest all`
+
+For QEMU-based regression runs, use:
+
+```bash
+python3 scripts/run_allocator_tests.py
+```
 
 ## TODO
 
