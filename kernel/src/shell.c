@@ -7,7 +7,11 @@
 #include "cpio.h"
 #include "memory.h"
 #include "memory_test.h"
+#include "trap.h"
+#include "user.h"
 
+/* Interactive UART shell with initramfs-backed file commands and user-program launch. */
+/* Shell-global boot context and initramfs location discovered during startup. */
 static unsigned long g_hartid = 0;
 static unsigned long g_dtb = 0;
 static uint64_t g_initrd_start = 0;
@@ -15,6 +19,10 @@ static uint64_t g_initrd_end = 0;
 static uint64_t g_initrd_hint_start = 0;
 static uint64_t g_initrd_hint_end = 0;
 
+#define CPIO_MODE_TYPE_MASK 0170000U
+#define CPIO_MODE_REGULAR   0100000U
+
+/* Validate fallback initrd hints before using them in place of DT-provided data. */
 static int initrd_hint_valid(uint64_t start, uint64_t end) {
     if (start == 0 || end <= start) {
         return 0;
@@ -25,6 +33,7 @@ static int initrd_hint_valid(uint64_t start, uint64_t end) {
     return 1;
 }
 
+/* Record shell-visible boot context and resolve the initramfs address range once. */
 void shell_set_context(unsigned long hartid, unsigned long dtb_addr,
                        uint64_t initrd_start_hint, uint64_t initrd_end_hint) {
     g_hartid = hartid;
@@ -46,6 +55,7 @@ void shell_set_context(unsigned long hartid, unsigned long dtb_addr,
     }
 }
 
+/* Small local helpers used by the shell parser and loader commands. */
 static int is_space(char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
@@ -69,6 +79,56 @@ static int streq(const char *a, const char *b) {
     return *a == *b;
 }
 
+/* Minimal memcpy replacement for the freestanding kernel build. */
+static void copy_bytes(void *dst, const void *src, unsigned long size) {
+    unsigned long i;
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+
+    for (i = 0; i < size; i++) {
+        d[i] = s[i];
+    }
+}
+
+/* Build the initramfs path used by runu: bin/<name>.bin. */
+static int build_user_program_path(const char *name, char *out, unsigned int out_size) {
+    static const char prefix[] = "bin/";
+    static const char suffix[] = ".bin";
+    unsigned int pos = 0;
+    unsigned int i = 0;
+
+    if (name == 0 || out == 0 || out_size == 0) {
+        return -1;
+    }
+
+    while (prefix[i] != '\0') {
+        if (pos + 1 >= out_size) {
+            return -1;
+        }
+        out[pos++] = prefix[i++];
+    }
+
+    i = 0;
+    while (name[i] != '\0') {
+        if (pos + 1 >= out_size) {
+            return -1;
+        }
+        out[pos++] = name[i++];
+    }
+
+    i = 0;
+    while (suffix[i] != '\0') {
+        if (pos + 1 >= out_size) {
+            return -1;
+        }
+        out[pos++] = suffix[i++];
+    }
+
+    out[pos] = '\0';
+    return 0;
+}
+
+/* Normalize leading and trailing shell input whitespace in place. */
 static void trim_in_place(char *s) {
     char *p = s;
     while (is_space(*p)) {
@@ -89,6 +149,7 @@ static void trim_in_place(char *s) {
     }
 }
 
+/* Read a single command line from UART with basic editing support. */
 static void getCommand(char* buffer, int max_len) {
     int idx = 0;
     int ignore_next_lf = 0;
@@ -130,6 +191,7 @@ static void getCommand(char* buffer, int max_len) {
     }
 }
 
+/* Shell info commands. */
 static void print_info(void) {
     unsigned long spec = (unsigned long)sbi_get_spec_version();
     unsigned long impl_id = (unsigned long)sbi_get_impl_id();
@@ -225,6 +287,7 @@ static void print_info(void) {
     uart_send_string("\n");
 }
 
+/* Translate SBI HSM hart states into short shell-visible names. */
 static const char* hsm_state_name(long st) {
     switch (st) {
         case SBI_HSM_STATE_STARTED: return "started";
@@ -238,6 +301,7 @@ static const char* hsm_state_name(long st) {
     }
 }
 
+/* Query SBI HSM state for each hart and print a compact summary. */
 static void print_cores(void) {
     unsigned long core;
     long hsm = sbi_probe_extension(SBI_EXT_HSM);
@@ -263,6 +327,7 @@ static void print_cores(void) {
     }
 }
 
+/* Split the command line into the first token and the remaining argument string. */
 static void split_first_arg(char *line, char **cmd, char **arg) {
     char *p = line;
     while (is_space(*p)) {
@@ -281,6 +346,7 @@ static void split_first_arg(char *line, char **cmd, char **arg) {
     *arg = (*p == '\0') ? 0 : p;
 }
 
+/* Emit raw initramfs file bytes to UART, preserving terminal newlines. */
 static void uart_send_bytes(const uint8_t *data, unsigned long size) {
     unsigned long i;
     for (i = 0; i < size; i++) {
@@ -296,6 +362,7 @@ struct ls_ctx {
     unsigned int count;
 };
 
+/* initramfs-backed shell commands. */
 static void ls_cb(const char *name, const void *data, unsigned long size,
                   unsigned int mode, void *ctx) {
     struct ls_ctx *st = (struct ls_ctx *)ctx;
@@ -317,6 +384,7 @@ static void ls_cb(const char *name, const void *data, unsigned long size,
     st->count++;
 }
 
+/* List every visible initramfs entry once the archive has been validated. */
 static void cmd_ls(void) {
     struct ls_ctx st;
     st.count = 0;
@@ -334,6 +402,7 @@ static void cmd_ls(void) {
     uart_send_string(" files.\n");
 }
 
+/* Print a regular initramfs file to UART. */
 static void cmd_cat(const char *arg) {
     const void *data = 0;
     unsigned long size = 0;
@@ -382,6 +451,7 @@ static void cmd_cat(const char *arg) {
     }
 }
 
+/* Allocator smoke-test command used for quick manual validation. */
 static void cmd_allocdemo(void) {
     void *p1;
     void *p2;
@@ -403,6 +473,79 @@ static void cmd_allocdemo(void) {
     uart_send_string("allocator demo done\n");
 }
 
+/* Load a raw user binary from initramfs into the reserved execution window. */
+static void cmd_runu(const char *arg) {
+    const void *data;
+    unsigned long size;
+    unsigned int mode;
+    char path[64];
+
+    /* Validate shell input and make sure initramfs is available first. */
+    if (arg == 0) {
+        uart_send_string("usage: runu <name>\n");
+        return;
+    }
+
+    if (g_initrd_start == 0 || g_initrd_end <= g_initrd_start) {
+        uart_send_string("runu: initramfs unavailable\n");
+        return;
+    }
+
+    if (build_user_program_path(arg, path, sizeof(path)) != 0) {
+        uart_send_string("runu: program name too long\n");
+        return;
+    }
+
+    if (cpio_find((const void *)g_initrd_start, (const void *)g_initrd_end,
+                  path, &data, &size, &mode) != 0) {
+        uart_send_string("runu: file not found: ");
+        uart_send_string(path);
+        uart_send_string("\n");
+        return;
+    }
+
+    /* Accept only regular files that fit in the reserved user code window. */
+    if ((mode & CPIO_MODE_TYPE_MASK) != CPIO_MODE_REGULAR) {
+        uart_send_string("runu: not a regular file: ");
+        uart_send_string(path);
+        uart_send_string("\n");
+        return;
+    }
+
+    if (size == 0 || size > USER_CODE_SIZE) {
+        uart_send_string("runu: invalid program size: ");
+        uart_send_dec(size);
+        uart_send_string("\n");
+        return;
+    }
+
+    /* Stage the raw user binary at the fixed execution address. */
+    copy_bytes((void *)(uintptr_t)USER_CODE_BASE, data, size);
+
+    uart_send_string("runu: found file ");
+    uart_send_string(path);
+    uart_send_string("\n");
+    uart_send_string("runu: copied to ");
+    uart_send_hex((unsigned long)USER_CODE_BASE);
+    uart_send_string("\n");
+    uart_send_string("runu: size = ");
+    uart_send_dec(size);
+    uart_send_string("\n");
+    uart_send_string("runu: entry = ");
+    uart_send_hex((unsigned long)USER_CODE_BASE);
+    uart_send_string("\n");
+    uart_send_string("runu: user stack top = ");
+    uart_send_hex((unsigned long)USER_STACK_TOP);
+    uart_send_string("\n");
+    uart_send_string("runu: requested name = ");
+    uart_send_string(arg);
+    uart_send_string("\n");
+
+    /* Hand control to the prepared user-mode entry path. */
+    enter_user_mode();
+}
+
+/* Main command dispatcher for the interactive shell. */
 void processCommand(shell_t* shell) {
     char *cmd;
     char *arg;
@@ -427,6 +570,7 @@ void processCommand(shell_t* shell) {
         uart_send_string("  slabinfo - Show slab cache state\n");
         uart_send_string("  buddyinfo - Show buddy free-list state\n");
         uart_send_string("  slabcheck - Run slab invariant checks\n");
+        uart_send_string("  runu <name> - Load and run bin/<name>.bin from initramfs\n");
         return;
     }
 
@@ -485,24 +629,28 @@ void processCommand(shell_t* shell) {
         return;
     }
 
+    if (streq(cmd, "runu")) {
+        cmd_runu(arg);
+        return;
+    }
+
     uart_send_string("Unknown command: ");
     uart_send_string(cmd);
     uart_send_string("\n");
-
-
 }
 
+/* Single-command REPL wrapper used by kernel_main. */
 void runAShell(int32_t pid) {
-    char* prompt_start = "> ";
-    shell_t shell; 
-    char command_buffer[128]; 
+    char *prompt_start = "> ";
+    shell_t shell;
+    char command_buffer[128];
     shell.pid = pid;
     uart_send_string(prompt_start);
 
     getCommand(command_buffer, 128);
     trim_in_place(command_buffer);
 
-    shell.command = command_buffer; 
+    shell.command = command_buffer;
 
-    processCommand(&shell); 
+    processCommand(&shell);
 }

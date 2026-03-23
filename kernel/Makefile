@@ -14,6 +14,12 @@ DTB_FILE  := x1_orangepi-rv2.dtb
 ROOTFS_DIR := rootfs
 INITRAMFS := initramfs.cpio
 ROOTFS_FILES := $(shell [ -d $(ROOTFS_DIR) ] && find $(ROOTFS_DIR) -print)
+USER_DIR   := user
+USER_BUILD_DIR := $(BUILD_DIR)/user
+USER_ROOTFS_DIR := $(ROOTFS_DIR)/bin
+USER_TEST_SRC := $(USER_DIR)/test.S
+USER_TEST_ELF := $(USER_BUILD_DIR)/test.elf
+USER_TEST_BIN := $(USER_ROOTFS_DIR)/test.bin
 
 C_SRCS    := $(wildcard $(SRC_DIR)/*.c)
 ASM_SRCS  := $(wildcard $(SRC_DIR)/*.S)
@@ -35,6 +41,12 @@ all: kernel.elf kernel.bin kernel.fit
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
+
+$(USER_BUILD_DIR): | $(BUILD_DIR)
+	mkdir -p $(USER_BUILD_DIR)
+
+$(USER_ROOTFS_DIR):
+	mkdir -p $(USER_ROOTFS_DIR)
 
 $(BUILD_DIR)/board_%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(BOARD_CFLAGS) -c $< -o $@
@@ -60,7 +72,13 @@ kernel.elf: $(BUILD_DIR)/kernel_board.elf
 kernel.bin: $(BUILD_DIR)/kernel_board.elf
 	$(OBJCOPY) -O binary -S $< $@
 
-$(INITRAMFS): $(ROOTFS_FILES)
+$(USER_TEST_ELF): $(USER_TEST_SRC) | $(USER_BUILD_DIR)
+	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=0x0 -Wl,-e,_start -o $@ $<
+
+$(USER_TEST_BIN): $(USER_TEST_ELF) | $(USER_ROOTFS_DIR)
+	$(OBJCOPY) -O binary -S $< $@
+
+$(INITRAMFS): $(ROOTFS_FILES) $(USER_TEST_BIN)
 	@if [ ! -d "$(ROOTFS_DIR)" ]; then \
 		echo "Missing $(ROOTFS_DIR)/ directory"; \
 		exit 1; \
@@ -70,13 +88,13 @@ $(INITRAMFS): $(ROOTFS_FILES)
 kernel.fit: kernel.bin $(ITS_FILE) $(DTB_FILE) $(INITRAMFS)
 	$(MKIMAGE) -f $(ITS_FILE) $@
 
-qemu: $(BUILD_DIR)/kernel_qemu.elf
-	$(QEMU) -M virt -smp 1 -m 256M -nographic -bios default -kernel $(BUILD_DIR)/kernel_qemu.elf
+qemu: $(BUILD_DIR)/kernel_qemu.elf $(INITRAMFS)
+	$(QEMU) -M virt -smp 1 -m 256M -nographic -bios default -kernel $(BUILD_DIR)/kernel_qemu.elf -initrd $(INITRAMFS)
 
 qemu-bin: $(BUILD_DIR)/kernel_qemu.elf
 	$(OBJCOPY) -O binary -S $< build/kernel_qemu.bin
 
 clean:
-	rm -rf $(BUILD_DIR) kernel.elf kernel.bin kernel.fit $(INITRAMFS)
+	rm -rf $(BUILD_DIR) kernel.elf kernel.bin kernel.fit $(INITRAMFS) $(USER_TEST_BIN)
 
 -include $(BOARD_DEPS) $(QEMU_DEPS)
