@@ -20,6 +20,9 @@ USER_ROOTFS_DIR := $(ROOTFS_DIR)/bin
 USER_TEST_SRC := $(USER_DIR)/test.S
 USER_TEST_ELF := $(USER_BUILD_DIR)/test.elf
 USER_TEST_BIN := $(USER_ROOTFS_DIR)/test.bin
+USER_BADINST_SRC := $(USER_DIR)/badinst.S
+USER_BADINST_ELF := $(USER_BUILD_DIR)/badinst.elf
+USER_BADINST_BIN := $(USER_ROOTFS_DIR)/badinst.bin
 
 C_SRCS    := $(wildcard $(SRC_DIR)/*.c)
 ASM_SRCS  := $(wildcard $(SRC_DIR)/*.S)
@@ -78,7 +81,13 @@ $(USER_TEST_ELF): $(USER_TEST_SRC) | $(USER_BUILD_DIR)
 $(USER_TEST_BIN): $(USER_TEST_ELF) | $(USER_ROOTFS_DIR)
 	$(OBJCOPY) -O binary -S $< $@
 
-$(INITRAMFS): $(ROOTFS_FILES) $(USER_TEST_BIN)
+$(USER_BADINST_ELF): $(USER_BADINST_SRC) | $(USER_BUILD_DIR)
+	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=0x0 -Wl,-e,_start -o $@ $<
+
+$(USER_BADINST_BIN): $(USER_BADINST_ELF) | $(USER_ROOTFS_DIR)
+	$(OBJCOPY) -O binary -S $< $@
+
+$(INITRAMFS): $(ROOTFS_FILES) $(USER_TEST_BIN) $(USER_BADINST_BIN)
 	@if [ ! -d "$(ROOTFS_DIR)" ]; then \
 		echo "Missing $(ROOTFS_DIR)/ directory"; \
 		exit 1; \

@@ -55,7 +55,7 @@ void handle_user_ecall(struct trapframe *tf)
 void handle_user_fault(struct trapframe *tf)
 {
     trap_print_tf(tf);
-    uart_send_string("[trap] unhandled user fault\n");
+    uart_send_string("[trap] user fault, terminate\n");
     /* Fatal user faults should stop returning to the broken user context. */
     user_mark_exit();
 }
