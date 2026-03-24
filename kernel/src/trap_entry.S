@@ -93,10 +93,32 @@ trap_entry:
     csrr t0, stval
     sd t0, TF_STVAL(sp)
 
+    /* Hand the completed trapframe to the C dispatcher. */
     mv a0, sp
     call do_trap
+
+    /* do_trap() may classify the trap as SYS_exit and mark the current
+     * user context as finished. In that case we must not restore the user
+     * registers and execute another sret back to U-mode.
+     */
+    call user_has_exited
+    bnez a0, trap_exit_stop
+
+    /* Normal trap path: restore the saved trapframe and return to the
+     * interrupted user context through sret.
+     */
     mv a0, sp
     call trap_return
+
+/* Resume the shell after SYS_exit or a fatal user fault.
+ * This toy kernel does not have a scheduler, so once a user program is done
+ * we stay on the current kernel stack and re-enter the shell loop directly.
+ */
+trap_exit_stop:
+    call user_return_to_shell
+1:
+    wfi
+    j 1b
 
 /* Common trap return path.
  * a0 must point to struct trapframe on the current kernel stack.

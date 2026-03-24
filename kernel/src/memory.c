@@ -17,7 +17,7 @@
 #define POISON_RECLAIM_PAGE 0xCCU
 // TODO
 // Slab Reclamation
-// Thread-Safe / Interrupt-Safe
+
 
 // RAM
 struct mem_region_info {
@@ -43,6 +43,14 @@ enum slab_state {
     SLAB_PARTIAL,
     SLAB_FULL,
 };
+
+struct frame_meta {
+    int16_t state;
+    int32_t free_prev;
+    int32_t free_next;
+    enum page_kind kind;
+};
+
 // Intrusive linked list
 struct kmalloc_free_chunk {
     struct kmalloc_free_chunk *next;
@@ -91,11 +99,12 @@ static uint64_t g_startup_cur = 0;
 static uint64_t g_startup_end = 0;
 static int g_startup_ready = 0;
 // Buddy System thing
-// TODO listhead version
-static int16_t *g_frame_state = 0; // Buddy state only: VAL/F/X
-static int32_t *g_free_next = 0;
+static struct frame_meta *g_frame_array = 0;
 static int32_t g_free_lists[MEMORY_BUDDY_MAX_ORDER + 1];
-static enum page_kind *g_page_kind = 0;
+static int g_regions_direct_map = 0;
+static uint64_t g_direct_map_base = 0;
+static uint64_t g_direct_map_first_idx = 0;
+static uint64_t g_direct_map_last_idx = 0;
 // is buddy +kmalloc  ok
 static int g_memory_ready = 0;
 static uint64_t g_page_alloc_count = 0;
@@ -176,7 +185,7 @@ static unsigned int freelist_count_order(unsigned int order) {
 
     while (cur >= 0) {
         n++;
-        cur = g_free_next[(uint64_t)cur];
+        cur = g_frame_array[(uint64_t)cur].free_next;
     }
     return n;
 }
@@ -470,17 +479,17 @@ static unsigned int slab_calc_capacity(void *page_base, struct kmem_cache *cache
 }
 
 static enum page_kind page_kind_get(uint64_t idx) {
-    if (idx >= g_total_pages || g_page_kind == 0) {
+    if (idx >= g_total_pages || g_frame_array == 0) {
         return PAGE_KIND_NONE;
     }
-    return g_page_kind[idx];
+    return g_frame_array[idx].kind;
 }
 
 static void page_kind_set(uint64_t idx, enum page_kind kind) {
-    if (idx >= g_total_pages || g_page_kind == 0) {
+    if (idx >= g_total_pages || g_frame_array == 0) {
         return;
     }
-    g_page_kind[idx] = kind;
+    g_frame_array[idx].kind = kind;
 }
 
 // Enclosure babbaa
@@ -613,6 +622,17 @@ static void *startup_alloc(uint64_t size, uint64_t align) {
 
 static int find_region_by_index(uint64_t idx, unsigned int *rid_out) {
     unsigned int rid;
+
+    if (g_regions_direct_map) {
+        if (idx >= g_direct_map_first_idx && idx < g_direct_map_last_idx) {
+            if (rid_out != 0) {
+                *rid_out = 0;
+            }
+            return 0;
+        }
+        return -1;
+    }
+
     for (rid = 0; rid < g_region_count; rid++) {
         uint64_t first = g_regions[rid].first_idx;
         uint64_t last = first + g_regions[rid].page_count;
@@ -628,6 +648,19 @@ static int find_region_by_index(uint64_t idx, unsigned int *rid_out) {
 // Page index to real address9
 static int index_to_pa(uint64_t idx, uint64_t *pa_out) {
     unsigned int rid;
+
+    if (pa_out == 0) {
+        return -1;
+    }
+
+    if (g_regions_direct_map) {
+        if (idx < g_direct_map_first_idx || idx >= g_direct_map_last_idx) {
+            return -1;
+        }
+        *pa_out = g_direct_map_base + (idx - g_direct_map_first_idx) * PAGE_SIZE;
+        return 0;
+    }
+
     if (find_region_by_index(idx, &rid) != 0) {
         return -1;
     }
@@ -637,6 +670,24 @@ static int index_to_pa(uint64_t idx, uint64_t *pa_out) {
 // user give back
 static int pa_to_index(uint64_t pa, uint64_t *idx_out, unsigned int *rid_out) {
     unsigned int rid;
+
+    if (idx_out == 0) {
+        return -1;
+    }
+
+    if (g_regions_direct_map) {
+        uint64_t end = g_direct_map_base + (g_direct_map_last_idx - g_direct_map_first_idx) * PAGE_SIZE;
+
+        if (pa < g_direct_map_base || pa >= end || (pa & (PAGE_SIZE - 1U)) != 0U) {
+            return -1;
+        }
+        *idx_out = g_direct_map_first_idx + ((pa - g_direct_map_base) / PAGE_SIZE);
+        if (rid_out != 0) {
+            *rid_out = 0;
+        }
+        return 0;
+    }
+
     for (rid = 0; rid < g_region_count; rid++) {
         uint64_t base = g_regions[rid].base;
         uint64_t end = base + g_regions[rid].size;
@@ -660,9 +711,9 @@ static int pa_to_index(uint64_t pa, uint64_t *idx_out, unsigned int *rid_out) {
 static void block_mark_free(uint64_t idx, unsigned int order) {
     uint64_t pages = 1ULL << order;
     uint64_t i;
-    g_frame_state[idx] = (int16_t)order;
+    g_frame_array[idx].state = (int16_t)order;
     for (i = 1; i < pages; i++) {
-        g_frame_state[idx + i] = FRAME_BUDDY;
+        g_frame_array[idx + i].state = FRAME_BUDDY;
     }
 }
 
@@ -670,15 +721,21 @@ static void block_mark_free(uint64_t idx, unsigned int order) {
 static void block_mark_alloc(uint64_t idx, unsigned int order) {
     uint64_t pages = 1ULL << order;
     uint64_t i;
-    g_frame_state[idx] = alloc_tag_from_order(order);
+    g_frame_array[idx].state = alloc_tag_from_order(order);
     for (i = 1; i < pages; i++) {
-        g_frame_state[idx + i] = FRAME_USED;
+        g_frame_array[idx + i].state = FRAME_USED;
     }
 }
 // mark -2 or -10X
 static void freelist_push(unsigned int order, uint64_t idx) {
     int32_t i32 = (int32_t)idx;
-    g_free_next[idx] = g_free_lists[order];
+    int32_t old_head = g_free_lists[order];
+
+    g_frame_array[idx].free_prev = -1;
+    g_frame_array[idx].free_next = old_head;
+    if (old_head >= 0) {
+        g_frame_array[(uint64_t)old_head].free_prev = i32;
+    }
     g_free_lists[order] = i32;
 
     log_prefix();
@@ -696,8 +753,14 @@ static void freelist_push(unsigned int order, uint64_t idx) {
 static int32_t freelist_pop(unsigned int order) {
     int32_t head = g_free_lists[order];
     if (head >= 0) {
-        g_free_lists[order] = g_free_next[(uint64_t)head];
-        g_free_next[(uint64_t)head] = -1;
+        int32_t next = g_frame_array[(uint64_t)head].free_next;
+
+        g_free_lists[order] = next;
+        if (next >= 0) {
+            g_frame_array[(uint64_t)next].free_prev = -1;
+        }
+        g_frame_array[(uint64_t)head].free_prev = -1;
+        g_frame_array[(uint64_t)head].free_next = -1;
 
         log_prefix();
         uart_send_string("[-] Remove page ");
@@ -711,35 +774,43 @@ static int32_t freelist_pop(unsigned int order) {
     return head;
 }
 
-// this is for merge, remove specific page: need traverse
+// Remove a known free block in O(1) from the order freelist.
 static int freelist_remove(unsigned int order, uint64_t idx) {
-    int32_t prev = -1;
-    int32_t cur = g_free_lists[order];
+    int32_t prev;
+    int32_t next;
 
-    while (cur >= 0) {
-        if ((uint64_t)cur == idx) {
-            int32_t next = g_free_next[(uint64_t)cur];
-            if (prev < 0) {
-                g_free_lists[order] = next;
-            } else {
-                g_free_next[(uint64_t)prev] = next;
-            }
-            g_free_next[idx] = -1;
-
-            log_prefix();
-            uart_send_string("[-] Remove page ");
-            uart_send_dec((unsigned long)idx);
-            uart_send_string(" from order ");
-            uart_send_dec(order);
-            uart_send_string(". Range of pages: ");
-            log_page_range(idx, order);
-            uart_send_string("\n");
-            return 0;
-        }
-        prev = cur;
-        cur = g_free_next[(uint64_t)cur];
+    if (idx >= g_total_pages) {
+        return -1;
     }
-    return -1;
+    if (g_frame_array[idx].state != (int16_t)order) {
+        return -1;
+    }
+
+    prev = g_frame_array[idx].free_prev;
+    next = g_frame_array[idx].free_next;
+    if (prev < 0) {
+        if (g_free_lists[order] != (int32_t)idx) {
+            return -1;
+        }
+        g_free_lists[order] = next;
+    } else {
+        g_frame_array[(uint64_t)prev].free_next = next;
+    }
+    if (next >= 0) {
+        g_frame_array[(uint64_t)next].free_prev = prev;
+    }
+    g_frame_array[idx].free_prev = -1;
+    g_frame_array[idx].free_next = -1;
+
+    log_prefix();
+    uart_send_string("[-] Remove page ");
+    uart_send_dec((unsigned long)idx);
+    uart_send_string(" from order ");
+    uart_send_dec(order);
+    uart_send_string(". Range of pages: ");
+    log_page_range(idx, order);
+    uart_send_string("\n");
+    return 0;
 }
 // Find my potential buddddddddyyyyyyyy
 static int buddy_index(uint64_t idx, unsigned int order, uint64_t *out) {
@@ -805,33 +876,20 @@ static void add_free_run(unsigned int rid, uint64_t run_start_page, uint64_t run
 
 // allocate frame array and freelist in startup
 static int buddy_setup_metadata(void) {
-    // Frame array size : log page
-    uint64_t state_bytes = g_total_pages * sizeof(int16_t);
-    // Freelist size : page index
-    uint64_t next_bytes = g_total_pages * sizeof(int32_t);
-    uint64_t kind_bytes = g_total_pages * sizeof(enum page_kind);
+    uint64_t frame_array_bytes = g_total_pages * sizeof(struct frame_meta);
     uint64_t i;
-    // for buddy allocator
-    g_frame_state = (int16_t *)startup_alloc(state_bytes, 8U);
-    if (g_frame_state == 0) {
+
+    g_frame_array = (struct frame_meta *)startup_alloc(frame_array_bytes, PAGE_SIZE);
+    if (g_frame_array == 0) {
         return -1;
     }
-    g_free_next = (int32_t *)startup_alloc(next_bytes, 8U);
-    if (g_free_next == 0) {
-        return -1;
-    }
-    // for slab allocator reclaim
-    g_page_kind = (enum page_kind *)startup_alloc(kind_bytes, 8U);
-    if (g_page_kind == 0) {
-        return -1;
-    }
-    // Default for safety
+
     for (i = 0; i < g_total_pages; i++) {
-        g_frame_state[i] = FRAME_USED;
-        g_free_next[i] = -1;
-        g_page_kind[i] = PAGE_KIND_NONE;
+        g_frame_array[i].state = FRAME_USED;
+        g_frame_array[i].free_prev = -1;
+        g_frame_array[i].free_next = -1;
+        g_frame_array[i].kind = PAGE_KIND_NONE;
     }
-    // Default
     for (i = 0; i <= MEMORY_BUDDY_MAX_ORDER; i++) {
         g_free_lists[i] = -1;
     }
@@ -854,7 +912,7 @@ static void buddy_build_initial_state(void) {
                     add_free_run(rid, run_start, run_len);
                     run_len = 0;
                 }
-                g_frame_state[idx] = FRAME_USED;
+                g_frame_array[idx].state = FRAME_USED;
                 continue;
             }
 
@@ -975,7 +1033,7 @@ void p_free(void *ptr) {
         return;
     }
 
-    tag = g_frame_state[idx];
+    tag = g_frame_array[idx].state;
     if (!is_alloc_head_tag(tag)) {
         return;
     }
@@ -989,7 +1047,7 @@ void p_free(void *ptr) {
         if (buddy_index(merged_idx, merged_order, &buddy) != 0) {
             break;
         }
-        if (g_frame_state[buddy] != (int16_t)merged_order) {
+        if (g_frame_array[buddy].state != (int16_t)merged_order) {
             break;
         }
         if (freelist_remove(merged_order, buddy) != 0) {
@@ -1043,7 +1101,7 @@ static int kmalloc_refill_class(unsigned int class_idx) {
     if (page == 0) {
         return -1;
     }
-    // Initialization for our new slab page. Buddy ownership/state stays in g_frame_state.
+    // Initialization for our new slab page. Buddy ownership/state stays in g_frame_array.
     base = (uint64_t)(uintptr_t)page;
     if (pa_to_index(base, &page_idx, 0) != 0) {
         p_free(page);
@@ -1351,7 +1409,7 @@ void kfree(void *ptr) {
     }
 
     if (kind == PAGE_KIND_LARGE) {
-        int16_t tag = g_frame_state[page_idx];
+        int16_t tag = g_frame_array[page_idx].state;
         if ((ptr_addr & (PAGE_SIZE - 1U)) != 0U) {
             log_prefix();
             uart_send_string("[Error] kfree large ptr not page-aligned: ");
@@ -1544,6 +1602,11 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
         return;
     }
 
+    g_regions_direct_map = 0;
+    g_direct_map_base = 0;
+    g_direct_map_first_idx = 0;
+    g_direct_map_last_idx = 0;
+
     dt_count = fdt_get_memory_regions(fdt, dt_regions, FDT_MAX_MEM_REGIONS);
     if (dt_count <= 0) {
         log_prefix();
@@ -1583,6 +1646,13 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
         log_prefix();
         uart_send_string("no usable page-aligned memory\n");
         return;
+    }
+
+    if (g_region_count == 1) {
+        g_regions_direct_map = 1;
+        g_direct_map_base = g_regions[0].base;
+        g_direct_map_first_idx = g_regions[0].first_idx;
+        g_direct_map_last_idx = g_regions[0].first_idx + g_regions[0].page_count;
     }
 
     g_total_pages = total_pages;

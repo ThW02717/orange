@@ -1,10 +1,13 @@
 #include <stdint.h>
+#include "shell.h"
 #include "trap.h"
 #include "user.h"
 
 /* Minimal user-mode launch state for Basic Exercise 1. */
 /* Single kernel stack used when the current user context traps back into S-mode. */
 static uint8_t g_user_kstack[USER_KSTACK_SIZE] __attribute__((aligned(16)));
+static int g_user_exited = 0;
+static int32_t g_shell_resume_pid = 1;
 
 /* Minimal state needed to enter U-mode and recover on the next trap. */
 struct user_state {
@@ -38,12 +41,32 @@ static void user_prepare_trapframe(struct trapframe *tf, uint64_t sstatus)
     tf->sstatus = sstatus;
 }
 
+void user_mark_exit(void) {
+    g_user_exited = 1;
+}
+
+int user_has_exited(void) {
+    return g_user_exited;
+}
+
+/* Resume the interactive shell on the current kernel stack after SYS_exit or
+ * a fatal user fault. This toy kernel has no scheduler, so returning to a
+ * fresh shell loop is the simplest way to hand control back to the user.
+ */
+void user_return_to_shell(void)
+{
+    while (1) {
+        runAShell(g_shell_resume_pid++);
+    }
+}
+
 /* Prepare the initial user-mode context and transfer control through trap_return. */
 void enter_user_mode(void)
 {
+
     uint64_t sstatus;
     struct trapframe *tf;
-
+    g_user_exited = 0;
     /* Prepare the minimal execution state for the next user-mode entry. */
     user_prepare_state();
 

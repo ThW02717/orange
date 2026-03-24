@@ -1,7 +1,7 @@
 #include <stdint.h>
 #include "trap.h"
 #include "uart.h"
-
+#include "user.h"
 /* Minimal trap subsystem skeleton for Basic Exercise 1.
  * TODO:
  * 1. trap_init(): program stvec to point at trap_entry.
@@ -38,7 +38,8 @@ void handle_user_ecall(struct trapframe *tf)
         return;
     case SYS_exit:
         /* TODO: mark the current user program as finished and return to shell. */
-        uart_send_string("[trap] SYS_exit not implemented yet\n");
+        uart_send_string("[trap] SYS_exit\n");
+        user_mark_exit();
         tf->sepc += 4;
         return;
     default:
@@ -55,7 +56,8 @@ void handle_user_fault(struct trapframe *tf)
 {
     trap_print_tf(tf);
     uart_send_string("[trap] unhandled user fault\n");
-    /* TODO: stop returning to this user context and hand control back to the shell. */
+    /* Fatal user faults should stop returning to the broken user context. */
+    user_mark_exit();
 }
 
 void do_trap(struct trapframe *tf)

@@ -2,21 +2,30 @@
 #define TRAP_H
 
 #include <stdint.h>
-/* CSR */
+
+/* sstatus bits used by the minimal S-mode <-> U-mode path.
+ * SPP  : privilege level restored by sret (0 = U-mode, 1 = S-mode)
+ * SPIE : interrupt-enable state restored by sret
+ * SIE  : current supervisor interrupt-enable bit
+ */
 #define SSTATUS_SIE            (1UL << 1)
 #define SSTATUS_SPIE           (1UL << 5)
 #define SSTATUS_SPP            (1UL << 8)
 
+/* scause encoding: top bit distinguishes interrupt from exception. */
 #define SCAUSE_INTERRUPT_BIT   (1UL << 63)
 
+/* Minimal exception causes used by Basic Exercise 1. */
 #define SCAUSE_U_ECALL         8UL
 #define SCAUSE_ILLEGAL_INST    2UL
 #define SCAUSE_INST_FAULT      1UL
 #define SCAUSE_LOAD_FAULT      5UL
 #define SCAUSE_STORE_FAULT     7UL
 
+/* Minimal syscall ids carried in a7 across the ecall boundary. */
 #define SYS_test               0UL
 #define SYS_exit               1UL
+
 /* User memory layout.
  * Keep board addresses aligned with the OrangePi RV2 plan.
  * QEMU uses a different RAM map, so the test layout must live in QEMU RAM.
@@ -38,6 +47,13 @@
 #define USER_CODE_LIMIT        (USER_CODE_BASE + USER_CODE_SIZE)
 #define USER_STACK_BASE        (USER_STACK_TOP - USER_STACK_SIZE)
 
+/* Fixed trap save area shared by trap_entry.S and trap.c.
+ * General registers capture the interrupted CPU context.
+ * sepc    : PC of the trapped instruction / return target for sret
+ * sstatus : privilege and interrupt state restored by sret
+ * scause  : trap reason reported by hardware
+ * stval   : extra fault information supplied by hardware
+ */
 struct trapframe {
     uint64_t ra;
     uint64_t sp;
