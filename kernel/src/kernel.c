@@ -186,6 +186,13 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
      * bring-up interactive while the interrupt path is still being tuned.
      */
     uart_send_string("timer: use 'timeron' to enable periodic timer interrupts\n");
+    /* Arm the UART external-interrupt route during boot so shell I/O can
+     * transition to the asynchronous path without a manual enable command.
+     * uart_recv() still keeps a polling fallback until the first real RX IRQ
+     * is observed, which keeps bring-up interactive on real hardware.
+     */
+    uart_irq_init();
+    uart_send_string("uart: interrupt-driven I/O armed at boot\n");
 
     /* The primary hart remains in the shell loop for the rest of boot. */
     {

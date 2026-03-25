@@ -16,6 +16,7 @@
  * STIE specifically enables the supervisor timer interrupt source.
  */
 #define SIE_STIE               (1UL << 5)
+#define SIE_SEIE               (1UL << 9)
 
 /* scause encoding: top bit distinguishes interrupt from exception. */
 #define SCAUSE_INTERRUPT_BIT   (1UL << 63)
@@ -29,6 +30,7 @@
 
 /* Supervisor timer interrupt cause code used by Exercise 2. */
 #define SCAUSE_S_TIMER_INT     5UL
+#define SCAUSE_S_EXT_INT       9UL
 
 /* Minimal syscall ids carried in a7 across the ecall boundary. */
 #define SYS_test               0UL

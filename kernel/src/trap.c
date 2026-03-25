@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "trap.h"
+#include "plic.h"
 #include "timer.h"
 #include "uart.h"
 #include "user.h"
@@ -71,7 +72,20 @@ void do_trap(struct trapframe *tf)
     if (trap_is_interrupt(tf->scause)) {
         if (trap_scause_code(tf->scause) == SCAUSE_S_TIMER_INT) {
             timer_handle_interrupt();
-            
+            return;
+        }
+
+        if (trap_scause_code(tf->scause) == SCAUSE_S_EXT_INT) {
+            uint32_t irq;
+
+            irq = plic_claim();
+            if (irq == UART0_IRQ) {
+                uart_note_external_irq(irq);
+                uart_handle_irq();
+            }
+            if (irq != 0U) {
+                plic_complete(irq);
+            }
             return;
         }
 

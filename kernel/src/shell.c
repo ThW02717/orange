@@ -515,6 +515,58 @@ static void cmd_timeroff(void) {
     timer_stop();
 }
 
+static void cmd_uartirqon(void) {
+    uart_irq_init();
+    uart_send_string("uart irq enabled\n");
+}
+
+static void cmd_uartirqoff(void) {
+    uart_irq_stop();
+    uart_send_string("uart irq disabled\n");
+}
+
+static void cmd_uartstat(void) {
+    uart_send_string("uart async ready: ");
+    uart_send_dec((unsigned long)uart_async_ready());
+    uart_send_string("\n");
+
+    uart_send_string("uart ext irq count: ");
+    uart_send_dec(uart_get_ext_irq_count());
+    uart_send_string("\n");
+
+    uart_send_string("uart rx irq count: ");
+    uart_send_dec(uart_get_rx_irq_count());
+    uart_send_string("\n");
+
+    uart_send_string("uart tx irq count: ");
+    uart_send_dec(uart_get_tx_irq_count());
+    uart_send_string("\n");
+
+    uart_send_string("uart rx fallback count: ");
+    uart_send_dec(uart_get_rx_fallback_count());
+    uart_send_string("\n");
+
+    uart_send_string("uart tx poll count: ");
+    uart_send_dec(uart_get_tx_poll_count());
+    uart_send_string("\n");
+}
+
+static void cmd_uartstatclr(void) {
+    uart_reset_stats();
+    uart_send_string("uart stats cleared\n");
+}
+
+/* Emit enough text to force the TX path to queue and drain asynchronously. */
+static void cmd_txdemo(void) {
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        uart_send_string("txdemo: The UART TX ring buffer is feeding bytes to the interrupt handler while the shell stays responsive. ");
+        uart_send_string("abcdefghijklmnopqrstuvwxyz 0123456789 ");
+        uart_send_string("ABCDEFGHIJKLMNOPQRSTUVWXYZ\n");
+    }
+}
+
 /* Load a raw user binary from initramfs into the reserved execution window. */
 static void cmd_runu(const char *arg) {
     const void *data;
@@ -612,6 +664,11 @@ void processCommand(shell_t* shell) {
         uart_send_string("  time   - Show timer subsystem state\n");
         uart_send_string("  timeron - Enable periodic timer interrupts\n");
         uart_send_string("  timeroff - Disable periodic timer interrupts\n");
+        uart_send_string("  uartirqon - Enable interrupt-driven UART I/O\n");
+        uart_send_string("  uartirqoff - Disable interrupt-driven UART I/O\n");
+        uart_send_string("  uartstat - Show UART IRQ/fallback counters\n");
+        uart_send_string("  uartstatclr - Clear UART IRQ/fallback counters\n");
+        uart_send_string("  txdemo - Print a long string through the TX interrupt path\n");
         uart_send_string("  slabinfo - Show slab cache state\n");
         uart_send_string("  buddyinfo - Show buddy free-list state\n");
         uart_send_string("  slabcheck - Run slab invariant checks\n");
@@ -671,6 +728,31 @@ void processCommand(shell_t* shell) {
 
     if (streq(cmd, "timeroff")) {
         cmd_timeroff();
+        return;
+    }
+
+    if (streq(cmd, "uartirqon")) {
+        cmd_uartirqon();
+        return;
+    }
+
+    if (streq(cmd, "uartirqoff")) {
+        cmd_uartirqoff();
+        return;
+    }
+
+    if (streq(cmd, "uartstat")) {
+        cmd_uartstat();
+        return;
+    }
+
+    if (streq(cmd, "uartstatclr")) {
+        cmd_uartstatclr();
+        return;
+    }
+
+    if (streq(cmd, "txdemo")) {
+        cmd_txdemo();
         return;
     }
 
