@@ -4,8 +4,10 @@
 #include <stdint.h>
 
 /* SBI extension IDs */
+#define SBI_EXT_TIMER_LEGACY   0x00
 #define SBI_EXT_BASE           0x10
 #define SBI_EXT_HSM            0x48534D
+#define SBI_EXT_TIMER          0x54494D45
 
 /* SBI BASE function IDs */
 #define SBI_EXT_BASE_GET_SPEC_VERSION  0x0
@@ -41,6 +43,7 @@ struct sbiret {
     long value;
 };
 
+/* Common SBI transport used by the typed wrappers below. */
 struct sbiret sbi_ecall(int ext, int fid, unsigned long arg0,
                         unsigned long arg1, unsigned long arg2,
                         unsigned long arg3, unsigned long arg4,
@@ -55,5 +58,8 @@ long sbi_probe_extension(long extension_id);
 int sbi_err_map_errno(long err);
 long sbi_hart_start(unsigned long hartid, unsigned long start_addr, unsigned long opaque);
 long sbi_hart_get_status(unsigned long hartid);
+
+/* Program the next machine timer event through SBI firmware. */
+struct sbiret sbi_set_timer(uint64_t stime_value);
 
 #endif

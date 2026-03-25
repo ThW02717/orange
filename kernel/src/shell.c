@@ -8,6 +8,7 @@
 #include "memory.h"
 #include "memory_test.h"
 #include "trap.h"
+#include "timer.h"
 #include "user.h"
 
 /* Interactive UART shell with initramfs-backed file commands and user-program launch. */
@@ -473,6 +474,47 @@ static void cmd_allocdemo(void) {
     uart_send_string("allocator demo done\n");
 }
 
+/* Print the current timer subsystem state without needing a reboot log. */
+static void cmd_time(void) {
+    uint64_t now;
+
+    now = timer_read();
+
+    uart_send_string("timer freq: ");
+    uart_send_dec(g_timebase_freq);
+    uart_send_string("\n");
+
+    uart_send_string("timer boot: ");
+    uart_send_dec(g_boot_time);
+    uart_send_string("\n");
+
+    uart_send_string("timer now: ");
+    uart_send_dec(now);
+    uart_send_string("\n");
+
+    uart_send_string("timer next: ");
+    uart_send_dec(g_next_deadline);
+    uart_send_string("\n");
+
+    uart_send_string("timer uptime: ");
+    uart_send_dec(g_uptime_seconds);
+    uart_send_string("\n");
+}
+
+/* Manually enable the timer subsystem once boot-time probes have completed. */
+static void cmd_timeron(void) {
+    if (g_timebase_freq == 0) {
+        uart_send_string("timeron: timer frequency unavailable\n");
+        return;
+    }
+
+    timer_init();
+}
+
+static void cmd_timeroff(void) {
+    timer_stop();
+}
+
 /* Load a raw user binary from initramfs into the reserved execution window. */
 static void cmd_runu(const char *arg) {
     const void *data;
@@ -567,6 +609,9 @@ void processCommand(shell_t* shell) {
         uart_send_string("  allocdemo - Run allocator demo\n");
         uart_send_string("  kmtest <name> - Run allocator tests\n");
         uart_send_string("  memstat  - Show allocator counters\n");
+        uart_send_string("  time   - Show timer subsystem state\n");
+        uart_send_string("  timeron - Enable periodic timer interrupts\n");
+        uart_send_string("  timeroff - Disable periodic timer interrupts\n");
         uart_send_string("  slabinfo - Show slab cache state\n");
         uart_send_string("  buddyinfo - Show buddy free-list state\n");
         uart_send_string("  slabcheck - Run slab invariant checks\n");
@@ -611,6 +656,21 @@ void processCommand(shell_t* shell) {
 
     if (streq(cmd, "memstat")) {
         memory_print_memstat();
+        return;
+    }
+
+    if (streq(cmd, "time")) {
+        cmd_time();
+        return;
+    }
+
+    if (streq(cmd, "timeron")) {
+        cmd_timeron();
+        return;
+    }
+
+    if (streq(cmd, "timeroff")) {
+        cmd_timeroff();
         return;
     }
 

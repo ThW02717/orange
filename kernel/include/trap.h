@@ -12,6 +12,11 @@
 #define SSTATUS_SPIE           (1UL << 5)
 #define SSTATUS_SPP            (1UL << 8)
 
+/* sie selects which supervisor interrupt sources are individually enabled.
+ * STIE specifically enables the supervisor timer interrupt source.
+ */
+#define SIE_STIE               (1UL << 5)
+
 /* scause encoding: top bit distinguishes interrupt from exception. */
 #define SCAUSE_INTERRUPT_BIT   (1UL << 63)
 
@@ -21,6 +26,9 @@
 #define SCAUSE_INST_FAULT      1UL
 #define SCAUSE_LOAD_FAULT      5UL
 #define SCAUSE_STORE_FAULT     7UL
+
+/* Supervisor timer interrupt cause code used by Exercise 2. */
+#define SCAUSE_S_TIMER_INT     5UL
 
 /* Minimal syscall ids carried in a7 across the ecall boundary. */
 #define SYS_test               0UL

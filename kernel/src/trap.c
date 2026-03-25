@@ -1,14 +1,12 @@
 #include <stdint.h>
 #include "trap.h"
+#include "timer.h"
 #include "uart.h"
 #include "user.h"
-/* Minimal trap subsystem skeleton for Basic Exercise 1.
- * TODO:
- * 1. trap_init(): program stvec to point at trap_entry.
- * 2. enter_user_mode() path: prepare an initial trapframe and sret into U-mode.
- * 3. trap.S: save x1-x31 and CSR state into struct trapframe, then call do_trap().
- * 4. handle_user_ecall(): decode a7, advance sepc for SYS_test, and finish SYS_exit.
- * 5. handle_user_fault(): terminate the current user program and return to shell.
+
+/* C-side trap dispatch for the minimal user-mode path.
+ * Assembly is responsible for saving/restoring CPU state. This file decides
+ * whether the trap is an ecall, a user fault, or an unimplemented interrupt.
  */
 
 static void trap_print_tf(const struct trapframe *tf)
@@ -24,21 +22,22 @@ static void trap_print_tf(const struct trapframe *tf)
 
 void trap_init(void)
 {
+    /* All supervisor traps currently enter through one common assembly stub. */
     asm volatile("csrw stvec, %0" : : "r"(trap_entry));
 }
 
 void handle_user_ecall(struct trapframe *tf)
 {
+    /* Print the trapped user state before decoding the syscall number in a7. */
     trap_print_tf(tf);
 
     switch (tf->a7) {
     case SYS_test:
-        /* TODO: add any temporary diagnostics you want for the SYS_test path. */
+        /* Skip the ecall itself and resume at the next user instruction. */
         tf->sepc += 4;
         return;
     case SYS_exit:
-        /* TODO: mark the current user program as finished and return to shell. */
-        uart_send_string("[trap] SYS_exit\n");
+        uart_send_string("[kernel] user exit\n");
         user_mark_exit();
         tf->sepc += 4;
         return;
@@ -56,7 +55,9 @@ void handle_user_fault(struct trapframe *tf)
 {
     trap_print_tf(tf);
     uart_send_string("[trap] user fault, terminate\n");
-    /* Fatal user faults should stop returning to the broken user context. */
+    /* Force trap_entry.S to abandon the current user context and re-enter
+     * the shell instead of restoring the faulting user state.
+     */
     user_mark_exit();
 }
 
@@ -68,11 +69,20 @@ void do_trap(struct trapframe *tf)
     }
 
     if (trap_is_interrupt(tf->scause)) {
-        uart_send_string("[trap] interrupt path not implemented yet\n");
+        if (trap_scause_code(tf->scause) == SCAUSE_S_TIMER_INT) {
+            timer_handle_interrupt();
+            
+            return;
+        }
+
+        uart_send_string("[trap] unhandled interrupt\n");
         trap_print_tf(tf);
         return;
     }
 
+    /* Basic Exercise 1 only expects U-mode ecall plus a generic user fault
+     * fallback for every other exception.
+     */
     if (trap_scause_code(tf->scause) == SCAUSE_U_ECALL) {
         handle_user_ecall(tf);
         return;

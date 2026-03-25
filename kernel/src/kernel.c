@@ -1,10 +1,16 @@
 
 #include <stdint.h>
-#include "uart.h" 
+#include "uart.h"
+#include "fdt.h"
 #include "shell.h"
 #include "sbi.h"
 #include "memory.h"
+#include "timer.h"
+#include "trap.h"
 
+/* Bootstrap-core-only kernel entry. Secondary harts are started after the
+ * primary hart initializes memory, shell context, and other global state.
+ */
 static volatile unsigned long bootstrap_hart = ~0UL;
 static volatile unsigned int greet_ticket = 0;
 static volatile unsigned int greet_serving = 0;
@@ -15,8 +21,68 @@ static volatile unsigned int started_cores = 1;
 #define SECONDARY_STACK_SIZE 4096
 
 static unsigned char secondary_stacks[MAX_CORES - 1][SECONDARY_STACK_SIZE] __attribute__((aligned(16)));
-
 extern void secondary_start(void);
+
+/* Boot-time rdtime probe only: add a little distance between reads so the
+ * monotonic counter is visible on a fast CPU.
+ */
+static void timer_probe_delay(unsigned long count)
+{
+    while (count-- > 0) {
+        asm volatile("nop");
+    }
+}
+
+static void timer_probe_readout(void)
+{
+    uint64_t t1;
+    uint64_t t2;
+    uint64_t t3;
+
+    /* Read the raw time counter a few times to confirm it is increasing
+     * before building interrupt scheduling on top of it.
+     */
+    t1 = timer_read();
+    timer_probe_delay(10000UL);
+    t2 = timer_read();
+    timer_probe_delay(10000UL);
+    t3 = timer_read();
+
+    uart_send_string("timer read: t1=");
+    uart_send_dec(t1);
+    uart_send_string(" t2=");
+    uart_send_dec(t2);
+    uart_send_string(" t3=");
+    uart_send_dec(t3);
+    uart_send_string("\n");
+}
+
+static void timer_probe_state(void)
+{
+    /* Dump the timer subsystem's initial bookkeeping before interrupts are
+     * wired in so later regressions have a clear baseline.
+     */
+    uart_send_string("timer state: boot=");
+    uart_send_dec(g_boot_time);
+    uart_send_string(" next=");
+    uart_send_dec(g_next_deadline);
+    uart_send_string(" uptime=");
+    uart_send_dec(g_uptime_seconds);
+    uart_send_string("\n");
+}
+
+static void timer_probe_sbi_support(void)
+{
+    long supported;
+
+    /* Probe the SBI TIME extension explicitly so we can distinguish
+     * "deadline math is wrong" from "firmware does not implement TIME".
+     */
+    supported = sbi_probe_extension(SBI_EXT_TIMER);
+    uart_send_string("sbi TIME ext = ");
+    uart_send_dec((unsigned long)supported);
+    uart_send_string("\n");
+}
 
 static void greet_once(unsigned long core_id) {
     unsigned int my_ticket = __sync_fetch_and_add(&greet_ticket, 1);
@@ -45,6 +111,7 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
     unsigned int stack_slot = 0;
     unsigned long target_hart;
 
+    /* Only the bootstrap hart continues through the full kernel init path. */
     if (bootstrap_hart == ~0UL) {
         bootstrap_hart = hartid;
     }
@@ -58,7 +125,12 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
     /* Keep bootloader UART state first to avoid serial regressions. */
     shell_set_context(hartid, dtb_addr, (uint64_t)initrd_start_hint, (uint64_t)initrd_end_hint);
     memory_init((const void *)dtb_addr, (uint64_t)initrd_start_hint, (uint64_t)initrd_end_hint);
+    /* Timer interrupts are delivered while the shell is running in S-mode,
+     * so stvec must already point at trap_entry before timeron can be used.
+     */
+    trap_init();
 
+    /* Bring up the remaining harts with private secondary stacks. */
     for (target_hart = 0; target_hart < MAX_CORES; target_hart++) {
         long ret;
         unsigned long stack_top;
@@ -94,6 +166,28 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
         }
     }
 
+    /* Print the DT-provided timer frequency after the multi-core greeting
+     * burst settles down so the value is easier to read on the shared UART.
+     */
+    if (fdt_get_timebase_frequency((const void *)dtb_addr, &g_timebase_freq) == 0) {
+        timer_init_state(g_timebase_freq);
+        uart_send_string("timer freq = ");
+        uart_send_dec(g_timebase_freq);
+        uart_send_string("\n");
+    } else {
+        uart_send_string("timer freq = <unavailable>\n");
+    }
+
+    timer_probe_state();
+    timer_probe_readout();
+    timer_probe_sbi_support();
+
+    /* Leave timer enable under an explicit shell command for now. This keeps
+     * bring-up interactive while the interrupt path is still being tuned.
+     */
+    uart_send_string("timer: use 'timeron' to enable periodic timer interrupts\n");
+
+    /* The primary hart remains in the shell loop for the rest of boot. */
     {
         int32_t pid = 1;
         while (1) {

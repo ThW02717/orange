@@ -581,3 +581,30 @@ int fdt_get_initrd_range(const void *fdt, uint64_t *start, uint64_t *end) {
     *end = e;
     return 0;
 }
+
+int fdt_get_timebase_frequency(const void *fdt, uint32_t *freq)
+{
+    int node;
+    int len;
+    const uint32_t *prop;
+
+    if (fdt == 0 || freq == 0) {
+        return -1;
+    }
+    if (fdt_check_header(fdt) != 0) {
+        return -1;
+    }
+
+    node = fdt_path_offset(fdt, "/cpus");
+    if (node < 0) {
+        return -1;
+    }
+
+    prop = (const uint32_t *)fdt_getprop(fdt, node, "timebase-frequency", &len);
+    if (prop == 0 || len < 4) {
+        return -1;
+    }
+    // big to littele
+    *freq = fdt32_to_cpu(*prop);
+    return 0;
+}

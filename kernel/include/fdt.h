@@ -18,5 +18,6 @@ int fdt_get_memory_regions(const void *fdt, struct fdt_mem_region *regions, int 
 int fdt_get_reserved_memory_regions(const void *fdt, struct fdt_mem_region *regions, int max_regions);
 int fdt_get_memory_region(const void *fdt, uint64_t *base, uint64_t *size);
 int fdt_get_initrd_range(const void *fdt, uint64_t *start, uint64_t *end);
+int fdt_get_timebase_frequency(const void *fdt, uint32_t *freq);
 
 #endif

@@ -42,18 +42,42 @@
 .equ TRAPFRAME_ALLOC_SIZE, 288
 
 /* Supervisor trap entry.
- * Assumption for the user-mode path:
- *   sscratch = current task's kernel stack top
- * On trap from U-mode, swap sp and sscratch so we land on the kernel stack
- * and preserve the interrupted user sp inside sscratch.
+ * - Trap from U-mode: sscratch holds the kernel stack top, so swap sp and
+ *   sscratch to land on the kernel stack and preserve the user sp.
+ * - Trap from S-mode: we are already on a kernel stack, so keep sp as-is and
+ *   save the interrupted kernel sp into the trapframe directly.
  */
 trap_entry:
+    csrr t0, sstatus
+    andi t0, t0, 0x100
+    bnez t0, 1f
+
+    /* U-mode trap path: switch from user sp to the task's kernel stack. */
     csrrw sp, sscratch, sp
     addi sp, sp, -TRAPFRAME_ALLOC_SIZE
+    j 2f
 
+1:
+    /* S-mode trap path: keep the current kernel stack and allocate the
+     * trapframe on it directly.
+     */
+    addi sp, sp, -TRAPFRAME_ALLOC_SIZE
+
+2:
+
+    /* Save the interrupted CPU context into the trapframe. TF_SP always stores
+     * the interrupted stack pointer, whether that was a user sp or a kernel sp.
+     */
     sd ra, TF_RA(sp)
     sd t0, TF_T0(sp)
+    csrr t0, sstatus
+    andi t0, t0, 0x100
+    bnez t0, 3f
     csrr t0, sscratch
+    j 4f
+3:
+    addi t0, sp, TRAPFRAME_ALLOC_SIZE
+4:
     sd t0, TF_SP(sp)
     sd gp, TF_GP(sp)
     sd tp, TF_TP(sp)
@@ -126,11 +150,13 @@ trap_exit_stop:
 trap_return:
     mv t0, a0
 
+    /* Restore CSR state first so sret returns to the correct PC and mode. */
     ld t1, TF_SEPC(t0)
     csrw sepc, t1
     ld t1, TF_SSTATUS(t0)
     csrw sstatus, t1
 
+    /* Restore the general-purpose registers from the trapframe image. */
     ld ra, TF_RA(t0)
     ld gp, TF_GP(t0)
     ld tp, TF_TP(t0)
@@ -166,4 +192,5 @@ trap_return:
     ld sp, TF_SP(t0)
     ld t0, TF_T0(t0)
 
+    /* Return to the PC recorded in sepc, using the privilege encoded in sstatus. */
     sret
