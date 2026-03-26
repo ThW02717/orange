@@ -16,16 +16,6 @@ The project is intentionally narrow and observable. Most features are exposed th
 - buddy page allocator
 - slab-based kernel heap allocator
 
-## Why It Is Interesting
-
-This codebase focuses on the parts of kernel bring-up that are easy to describe in theory but messy in practice on hardware:
-
-- switching from S-mode to U-mode and getting back correctly
-- preserving enough state to recover from both `ecall` and user faults
-- making UART genuinely interrupt-driven instead of silently falling back to polling
-- loading different user binaries into the same execution window without executing stale instructions
-- wiring timer and external interrupts on a real RISC-V board, not only in emulation
-
 ## Trap Architecture
 
 The kernel uses one common supervisor trap entry:
