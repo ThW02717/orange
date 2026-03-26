@@ -122,6 +122,12 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
         }        
     }
 
+    if (uart_platform_init_from_fdt((const void *)dtb_addr) != 0) {
+        while (1) {
+            asm volatile("wfi");
+        }
+    }
+
     /* Keep bootloader UART state first to avoid serial regressions. */
     shell_set_context(hartid, dtb_addr, (uint64_t)initrd_start_hint, (uint64_t)initrd_end_hint);
     memory_init((const void *)dtb_addr, (uint64_t)initrd_start_hint, (uint64_t)initrd_end_hint);

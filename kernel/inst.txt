@@ -1,0 +1,127 @@
+
+sudo screen /dev/ttyUSB0 115200
+
+
+
+sudo python3 bootloader/tools/uart_load.py /dev/ttyUSB0 kernel/kernel.bin --initrd kernel/initramfs.cpio --load-cmd never
+
+
+
+
+一開始壞掉的原因，不是 ring buffer 本身，而是 我太早把整條 UART path 切成「假設 IRQ 已經通」，但實際上硬體中斷根本還沒被正確打開。
+
+整段問題可以拆成這幾層。
+
+1. 一開始一開 UART async，shell 就不能打字
+當時我做的是：
+
+uart_irq_init() 一開
+就讓 uart.c 的 uart_recv() 改成只吃 RX ring buffer
+shell 的 shell.c getCommand() 又完全依賴 uart_recv()
+但那時候實際上：
+
+UART RX interrupt 根本沒進來
+RX ring buffer 一直是空的
+所以結果就是：
+
+shell 卡在等 RX buffer
+看起來像「連字都不能打」
+也就是說，不是 shell parser 壞掉，是輸入來源被我太早改掉了。
+
+2. 為什麼 IRQ 根本沒進來
+那時候表面上我已經做了：
+
+PLIC enable
+sie.SEIE
+sstatus.SIE
+UART IER 開 RX bit
+但這顆板子的 UART 不是最普通的 16550，它在 DT 裡明確寫的是：
+
+compatible = "ky,pxa-uart"
+而 pxa-uart 的 interrupt bring-up 不是只開最基本的：
+
+IER[RX]
+就夠了。
+少掉的東西包括：
+
+UART_IER_UUE
+UART_IER_RTO_ENABLE
+UART_IER_LINE_ENABLE
+UART_MCR_OUT2
+還有啟用前後的 stale interrupt status clear
+所以前面那版雖然「看起來像把 IRQ 架構都接好了」，其實 UART 硬體端根本沒真的把中斷線送出來。
+
+3. 那時候為什麼 txdemo 也看起來能用
+因為我前面為了避免 shell 完全死掉，做了兩個妥協：
+
+RX 有 fallback polling
+TX 還會在 uart_send() 裡直接試著送字
+所以即使沒有 IRQ，表面上：
+
+shell 還能收字
+txdemo 還能印
+但那其實只是：
+
+polling/fallback 在撐
+不是 interrupt-driven
+後來 uartstat 一量就很清楚：
+
+ext irq count = 0
+rx irq count = 0
+tx irq count = 0
+fallback/poll count 一直增加
+這就直接證明：
+
+前面那版根本沒真的進中斷
+4. 為什麼後來要加 uartstat
+因為只靠「看起來能打字」根本不夠。
+
+如果沒有計數器，你很容易被這種情況騙到：
+
+shell 能用
+txdemo 能印
+但其實全部都還是 polling
+所以我後來在 uart.c 加了：
+
+external IRQ count
+RX IRQ count
+TX IRQ count
+RX fallback count
+TX poll count
+在 shell.c 加了：
+
+uartstat
+uartstatclr
+這一步很關鍵，因為它把「感覺有沒有成功」變成了「可量測」。
+
+5. 最後真正修好的關鍵
+真正把它從「假 async」變成「真 interrupt-driven」的關鍵，不是 shell，不是 ring buffer，而是把 UART 硬體初始化補到比較像 Linux pxa-uart 的做法：
+
+在 uart.c uart_irq_init() 裡補了：
+
+UART_FCR_REG = 0x07
+UART_IER_UUE
+UART_IER_RX_ENABLE
+UART_IER_LINE_ENABLE
+UART_IER_RTO_ENABLE
+UART_MCR_OUT2
+啟用前後讀：
+LSR
+RBR
+IIR
+MSR
+來清掉 stale interrupt status
+補完這些之後，你的 uartstat 才第一次出現真正對的結果：
+
+async ready = 1
+ext irq count > 0
+rx irq count > 0
+tx irq count > 0
+rx fallback count = 0
+tx poll count = 0
+這才代表：
+
+RX/TX 都真的走中斷
+shell 不再只是靠 fallback 撐著
+一句話總結
+前面一堆問題的根本原因，是我一開始把 shell I/O 太早切到 ring buffer，但實際上 pxa-uart 的硬體中斷還沒被正確打開；後來靠 uartstat 證明這件事，再把 UUE / RTO / LINE / OUT2 / stale status clear 補齊，才真正把它修成完全 interrupt-driven。

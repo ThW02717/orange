@@ -21,6 +21,17 @@ static void trap_print_tf(const struct trapframe *tf)
     uart_send_string("\n");
 }
 
+static void trap_print_user_syscall(const char *name, const struct trapframe *tf)
+{
+    uart_send_string("[trap] U-mode ecall ");
+    uart_send_string(name);
+    uart_send_string(" a7=");
+    uart_send_dec((unsigned long)tf->a7);
+    uart_send_string(" sepc=");
+    uart_send_hex((unsigned long)tf->sepc);
+    uart_send_string("\n");
+}
+
 void trap_init(void)
 {
     /* All supervisor traps currently enter through one common assembly stub. */
@@ -29,20 +40,26 @@ void trap_init(void)
 
 void handle_user_ecall(struct trapframe *tf)
 {
-    /* Print the trapped user state before decoding the syscall number in a7. */
-    trap_print_tf(tf);
-
     switch (tf->a7) {
     case SYS_test:
+        trap_print_user_syscall("SYS_test", tf);
+        trap_print_tf(tf);
         /* Skip the ecall itself and resume at the next user instruction. */
         tf->sepc += 4;
+        uart_send_string("[trap] resume U-mode at sepc=");
+        uart_send_hex((unsigned long)tf->sepc);
+        uart_send_string("\n");
         return;
     case SYS_exit:
-        uart_send_string("[kernel] user exit\n");
+        trap_print_user_syscall("SYS_exit", tf);
+        trap_print_tf(tf);
+        uart_send_string("[kernel] user exit -> return to shell\n");
         user_mark_exit();
         tf->sepc += 4;
         return;
     default:
+        trap_print_user_syscall("UNKNOWN", tf);
+        trap_print_tf(tf);
         uart_send_string("[trap] unknown syscall id=");
         uart_send_dec((unsigned long)tf->a7);
         uart_send_string("\n");
@@ -79,8 +96,8 @@ void do_trap(struct trapframe *tf)
             uint32_t irq;
 
             irq = plic_claim();
-            if (irq == UART0_IRQ) {
-                uart_note_external_irq(irq);
+            if (irq == uart_irq_id()) {
+                uart_demo_note_external_irq(irq);
                 uart_handle_irq();
             }
             if (irq != 0U) {

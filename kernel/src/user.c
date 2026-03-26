@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include "shell.h"
 #include "trap.h"
+#include "uart.h"
 #include "user.h"
 
 /* Minimal user-mode launch state for Basic Exercise 1. */
@@ -56,6 +57,24 @@ int user_has_exited(void) {
  */
 void user_return_to_shell(void)
 {
+    uint64_t sstatus;
+
+    /* Once control is back in the shell, later S-mode interrupts must follow
+     * the normal trap-return path again. Leave the "user exited" state as a
+     * one-shot handoff signal instead of a permanent sticky flag.
+     */
+    g_user_exited = 0;
+
+    /* trap_exit_stop reaches the shell without going through trap_return, so
+     * the current S-mode interrupt-enable bit stays cleared unless we restore
+     * it here. The shell relies on UART external interrupts to fill the RX/TX
+     * ring buffers, so re-enable S-mode interrupts before re-entering the
+     * REPL.
+     */
+    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
+    sstatus |= SSTATUS_SIE;
+    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
+
     while (1) {
         runAShell(g_shell_resume_pid++);
     }
@@ -71,6 +90,14 @@ void enter_user_mode(void)
 
     /* Prepare the minimal execution state for the next user-mode entry. */
     user_prepare_state();
+
+    uart_send_string("[user] prepare U-mode entry=");
+    uart_send_hex((unsigned long)g_user_state.user_entry);
+    uart_send_string(" sp=");
+    uart_send_hex((unsigned long)g_user_state.user_sp);
+    uart_send_string(" kstack=");
+    uart_send_hex((unsigned long)g_user_state.kstack_top);
+    uart_send_string("\n");
 
     /* Register the supervisor trap entry before dropping privilege. */
     trap_init();
@@ -95,6 +122,8 @@ void enter_user_mode(void)
      */
     tf = (struct trapframe *)(uintptr_t)(g_user_state.kstack_top - TRAPFRAME_ALLOC_SIZE);
     user_prepare_trapframe(tf, sstatus);
+
+    uart_send_string("[user] sret -> U-mode\n");
 
     /* trap_return restores this synthetic trapframe and performs the first
      * sret into the loaded user program.

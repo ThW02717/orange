@@ -65,6 +65,28 @@ static int name_starts_with(const char *name, const char *prefix) {
     return 1;
 }
 
+static int prop_has_compatible(const void *prop, int len, const char *compatible)
+{
+    const char *cur = (const char *)prop;
+    const char *end = cur + len;
+    unsigned int want_len;
+
+    if (prop == 0 || compatible == 0 || len <= 0) {
+        return 0;
+    }
+
+    want_len = str_len(compatible);
+    while (cur < end && *cur != '\0') {
+        unsigned int cur_len = str_len(cur);
+
+        if (cur_len == want_len && name_eq(cur, compatible, want_len)) {
+            return 1;
+        }
+        cur += cur_len + 1U;
+    }
+    return 0;
+}
+
 static unsigned int align4(unsigned int n) {
     return (n + 3U) & ~3U;
 }
@@ -274,6 +296,81 @@ const void *fdt_getprop(const void *fdt, int nodeoffset, const char *name, int *
     }
 
     return 0;
+}
+
+int fdt_find_compatible(const void *fdt, const char *compatible)
+{
+    const struct fdt_header *hdr;
+    const uint8_t *struct_base;
+    const uint8_t *cur;
+    const uint8_t *end;
+    int depth = -1;
+    int current_node[FDT_MAX_DEPTH];
+
+    if (fdt == 0 || compatible == 0) {
+        return -1;
+    }
+    if (fdt_check_header(fdt) != 0) {
+        return -1;
+    }
+
+    hdr = (const struct fdt_header *)fdt;
+    struct_base = (const uint8_t *)fdt + fdt32_to_cpu(hdr->off_dt_struct);
+    cur = struct_base;
+    end = struct_base + fdt32_to_cpu(hdr->size_dt_struct);
+
+    while (cur < end) {
+        uint32_t token = fdt32_to_cpu(*(const uint32_t *)cur);
+        cur += 4;
+
+        switch (token) {
+        case FDT_BEGIN_NODE: {
+            const char *name = (const char *)cur;
+            int node_offset = (int)((cur - 4) - struct_base);
+
+            depth++;
+            if (depth >= FDT_MAX_DEPTH) {
+                return -1;
+            }
+            current_node[depth] = node_offset;
+            cur += align4(str_len(name) + 1U);
+            break;
+        }
+        case FDT_END_NODE:
+            depth--;
+            break;
+        case FDT_PROP: {
+            uint32_t len = fdt32_to_cpu(*(const uint32_t *)cur);
+            uint32_t nameoff;
+            const char *prop_name;
+            const void *prop_data;
+            const uint8_t *strings_base;
+
+            cur += 4;
+            nameoff = fdt32_to_cpu(*(const uint32_t *)cur);
+            cur += 4;
+            strings_base = (const uint8_t *)fdt + fdt32_to_cpu(hdr->off_dt_strings);
+            prop_name = (const char *)(strings_base + nameoff);
+            prop_data = (const void *)cur;
+            cur += align4(len);
+
+            if (depth >= 0 &&
+                name_eq(prop_name, "compatible", 10U) &&
+                prop_has_compatible(prop_data, (int)len, compatible)) {
+                return current_node[depth];
+            }
+            break;
+        }
+        case FDT_NOP:
+            break;
+        case FDT_END:
+            return -1;
+        default:
+            return -1;
+        }
+    }
+
+    return -1;
 }
 
 static int fdt_get_u32(const void *fdt, int node, const char *name, uint32_t defval) {
@@ -606,5 +703,42 @@ int fdt_get_timebase_frequency(const void *fdt, uint32_t *freq)
     }
     // big to littele
     *freq = fdt32_to_cpu(*prop);
+    return 0;
+}
+
+int fdt_get_reg_base(const void *fdt, int nodeoffset, uint64_t *base)
+{
+    int len = 0;
+    const uint32_t *prop;
+
+    if (base == 0) {
+        return -1;
+    }
+
+    prop = (const uint32_t *)fdt_getprop(fdt, nodeoffset, "reg", &len);
+    if (prop == 0 || len < 8) {
+        return -1;
+    }
+
+    *base = ((uint64_t)fdt32_to_cpu(prop[0]) << 32) |
+            (uint64_t)fdt32_to_cpu(prop[1]);
+    return 0;
+}
+
+int fdt_get_interrupt_id(const void *fdt, int nodeoffset, uint32_t *irq)
+{
+    int len = 0;
+    const uint32_t *prop;
+
+    if (irq == 0) {
+        return -1;
+    }
+
+    prop = (const uint32_t *)fdt_getprop(fdt, nodeoffset, "interrupts", &len);
+    if (prop == 0 || len < 4) {
+        return -1;
+    }
+
+    *irq = fdt32_to_cpu(prop[0]);
     return 0;
 }

@@ -515,55 +515,58 @@ static void cmd_timeroff(void) {
     timer_stop();
 }
 
-static void cmd_uartirqon(void) {
-    uart_irq_init();
-    uart_send_string("uart irq enabled\n");
-}
-
-static void cmd_uartirqoff(void) {
-    uart_irq_stop();
-    uart_send_string("uart irq disabled\n");
-}
-
-static void cmd_uartstat(void) {
-    uart_send_string("uart async ready: ");
-    uart_send_dec((unsigned long)uart_async_ready());
-    uart_send_string("\n");
-
-    uart_send_string("uart ext irq count: ");
-    uart_send_dec(uart_get_ext_irq_count());
-    uart_send_string("\n");
-
-    uart_send_string("uart rx irq count: ");
-    uart_send_dec(uart_get_rx_irq_count());
-    uart_send_string("\n");
-
-    uart_send_string("uart tx irq count: ");
-    uart_send_dec(uart_get_tx_irq_count());
-    uart_send_string("\n");
-
-    uart_send_string("uart rx fallback count: ");
-    uart_send_dec(uart_get_rx_fallback_count());
-    uart_send_string("\n");
-
-    uart_send_string("uart tx poll count: ");
-    uart_send_dec(uart_get_tx_poll_count());
-    uart_send_string("\n");
-}
-
-static void cmd_uartstatclr(void) {
-    uart_reset_stats();
-    uart_send_string("uart stats cleared\n");
-}
-
 /* Emit enough text to force the TX path to queue and drain asynchronously. */
-static void cmd_txdemo(void) {
-    int i;
+/* One-shot UART demo:
+ * - emits enough output to exercise the TX interrupt path
+ * - asks the user for one input character to prove RX interrupts feed the
+ *   shell path
+ * - prints a compact pass/fail summary based on the UART driver counters
+ */
+static void cmd_uartdemo(void) {
+    struct uart_demo_stats stats;
+    char c;
+    int pass;
 
-    for (i = 0; i < 8; i++) {
-        uart_send_string("txdemo: The UART TX ring buffer is feeding bytes to the interrupt handler while the shell stays responsive. ");
-        uart_send_string("abcdefghijklmnopqrstuvwxyz 0123456789 ");
-        uart_send_string("ABCDEFGHIJKLMNOPQRSTUVWXYZ\n");
+    uart_demo_reset_stats();
+
+    uart_send_string("uartdemo: TX phase\n");
+    uart_send_string("uartdemo: TX interrupt-driven output test line\n");
+
+    uart_send_string("uartdemo: RX phase, type one printable key: ");
+    c = uart_recv();
+    uart_send_string("\n");
+
+    uart_demo_get_stats(&stats);
+
+    uart_send_string("uartdemo: got '");
+    uart_send(c);
+    uart_send_string("'\n");
+
+    uart_send_string("uartdemo: stats async_ready=");
+    uart_send_dec(stats.async_ready);
+    uart_send_string(" ext_irq=");
+    uart_send_dec(stats.ext_irq_count);
+    uart_send_string(" rx_irq=");
+    uart_send_dec(stats.rx_irq_count);
+    uart_send_string(" tx_irq=");
+    uart_send_dec(stats.tx_irq_count);
+    uart_send_string(" rx_fallback=");
+    uart_send_dec(stats.rx_fallback_count);
+    uart_send_string(" tx_poll=");
+    uart_send_dec(stats.tx_poll_count);
+    uart_send_string("\n");
+
+    pass = (stats.async_ready != 0UL) &&
+           (stats.ext_irq_count != 0UL) &&
+           (stats.rx_irq_count != 0UL) &&
+           (stats.tx_irq_count != 0UL) &&
+           (stats.rx_fallback_count == 0UL) &&
+           (stats.tx_poll_count == 0UL);
+
+    if (pass) {
+        uart_send_string("uartdemo: PASS - RX/TX are interrupt-driven\n");
+    } else {
+        uart_send_string("uartdemo: FAIL - counters do not match the interrupt-driven path\n");
     }
 }
 
@@ -615,6 +618,12 @@ static void cmd_runu(const char *arg) {
 
     /* Stage the raw user binary at the fixed execution address. */
     copy_bytes((void *)(uintptr_t)USER_CODE_BASE, data, size);
+    /* Freshly copied user code will be executed from the same fixed address on
+     * every runu invocation. Make the new instruction stream visible to the
+     * CPU before enter_user_mode() jumps there, otherwise a previous program
+     * may still be sitting in the I-cache.
+     */
+    asm volatile(".word 0x0000100f" ::: "memory");
 
     uart_send_string("runu: found file ");
     uart_send_string(path);
@@ -634,6 +643,7 @@ static void cmd_runu(const char *arg) {
     uart_send_string("runu: requested name = ");
     uart_send_string(arg);
     uart_send_string("\n");
+    uart_send_string("runu: switching S-mode -> U-mode via sret\n");
 
     /* Hand control to the prepared user-mode entry path. */
     enter_user_mode();
@@ -664,11 +674,7 @@ void processCommand(shell_t* shell) {
         uart_send_string("  time   - Show timer subsystem state\n");
         uart_send_string("  timeron - Enable periodic timer interrupts\n");
         uart_send_string("  timeroff - Disable periodic timer interrupts\n");
-        uart_send_string("  uartirqon - Enable interrupt-driven UART I/O\n");
-        uart_send_string("  uartirqoff - Disable interrupt-driven UART I/O\n");
-        uart_send_string("  uartstat - Show UART IRQ/fallback counters\n");
-        uart_send_string("  uartstatclr - Clear UART IRQ/fallback counters\n");
-        uart_send_string("  txdemo - Print a long string through the TX interrupt path\n");
+        uart_send_string("  uartdemo - Run one-shot RX/TX interrupt-driven UART demo\n");
         uart_send_string("  slabinfo - Show slab cache state\n");
         uart_send_string("  buddyinfo - Show buddy free-list state\n");
         uart_send_string("  slabcheck - Run slab invariant checks\n");
@@ -731,28 +737,8 @@ void processCommand(shell_t* shell) {
         return;
     }
 
-    if (streq(cmd, "uartirqon")) {
-        cmd_uartirqon();
-        return;
-    }
-
-    if (streq(cmd, "uartirqoff")) {
-        cmd_uartirqoff();
-        return;
-    }
-
-    if (streq(cmd, "uartstat")) {
-        cmd_uartstat();
-        return;
-    }
-
-    if (streq(cmd, "uartstatclr")) {
-        cmd_uartstatclr();
-        return;
-    }
-
-    if (streq(cmd, "txdemo")) {
-        cmd_txdemo();
+    if (streq(cmd, "uartdemo")) {
+        cmd_uartdemo();
         return;
     }
 

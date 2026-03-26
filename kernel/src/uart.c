@@ -1,4 +1,5 @@
 #include "uart.h"
+#include "fdt.h"
 #include "ringbuf.h"
 #include "trap.h"
 #include "plic.h"
@@ -6,6 +7,14 @@
 
 static struct ringbuf g_uart_rx_buf;
 static struct ringbuf g_uart_tx_buf;
+static uintptr_t g_uart_mmio_base =
+#ifdef QEMU
+    0x10000000UL;
+#else
+    0UL;
+#endif
+static uintptr_t g_plic_mmio_base = 0UL;
+static uint32_t g_uart_irq_id = 0U;
 static int g_uart_irq_enabled = 0;
 static int g_uart_async_ready = 0;
 static volatile unsigned long g_uart_ext_irq_count = 0;
@@ -14,6 +23,60 @@ static volatile unsigned long g_uart_tx_irq_count = 0;
 static volatile unsigned long g_uart_rx_fallback_count = 0;
 static volatile unsigned long g_uart_tx_poll_count = 0;
 
+int uart_platform_init_from_fdt(const void *fdt)
+{
+#ifdef QEMU
+    (void)fdt;
+    g_plic_mmio_base = 0UL;
+    g_uart_irq_id = 10U;
+    return 0;
+#else
+    int uart_node;
+    int plic_node;
+    uint64_t uart_base;
+    uint64_t plic_base;
+    uint32_t irq;
+
+    if (fdt == 0) {
+        return -1;
+    }
+
+    uart_node = fdt_find_compatible(fdt, "ky,pxa-uart");
+    plic_node = fdt_find_compatible(fdt, "riscv,plic0");
+    if (uart_node < 0 || plic_node < 0) {
+        return -1;
+    }
+    if (fdt_get_reg_base(fdt, uart_node, &uart_base) != 0 ||
+        fdt_get_interrupt_id(fdt, uart_node, &irq) != 0 ||
+        fdt_get_reg_base(fdt, plic_node, &plic_base) != 0) {
+        return -1;
+    }
+
+    g_uart_mmio_base = (uintptr_t)uart_base;
+    g_uart_irq_id = irq;
+    g_plic_mmio_base = (uintptr_t)plic_base;
+    return 0;
+#endif
+}
+
+uintptr_t uart_mmio_base(void)
+{
+    return g_uart_mmio_base;
+}
+
+uintptr_t plic_mmio_base(void)
+{
+    return g_plic_mmio_base;
+}
+
+uint32_t uart_irq_id(void)
+{
+    return g_uart_irq_id;
+}
+
+/* Read or write one UART MMIO register.
+ * OrangePi RV2 exposes 32-bit MMIO registers, while QEMU uses byte access.
+ */
 static inline uint32_t uart_reg_read(uintptr_t reg)
 {
 #ifdef QEMU
@@ -130,6 +193,7 @@ static int uart_tx_try_drain_one(void)
 {
     char c;
 
+    /* Only feed THR when the transmitter can accept a new byte. */
     if ((uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) == 0U) {
         return 0;
     }
@@ -138,18 +202,28 @@ static int uart_tx_try_drain_one(void)
         return 0;
     }
 
+    /* THR is the transmit holding register: writing one byte starts the next
+     * piece of serial output.
+     */
     uart_reg_write(UART_THR_REG, (uint32_t)(uint8_t)c);
     return 1;
 }
 
 static void uart_tx_kick(void)
 {
+    /* TX interrupts stay disabled while the queue is empty. Once new data is
+     * queued, enable TX-ready interrupts and opportunistically push one byte
+     * so the hardware pipeline starts moving immediately.
+     */
     uart_ier_set_bits(UART_IER_TX_ENABLE);
     (void)uart_tx_try_drain_one();
 }
 
 static void uart_irq_ack_stale_status(void)
 {
+    /* Boot ROM / firmware may leave old UART status pending. Read the common
+     * status registers once so interrupt-driven I/O starts from a clean slate.
+     */
     (void)uart_reg_read(UART_LSR_REG);
     (void)uart_reg_read(UART_RBR_REG);
     (void)uart_reg_read(UART_IIR_REG);
@@ -178,19 +252,22 @@ void uart_irq_init(void)
 #else
     uint64_t sie;
     uint64_t sstatus;
-
+    
+    /* Reset software queues before arming the hardware path. */
     ringbuf_init(&g_uart_rx_buf);
     ringbuf_init(&g_uart_tx_buf);
-    uart_reset_stats();
+    uart_demo_reset_stats();
 
-    plic_set_priority(UART0_IRQ, 1U);
-    plic_enable_irq(UART0_IRQ);
+    /* Route the DT-discovered UART IRQ into hart0's S-mode context. */
+    plic_set_priority(uart_irq_id(), 1U);
+    plic_enable_irq(uart_irq_id());
     plic_set_threshold(0U);
 
     /* This UART block is DT-compatible with pxa-uart. Besides the basic RX
-     * interrupt bit, it also wants unit-enable plus receiver-timeout enable
-     * so incoming characters can raise an interrupt promptly while the shell
-     * is idle.
+     * enable bit, it also needs:
+     * - FIFO enabled and cleared,
+     * - OUT2 asserted so the IRQ output line is driven,
+     * - UUE/LINE/RTO bits enabled so sparse shell input still raises an IRQ.
      */
     uart_reg_write(UART_FCR_REG, 0x07U);
     uart_reg_write(UART_MCR_REG, uart_reg_read(UART_MCR_REG) | UART_MCR_OUT2);
@@ -202,6 +279,7 @@ void uart_irq_init(void)
     uart_ier_clear_bits(UART_IER_TX_ENABLE);
     uart_irq_ack_stale_status();
 
+    /* Finally allow supervisor external interrupts to reach trap_entry. */
     asm volatile("csrr %0, sie" : "=r"(sie));
     sie |= SIE_SEIE;
     asm volatile("csrw sie, %0" : : "r"(sie));
@@ -215,26 +293,11 @@ void uart_irq_init(void)
 #endif
 }
 
-void uart_irq_stop(void)
-{
-#ifdef QEMU
-    return;
-#else
-    uint64_t sie;
-
-    g_uart_async_ready = 0;
-    g_uart_irq_enabled = 0;
-    uart_reg_write(UART_IER_REG, 0U);
-    plic_disable_irq(UART0_IRQ);
-
-    asm volatile("csrr %0, sie" : "=r"(sie));
-    sie &= ~SIE_SEIE;
-    asm volatile("csrw sie, %0" : : "r"(sie));
-#endif
-}
-
 void uart_send(char c)
 {
+    /* Once the first real UART IRQ is observed, all output is queued and
+     * drained by TX-ready interrupts.
+     */
     if (g_uart_async_ready) {
         while (1) {
             if (!uart_tx_buf_is_full()) {
@@ -246,14 +309,20 @@ void uart_send(char c)
         }
     }
 
-    g_uart_tx_poll_count++;
+    /* Early boot fallback: keep console output alive until the first real
+     * UART interrupt proves that the asynchronous path is active.
+     */
     while ((uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) == 0U) {
     }
+    g_uart_tx_poll_count++;
     uart_reg_write(UART_THR_REG, (uint32_t)(uint8_t)c);
 }
 
 char uart_recv(void)
 {
+    /* Once IRQ delivery is confirmed, input is consumed purely from the RX
+     * ring buffer that the ISR fills.
+     */
     if (g_uart_async_ready) {
         char c;
 
@@ -264,6 +333,10 @@ char uart_recv(void)
         }
     }
 
+    /* Bring-up fallback: briefly wait for an RX IRQ before polling the UART
+     * directly. This keeps the shell usable even if the interrupt route is
+     * not live yet during early boot.
+     */
     if (g_uart_irq_enabled) {
         unsigned long wait = 500000UL;
         char c;
@@ -276,9 +349,9 @@ char uart_recv(void)
         }
     }
 
-    g_uart_rx_fallback_count++;
     while ((uart_reg_read(UART_LSR_REG) & LSR_RX_READY) == 0U) {
     }
+    g_uart_rx_fallback_count++;
     return (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
 }
 
@@ -323,33 +396,42 @@ void uart_send_dec(unsigned long value)
 
 void uart_handle_irq(void)
 {
+    /* RX side: drain every received byte that hardware already has buffered
+     * and hand it to the software RX queue for the shell to consume later.
+     */
     while ((uart_reg_read(UART_LSR_REG) & LSR_RX_READY) != 0U) {
         char c = (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
         (void)uart_rx_push_char(c);
         g_uart_rx_irq_count++;
     }
 
+    /* TX side: one UART IRQ can be used to push several queued bytes while
+     * the transmitter stays ready.
+     */
     while (uart_tx_try_drain_one()) {
         g_uart_tx_irq_count++;
     }
 
-    if ((g_uart_rx_irq_count != 0UL || g_uart_tx_irq_count != 0UL) && !g_uart_async_ready) {
+    if (!g_uart_async_ready) {
         g_uart_async_ready = 1;
     }
 
+    /* When the TX queue becomes empty, stop TX-ready interrupts so the UART
+     * does not keep interrupting with no work to do.
+     */
     if (uart_tx_buf_is_empty()) {
         uart_ier_clear_bits(UART_IER_TX_ENABLE);
     }
 }
 
-void uart_note_external_irq(uint32_t irq)
+void uart_demo_note_external_irq(uint32_t irq)
 {
-    if (irq == UART0_IRQ) {
+    if (irq == uart_irq_id()) {
         g_uart_ext_irq_count++;
     }
 }
 
-void uart_reset_stats(void)
+void uart_demo_reset_stats(void)
 {
     uint64_t sstatus;
 
@@ -362,34 +444,18 @@ void uart_reset_stats(void)
     uart_irq_restore(sstatus);
 }
 
-unsigned long uart_get_ext_irq_count(void)
+void uart_demo_get_stats(struct uart_demo_stats *stats)
 {
-    return g_uart_ext_irq_count;
-}
+    if (stats == 0) {
+        return;
+    }
 
-unsigned long uart_get_rx_irq_count(void)
-{
-    return g_uart_rx_irq_count;
-}
-
-unsigned long uart_get_tx_irq_count(void)
-{
-    return g_uart_tx_irq_count;
-}
-
-unsigned long uart_get_rx_fallback_count(void)
-{
-    return g_uart_rx_fallback_count;
-}
-
-unsigned long uart_get_tx_poll_count(void)
-{
-    return g_uart_tx_poll_count;
-}
-
-int uart_async_ready(void)
-{
-    return g_uart_async_ready;
+    stats->async_ready = (unsigned long)g_uart_async_ready;
+    stats->ext_irq_count = g_uart_ext_irq_count;
+    stats->rx_irq_count = g_uart_rx_irq_count;
+    stats->tx_irq_count = g_uart_tx_irq_count;
+    stats->rx_fallback_count = g_uart_rx_fallback_count;
+    stats->tx_poll_count = g_uart_tx_poll_count;
 }
 
 /* Compatibility wrappers */
