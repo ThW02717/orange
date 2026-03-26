@@ -1,94 +1,197 @@
-# OrangePi RV2 OS Project
+# OrangePi RV2 Bare-Metal Kernel
 
-This repository contains a small operating system / kernel project targeting the OrangePi RV2 board.
-The project is developed and tested on real hardware, with the kernel delivered through a UART bootloader workflow.
+This repository is a small bare-metal kernel project built for the OrangePi RV2 and tested on real hardware through a UART bootloader workflow. The goal is not to emulate a production OS, but to implement and debug core kernel mechanisms directly on the board: trap handling, interrupt routing, user-mode entry, timer interrupts, UART RX/TX, and a slab-on-buddy memory allocator.
 
-The main goal of this project is to build core low-level OS components directly on bare metal and make their behavior observable during development, rather than to emulate a full production kernel.
+The project is intentionally narrow and observable. Most features are exposed through a small shell so the control flow can be exercised and verified without a full userspace or scheduler.
 
-## Current Scope
+## What This Project Covers
 
-- UART boot and interactive shell
-- FDT-based memory discovery
-- initrd / cpio file access
-- RISC-V supervisor trap entry / return path
-- user-mode test program entry and return-to-shell path
+- real-board boot and UART shell
+- FDT-driven platform discovery
+- initramfs / cpio-backed file loading
+- RISC-V S-mode trap entry and return
+- U-mode program entry and return-to-shell flow
 - SBI timer interrupt bring-up
-- interrupt-driven UART0 RX/TX with PLIC and ring buffers
+- interrupt-driven UART0 RX/TX through the PLIC
 - buddy page allocator
-- slab-on-buddy kernel heap allocator
+- slab-based kernel heap allocator
 
-## Trap And User Path
+## Why It Is Interesting
 
-The kernel now has a basic RISC-V trap path built around:
+This codebase focuses on the parts of kernel bring-up that are easy to describe in theory but messy in practice on hardware:
 
-- `stvec -> trap_entry -> do_trap() -> trap_return`
+- switching from S-mode to U-mode and getting back correctly
+- preserving enough state to recover from both `ecall` and user faults
+- making UART genuinely interrupt-driven instead of silently falling back to polling
+- loading different user binaries into the same execution window without executing stale instructions
+- wiring timer and external interrupts on a real RISC-V board, not only in emulation
 
-Current trap behavior includes:
+## Trap Architecture
 
-- user-mode `ecall` handling
-- user fault handling and return to shell
-- supervisor timer interrupt dispatch
-- supervisor external interrupt dispatch for UART0
+The kernel uses one common supervisor trap entry:
 
-The user-mode path is intentionally minimal:
+- `stvec -> trap_entry -> do_trap()`
 
-- `runu <name>` loads `bin/<name>.bin` from the initramfs
-- `enter_user_mode()` builds an initial user trapframe
-- `trap_return + sret` transfers control to U-mode
-- user `ecall` or fault traps back into S-mode
+From `do_trap()`, control is dispatched by cause:
 
-This is not yet a full process model or scheduler, but it provides the core control-flow needed for later scheduling work.
+- user `ecall` -> `handle_user_ecall()`
+- user fault -> `handle_user_fault()`
+- supervisor timer interrupt -> `timer_handle_interrupt()`
+- supervisor external interrupt -> `plic_claim()` -> `uart_handle_irq()` -> `plic_complete()`
 
-## Timer Interrupt
+If the interrupted context should continue running, the trap exits through:
 
-Basic core timer interrupt support is implemented using:
+- `trap_return -> sret`
 
-- `rdtime` as the clocksource
-- SBI `set_timer` as the next-event programming interface
+If a user program has terminated, the kernel deliberately skips `trap_return` and hands control back to the shell instead.
 
-Current timer behavior:
+## Timer Interrupt Path
 
-- the kernel reads `timebase-frequency` from the device tree
-- `timeron` schedules the first interrupt 1 second later
-- each timer interrupt prints uptime in seconds
-- the handler rearms the next one-shot timer 2 seconds later
-- `timeroff` disables the periodic demo behavior
+Timer bring-up currently uses:
 
-On the OrangePi RV2 board, the firmware reports SBI v1.0 but the new TIME extension probe does not succeed, so the timer code keeps a legacy SBI timer fallback for real-hardware bring-up.
+- `rdtime` as the clock source
+- SBI `set_timer` as the next-event mechanism
+- `timebase-frequency` from the device tree
 
-## Interrupt-Driven UART
+The current demo path is:
 
-UART0 input and output are now interrupt-driven on OrangePi RV2.
+1. `timeron`
+2. `timer_init()`
+3. program the first deadline
+4. timer expires
+5. CPU traps into `trap_entry`
+6. `do_trap()` sees `SCAUSE_S_TIMER_INT`
+7. `timer_handle_interrupt()` updates demo state and rearms the next deadline
 
-Implementation highlights:
+`timeroff` disables the periodic demo path again.
 
-- UART0 is routed through the PLIC
-- RX and TX each use a ring buffer
-- RX interrupts place incoming bytes into the RX buffer
-- TX interrupts drain queued output bytes from the TX buffer
-- the shell consumes input from the RX buffer and enqueues output to the TX buffer
-- short critical sections protect ring-buffer updates shared between ISR and normal kernel code
+On OrangePi RV2, firmware reports SBI v1.0, but the newer TIME extension probe does not succeed. The code therefore keeps a legacy SBI timer fallback for board-side bring-up.
+
+## UART Interrupt Path
+
+UART0 RX and TX are both interrupt-driven on OrangePi RV2.
+
+The driver now reads:
+
+- UART MMIO base
+- PLIC MMIO base
+- UART IRQ ID
+
+from the device tree during boot instead of hard-coding those values in the driver.
+
+### RX flow
+
+1. a byte arrives at UART0
+2. UART hardware raises its interrupt line
+3. PLIC forwards the IRQ to hart0 S-mode
+4. CPU traps into `trap_entry`
+5. `do_trap()` sees `SCAUSE_S_EXT_INT`
+6. `plic_claim()` returns the UART IRQ ID
+7. `uart_handle_irq()` drains bytes from `RBR` into the RX ring buffer
+8. shell-side `uart_recv()` later consumes bytes from that RX ring buffer
+9. `plic_complete()` finishes the interrupt
+
+### TX flow
+
+1. shell output calls `uart_send()` / `uart_send_string()`
+2. bytes are queued in the TX ring buffer
+3. `uart_tx_kick()` enables TX-ready interrupts
+4. UART hardware raises an interrupt when it can accept more output
+5. CPU traps into `trap_entry`
+6. `do_trap()` dispatches the UART external interrupt
+7. `uart_handle_irq()` repeatedly calls `uart_tx_try_drain_one()`
+8. `uart_tx_try_drain_one()` pops one byte from the TX ring buffer and writes it to `THR`
+9. when the TX ring buffer becomes empty, TX interrupts are disabled again
+
+The `uartdemo` shell command is the compact end-to-end check for this path. It verifies that:
+
+- RX interrupts are being serviced
+- TX interrupts are draining output
+- the driver is not silently falling back to polling
+
+## User-Mode Program Path
+
+The user-mode path is intentionally minimal and fixed-address:
+
+1. `runu <name>` looks up `bin/<name>.bin` in the initramfs
+2. the binary is copied to `USER_CODE_BASE`
+3. the kernel synchronizes the instruction stream for the freshly written code
+4. `enter_user_mode()` prepares an initial trapframe and writes `sepc`
+5. `trap_return -> sret` transfers control from S-mode to U-mode
+
+### `runu test`
+
+`test.bin` is a minimal syscall-path check. It executes two `ecall`s:
+
+1. `a7 = SYS_test`
+2. CPU traps to S-mode with `scause = 8`
+3. `handle_user_ecall()` prints `scause`, `sepc`, and `stval`
+4. kernel advances `sepc`
+5. `trap_return -> sret` resumes U-mode
+6. `a7 = SYS_exit`
+7. CPU traps to S-mode again
+8. kernel marks the user program as finished
+9. the exit path skips `trap_return` and returns to the shell
+
+This path is useful for verifying that:
+
+- the initial U-mode entry works
+- `ecall` traps are decoded correctly
+- `sepc` is advanced properly
+- the kernel can resume U-mode once and then terminate cleanly on `SYS_exit`
+
+### `runu badinst`
+
+`badinst.bin` starts with:
+
+- `.word 0xffffffff`
+
+So the expected path is:
+
+1. U-mode executes an illegal instruction
+2. CPU traps to S-mode with `scause = 2`
+3. `handle_user_fault()` prints `scause`, `sepc`, and `stval`
+4. kernel terminates the user program
+5. control returns to the shell instead of resuming U-mode
+
+This is the shortest end-to-end check for the user fault path.
+
+## Debugging Note: Reusing `USER_CODE_BASE`
+
+All user programs are currently loaded to the same execution address:
+
+- `USER_CODE_BASE = 0x32000000`
+
+That design is simple, but it exposed a subtle bring-up bug:
+
+- running `runu test`
+- then running `runu badinst`
+- sometimes still executed the old `test` instructions
+
+The bug was not in shell dispatch or fault handling. The problem was instruction-stream coherence: the kernel overwrote the old user image in memory, but the CPU could still execute stale instructions from the previous program image.
+
+The fix was to perform instruction-stream synchronization after copying the new binary and before jumping to `USER_CODE_BASE`.
+
+In this codebase, that fix is implemented inside `cmd_runu()` using the raw encoding of `fence.i`.
 
 ## Allocator
 
-One of the main components in this project is a slab-based kernel heap allocator built on top of the buddy page allocator.
-
 The allocator is split into two layers:
 
-- The buddy allocator manages page-level allocation and reclamation.
-- `kmalloc` / `kfree` handle kernel heap allocation on top of buddy.
+- a buddy allocator for page-granularity management
+- a slab allocator on top for small kernel objects
 
-Current design:
+Current design points:
 
-- Small allocations use the slab path.
-- Large allocations use the page allocator directly.
-- Each size class is managed by a `kmem_cache`.
-- Each slab page owns its own `slab_header` and per-slab freelist.
-- Empty slab pages are reused through a small empty-slab reserve policy before being reclaimed to buddy.
-- `kfree()` dispatches through page metadata instead of the old header/tag path.
-- Freed objects are poisoned with `0xAA` and reclaimed slab pages are poisoned with `0xCC` for debug visibility.
+- small allocations use slab caches
+- large allocations use the page allocator directly
+- each size class is managed by a `kmem_cache`
+- each slab page owns its own metadata and freelist
+- empty slab pages are retained briefly before being reclaimed to buddy
+- `kfree()` dispatches through page metadata instead of older header/tag logic
+- freed objects and reclaimed slabs are poisoned for debug visibility
 
-The allocator also exposes shell-visible observability commands so the internal state can be inspected while running on hardware:
+The allocator is intentionally observable from the shell through commands such as:
 
 - `memstat`
 - `slabinfo`
@@ -96,18 +199,9 @@ The allocator also exposes shell-visible observability commands so the internal 
 - `slabcheck`
 - `kmtest <name>`
 
-These commands make it possible to demonstrate allocator behavior directly, including:
-
-- slab state transitions after allocation
-- empty slab reuse vs. reclaim
-- large allocation / free effects on buddy free lists
-- allocator regression checks through `kmtest all`
-
-`KMEM_CACHE_EMPTY_LIMIT` is a policy choice, not a correctness requirement. In the current version, each cache keeps at most one empty slab page as a warm spare to reduce unnecessary buddy allocator churn.
-
 ## Shell Commands
 
-Current shell commands include:
+Current interactive commands include:
 
 - `help`
 - `hello`
@@ -127,7 +221,7 @@ Current shell commands include:
 - `slabcheck`
 - `runu <name>`
 
-Allocator test commands currently include:
+Allocator regression targets currently include:
 
 - `kmtest basic`
 - `kmtest boundary`
@@ -140,24 +234,3 @@ Allocator test commands currently include:
 - `kmtest stress`
 - `kmtest all`
 
-For QEMU-based regression runs, use:
-
-```bash
-python3 scripts/run_allocator_tests.py
-```
-
-## TODO
-
-- Add thread-safe and interrupt-safe protection
-- Improve allocator-side debug checks and fault reporting
-- Add more allocator test cases and stress scenarios
-- Refine slab empty-page retention policy
-- Continue cleanup of code structure and comments
-- Extend the kernel with process and scheduler work
-- Replace timer demo logging with scheduler-driven time accounting
-- Further simplify the UART shell interface now that the interrupt-driven path is working
-
-## Notes
-
-This project is intentionally scoped as a learning and systems-building project rather than a Linux-sized kernel implementation.
-The current allocator focuses on clear structure, observability, and correctness of the core path on real hardware.
