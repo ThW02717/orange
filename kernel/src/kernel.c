@@ -188,10 +188,11 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
     timer_probe_readout();
     timer_probe_sbi_support();
 
-    /* Leave timer enable under an explicit shell command for now. This keeps
-     * bring-up interactive while the interrupt path is still being tuned.
+    /* The multiplexed timer subsystem no longer depends on a fixed periodic
+     * heartbeat, so it is safe to arm the timer path during boot. The single
+     * hardware timer stays idle until software timers are queued.
      */
-    uart_send_string("timer: use 'timeron' to enable periodic timer interrupts\n");
+    timer_init();
     /* Arm the UART external-interrupt route during boot so shell I/O can
      * transition to the asynchronous path without a manual enable command.
      * uart_recv() still keeps a polling fallback until the first real RX IRQ

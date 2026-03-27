@@ -4,6 +4,23 @@
 #include <stdint.h>
 #include "sbi.h"
 
+/* Software timers execute deferred work by remembering which callback should
+ * run later plus one opaque argument passed back to that callback.
+ */
+typedef void (*timer_callback_t)(void *arg);
+
+/* One pending software timer event.
+ * - expire: absolute rdtime tick when this event becomes runnable
+ * - callback/arg: deferred work payload
+ * - next: linkage for the sorted singly linked pending list
+ */
+struct timer_event {
+    uint64_t expire;
+    timer_callback_t callback;
+    void *arg;
+    struct timer_event *next;
+};
+
 /* Minimal timer subsystem state used by early bring-up and later interrupt
  * handling.
  * - g_timebase_freq: platform timer ticks per second from DT
@@ -15,6 +32,7 @@ extern uint32_t g_timebase_freq;
 extern uint64_t g_boot_time;
 extern uint64_t g_next_deadline;
 extern uint64_t g_uptime_seconds;
+extern uint64_t g_timer_irq_count;
 
 /* Read the raw platform counter used as the kernel clocksource. */
 uint64_t timer_read(void);
@@ -32,4 +50,11 @@ struct sbiret timer_program_rel(uint64_t delta_ticks);
 void timer_init(void);
 void timer_handle_interrupt(void);
 void timer_stop(void);
+/* Queue one one-shot software timer relative to "now".
+ * The subsystem stores absolute expire times internally and keeps the pending
+ * list sorted by that absolute deadline.
+ */
+int add_timer(timer_callback_t callback, void *arg, uint64_t duration_ticks);
+unsigned int timer_pending_count(void);
+void timer_dump_queue(void);
 #endif

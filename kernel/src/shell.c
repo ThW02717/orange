@@ -23,6 +23,11 @@ static uint64_t g_initrd_hint_end = 0;
 #define CPIO_MODE_TYPE_MASK 0170000U
 #define CPIO_MODE_REGULAR   0100000U
 
+/* Timer callbacks may print while the REPL is blocked in uart_recv(), so keep
+ * the prompt string in one place and redraw it after asynchronous messages.
+ */
+static const char g_shell_prompt[] = "> ";
+
 /* Validate fallback initrd hints before using them in place of DT-provided data. */
 static int initrd_hint_valid(uint64_t start, uint64_t end) {
     if (start == 0 || end <= start) {
@@ -78,6 +83,28 @@ static int streq(const char *a, const char *b) {
         b++;
     }
     return *a == *b;
+}
+
+static int parse_u64_dec(const char *s, uint64_t *out) {
+    uint64_t value = 0;
+    unsigned int i = 0;
+
+    if (s == 0 || out == 0 || s[0] == '\0') {
+        return -1;
+    }
+
+    while (s[i] != '\0') {
+        char c = s[i];
+
+        if (c < '0' || c > '9') {
+            return -1;
+        }
+        value = (value * 10ULL) + (uint64_t)(c - '0');
+        i++;
+    }
+
+    *out = value;
+    return 0;
 }
 
 /* Minimal memcpy replacement for the freestanding kernel build. */
@@ -452,33 +479,17 @@ static void cmd_cat(const char *arg) {
     }
 }
 
-/* Allocator smoke-test command used for quick manual validation. */
-static void cmd_allocdemo(void) {
-    void *p1;
-    void *p2;
-    void *k1;
-    void *k2;
-
-    uart_send_string("allocator demo start\n");
-
-    p1 = p_alloc(1);
-    p2 = p_alloc(3);
-    p_free(p1);
-    p_free(p2);
-
-    k1 = kmalloc(80);
-    k2 = kmalloc(3000);
-    kfree(k1);
-    kfree(k2);
-
-    uart_send_string("allocator demo done\n");
-}
-
-/* Print the current timer subsystem state without needing a reboot log. */
-static void cmd_time(void) {
+/* Single timer status command: basic counters plus the pending queue. */
+static void cmd_timer(void) {
     uint64_t now;
+    uint64_t uptime;
 
     now = timer_read();
+    if (g_timebase_freq != 0) {
+        uptime = (now - g_boot_time) / g_timebase_freq;
+    } else {
+        uptime = 0;
+    }
 
     uart_send_string("timer freq: ");
     uart_send_dec(g_timebase_freq);
@@ -497,22 +508,104 @@ static void cmd_time(void) {
     uart_send_string("\n");
 
     uart_send_string("timer uptime: ");
-    uart_send_dec(g_uptime_seconds);
+    uart_send_dec(uptime);
     uart_send_string("\n");
+    uart_send_string("timer pending: ");
+    uart_send_dec(timer_pending_count());
+    uart_send_string("\n");
+    uart_send_string("timer irq_count: ");
+    uart_send_dec(g_timer_irq_count);
+    uart_send_string("\n");
+    timer_dump_queue();
 }
 
-/* Manually enable the timer subsystem once boot-time probes have completed. */
-static void cmd_timeron(void) {
+/* Minimal shell-facing callback used to prove that software timer events are
+ * really leaving the pending list and executing at interrupt time.
+ */
+static void shell_timer_callback(void *arg)
+{
+    unsigned long id = (unsigned long)(uintptr_t)arg;
+
+    uart_send_string("\n[timer] event ");
+    uart_send_dec(id);
+    uart_send_string(" fired at ");
+    uart_send_dec(g_uptime_seconds);
+    uart_send_string(" sec\n");
+}
+
+/* Timer callbacks and allocator frees both print asynchronously while the
+ * REPL is blocked in uart_recv(). Redraw the prompt only after the whole timer
+ * interrupt path has finished, with a tiny delay to avoid landing on the same
+ * line as the allocator free trace.
+ */
+void shell_redraw_prompt_delayed(void)
+{
+    uint64_t start;
+    uint64_t wait_ticks;
+
     if (g_timebase_freq == 0) {
-        uart_send_string("timeron: timer frequency unavailable\n");
+        uart_send_string(g_shell_prompt);
         return;
     }
 
-    timer_init();
+    start = timer_read();
+    wait_ticks = g_timebase_freq / 200U;
+    if (wait_ticks == 0) {
+        wait_ticks = 1;
+    }
+
+    while ((timer_read() - start) < wait_ticks) {
+        asm volatile("" ::: "memory");
+    }
+
+    uart_send_string(g_shell_prompt);
 }
 
-static void cmd_timeroff(void) {
-    timer_stop();
+/* Shell test entry only:
+ * - parse seconds
+ * - translate to timer ticks
+ * - hand the real work to add_timer()
+ */
+static void cmd_addtimer(const char *arg)
+{
+    static unsigned long next_timer_id = 1;
+    uint64_t seconds;
+    uint64_t ticks;
+    unsigned long id;
+
+    if (arg == 0 || parse_u64_dec(arg, &seconds) != 0) {
+        uart_send_string("usage: addtimer <seconds>\n");
+        return;
+    }
+    if (g_timebase_freq == 0) {
+        uart_send_string("addtimer: timer frequency unavailable\n");
+        return;
+    }
+
+    ticks = seconds * (uint64_t)g_timebase_freq;
+    id = next_timer_id++;
+
+    if (add_timer(shell_timer_callback, (void *)(uintptr_t)id, ticks) != 0) {
+        uart_send_string("addtimer: failed to allocate timer event\n");
+        return;
+    }
+
+    uart_send_string("addtimer: scheduled event ");
+    uart_send_dec(id);
+    uart_send_string(" after ");
+    uart_send_dec((unsigned long)seconds);
+    uart_send_string(" sec\n");
+}
+
+/* Single memory status command: counters plus slab/buddy snapshots. */
+static void cmd_mem(void)
+{
+    uart_send_string("memory stats\n");
+    memory_print_memstat();
+    uart_send_string("slab state\n");
+    memory_print_slabinfo();
+    uart_send_string("buddy state\n");
+    memory_print_buddyinfo();
 }
 
 /* Emit enough text to force the TX path to queue and drain asynchronously. */
@@ -668,16 +761,11 @@ void processCommand(shell_t* shell) {
         uart_send_string("  cores  - Show HSM status for core 0..7\n");
         uart_send_string("  ls     - List initrd files\n");
         uart_send_string("  cat    - Show initrd file content\n");
-        uart_send_string("  allocdemo - Run allocator demo\n");
-        uart_send_string("  kmtest <name> - Run allocator tests\n");
-        uart_send_string("  memstat  - Show allocator counters\n");
-        uart_send_string("  time   - Show timer subsystem state\n");
-        uart_send_string("  timeron - Enable periodic timer interrupts\n");
-        uart_send_string("  timeroff - Disable periodic timer interrupts\n");
+        uart_send_string("  memtest <name> - Run allocator tests\n");
+        uart_send_string("  mem    - Show allocator, slab, and buddy state\n");
+        uart_send_string("  timer  - Show timer subsystem state and pending queue\n");
+        uart_send_string("  addtimer <sec> - Schedule a one-shot software timer\n");
         uart_send_string("  uartdemo - Run one-shot RX/TX interrupt-driven UART demo\n");
-        uart_send_string("  slabinfo - Show slab cache state\n");
-        uart_send_string("  buddyinfo - Show buddy free-list state\n");
-        uart_send_string("  slabcheck - Run slab invariant checks\n");
         uart_send_string("  runu <name> - Load and run bin/<name>.bin from initramfs\n");
         return;
     }
@@ -707,53 +795,28 @@ void processCommand(shell_t* shell) {
         return;
     }
 
-    if (streq(cmd, "allocdemo")) {
-        cmd_allocdemo();
-        return;
-    }
-
-    if (streq(cmd, "kmtest")) {
+    if (streq(cmd, "memtest") || streq(cmd, "kmtest")) {
         memory_run_kmtest(arg);
         return;
     }
 
-    if (streq(cmd, "memstat")) {
-        memory_print_memstat();
+    if (streq(cmd, "mem")) {
+        cmd_mem();
         return;
     }
 
-    if (streq(cmd, "time")) {
-        cmd_time();
+    if (streq(cmd, "timer")) {
+        cmd_timer();
         return;
     }
 
-    if (streq(cmd, "timeron")) {
-        cmd_timeron();
-        return;
-    }
-
-    if (streq(cmd, "timeroff")) {
-        cmd_timeroff();
+    if (streq(cmd, "addtimer")) {
+        cmd_addtimer(arg);
         return;
     }
 
     if (streq(cmd, "uartdemo")) {
         cmd_uartdemo();
-        return;
-    }
-
-    if (streq(cmd, "slabinfo")) {
-        memory_print_slabinfo();
-        return;
-    }
-
-    if (streq(cmd, "buddyinfo")) {
-        memory_print_buddyinfo();
-        return;
-    }
-
-    if (streq(cmd, "slabcheck")) {
-        memory_debug_check_slabs();
         return;
     }
 
@@ -769,11 +832,10 @@ void processCommand(shell_t* shell) {
 
 /* Single-command REPL wrapper used by kernel_main. */
 void runAShell(int32_t pid) {
-    char *prompt_start = "> ";
     shell_t shell;
     char command_buffer[128];
     shell.pid = pid;
-    uart_send_string(prompt_start);
+    uart_send_string(g_shell_prompt);
 
     getCommand(command_buffer, 128);
     trim_in_place(command_buffer);

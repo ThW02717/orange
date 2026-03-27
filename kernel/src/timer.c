@@ -1,39 +1,89 @@
 #include "timer.h"
 #include "trap.h"
 #include "uart.h"
+#include "memory.h"
+#include "shell.h"
 
-/* Shared timer subsystem state. Later interrupt handling updates the same
- * values instead of inventing another source of truth.
+/* Shared timer subsystem state.
+ * - g_next_deadline follows the head of the pending software-timer list
+ * - g_uptime_seconds is updated from the hardware time counter on each IRQ
  */
 uint32_t g_timebase_freq;
 uint64_t g_boot_time;
 uint64_t g_next_deadline;
 uint64_t g_uptime_seconds;
+uint64_t g_timer_irq_count;
+
+static struct timer_event *g_timer_head = 0;
+static int g_timer_enabled = 0;
+/* Invariants for the software-timer queue:
+ * 1. g_timer_head points to a list sorted by expire, smallest first.
+ * 2. The programmed hardware deadline always matches g_timer_head->expire
+ *    whenever the list is non-empty.
+ */
 
 /* rdtime returns the monotonically increasing platform time counter. */
 uint64_t timer_read(void)
 {
     uint64_t value;
 
-    
     asm volatile("rdtime %0" : "=r"(value));
     return value;
 }
 
-/* Use the first timer read after initialization as the uptime baseline. */
-void timer_init_state(uint32_t timebase_freq)
+static inline uint64_t timer_irq_save(void)
 {
-    
-    g_timebase_freq = timebase_freq;
-    g_boot_time = timer_read();
-    g_next_deadline = 0;
-    g_uptime_seconds = 0;
+    uint64_t sstatus;
+
+    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
+    asm volatile("csrc sstatus, %0" : : "r"(SSTATUS_SIE));
+    return sstatus;
+}
+
+static inline void timer_irq_restore(uint64_t sstatus)
+{
+    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
+}
+
+/* Enable/disable only the hardware timer interrupt source. The software queue
+ * can still exist while the source is masked.
+ */
+static void timer_disable_source(void)
+{
+    uint64_t sie;
+
+    asm volatile("csrr %0, sie" : "=r"(sie));
+    sie &= ~SIE_STIE;
+    asm volatile("csrw sie, %0" : : "r"(sie));
+}
+
+static void timer_enable_source(void)
+{
+    uint64_t sie;
+    uint64_t sstatus;
+
+    asm volatile("csrr %0, sie" : "=r"(sie));
+    sie |= SIE_STIE;
+    asm volatile("csrw sie, %0" : : "r"(sie));
+
+    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
+    sstatus |= SSTATUS_SIE;
+    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
+}
+
+static void timer_sync_uptime(uint64_t now)
+{
+    if (g_timebase_freq == 0) {
+        g_uptime_seconds = 0;
+        return;
+    }
+
+    g_uptime_seconds = (now - g_boot_time) / g_timebase_freq;
 }
 
 /* Program the next timer interrupt at an absolute time point. */
 struct sbiret timer_program_abs(uint64_t deadline)
 {
-    
     g_next_deadline = deadline;
     return sbi_set_timer(deadline);
 }
@@ -41,90 +91,232 @@ struct sbiret timer_program_abs(uint64_t deadline)
 /* Convert a relative delay into the absolute deadline expected by SBI. */
 struct sbiret timer_program_rel(uint64_t delta_ticks)
 {
-    uint64_t now;
-
-    
-    now = timer_read();
-    return timer_program_abs(now + delta_ticks);
+    return timer_program_abs(timer_read() + delta_ticks);
 }
 
-void timer_init(void) {
-    uint64_t sie;
-    uint64_t sstatus;
+/* Reprogram the single hardware timer so it always tracks the earliest
+ * pending software timer event. If the queue is empty, park the deadline far
+ * away and clear g_next_deadline for observability.
+ */
+static void timer_reprogram_locked(void)
+{
+    if (g_timer_head != 0) {
+        (void)timer_program_abs(g_timer_head->expire);
+    } else {
+        g_next_deadline = 0;
+        (void)sbi_set_timer(~0ULL);
+    }
+}
 
-    /* Start timer bookkeeping from a fresh baseline and schedule the first
-     * one-second event. The CSR writes below then open the timer interrupt
-     * source and the global supervisor interrupt gate.
-     */
+/* Use the first timer read after initialization as the uptime baseline. */
+void timer_init_state(uint32_t timebase_freq)
+{
+    g_timebase_freq = timebase_freq;
+    g_boot_time = timer_read();
     g_next_deadline = 0;
+    g_uptime_seconds = 0;
+    g_timer_irq_count = 0;
+}
+
+void timer_init(void)
+{
+    uint64_t sstatus;
 
     if (g_timebase_freq == 0) {
         return;
     }
 
-    g_boot_time = timer_read();
-    g_uptime_seconds = 0;
-    timer_program_rel(g_timebase_freq);
-
-    /* Enable the supervisor timer interrupt source in sie. Without STIE,
-     * the programmed timer deadline can fire in firmware/hardware but S-mode
-     * still will not receive the timer interrupt.
+    /* Arm the timer subsystem without inventing a fake periodic event. The
+     * first real interrupt will come from whichever software timer becomes the
+     * list head next.
      */
-    asm volatile("csrr %0, sie" : "=r"(sie));
-    sie |= SIE_STIE;
-    asm volatile("csrw sie, %0" : : "r"(sie));
+    sstatus = timer_irq_save();
+    g_timer_enabled = 1;
+    timer_reprogram_locked();
+    timer_irq_restore(sstatus);
 
-    /* Enable supervisor interrupts globally in sstatus. This is the final
-     * gate; the timer source must be enabled in both sie and sstatus.
-     */
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    sstatus |= SSTATUS_SIE;
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
-    uart_send_string("[timer] init done\n");
-    uart_send_string("[timer] boot_time=");
-    uart_send_dec(g_boot_time);
+    timer_enable_source();
+
+    uart_send_string("[timer] subsystem armed\n");
+    uart_send_string("[timer] pending events=");
+    uart_send_dec(timer_pending_count());
     uart_send_string("\n");
-    uart_send_string("[timer] first deadline=");
+    uart_send_string("[timer] next deadline=");
     uart_send_dec(g_next_deadline);
     uart_send_string("\n");
+}
+
+int add_timer(timer_callback_t callback, void *arg, uint64_t duration_ticks)
+{
+    struct timer_event *event;
+    struct timer_event **link;
+    uint64_t sstatus;
+    uint64_t expire;
+
+    if (callback == 0 || g_timebase_freq == 0) {
+        return -1;
+    }
+
+    event = (struct timer_event *)kmalloc(sizeof(*event));
+    if (event == 0) {
+        return -1;
+    }
+
+    expire = timer_read() + duration_ticks;
+    event->expire = expire;
+    event->callback = callback;
+    event->arg = arg;
+    event->next = 0;
+
+    /* Critical section begins here.
+     *
+     * From this point until timer_irq_restore(), we temporarily block
+     * interrupts while mutating the pending timer list and the programmed
+     * hardware deadline. The queue and the hardware timer must change as one
+     * logical update:
+     *
+     *   1. Insert the new event into the sorted pending list.
+     *   2. Recompute which event is now the head.
+     *   3. Reprogram hardware so its next deadline matches head->expire.
+     *
+     * If a timer interrupt were allowed to arrive in the middle of that
+     * sequence, the handler could observe a half-updated list or an outdated
+     * deadline.
+     */
+    sstatus = timer_irq_save();
+
+    /* Sorted insert by absolute expire so the queue head is always the next
+     * event that hardware must wake up for.
+     */
+    link = &g_timer_head;
+    while (*link != 0 && (*link)->expire <= event->expire) {
+        link = &(*link)->next;
+    }
+    event->next = *link;
+    *link = event;
+
+    /* Still inside the same critical section: after the list order may have
+     * changed, update the one hardware timer source so it always tracks the
+     * new head deadline.
+     */
+    timer_reprogram_locked();
+
+    /* Critical section ends here. Restore the caller's previous interrupt
+     * state now that both the software queue and the hardware deadline are
+     * consistent again.
+     */
+    timer_irq_restore(sstatus);
+    return 0;
 }
 
 void timer_handle_interrupt(void)
 {
     uint64_t now;
-    uint64_t elapsed_ticks;
+    int fired_any = 0;
 
     if (g_timebase_freq == 0) {
         return;
     }
 
     now = timer_read();
-    elapsed_ticks = now - g_boot_time;
-    g_uptime_seconds = elapsed_ticks / g_timebase_freq;
+    timer_sync_uptime(now);
+    g_timer_irq_count++;
 
-    uart_send_string("\n[timer] irq: ");
-    uart_send_dec(g_uptime_seconds);
-    uart_send_string(" sec\n");
-
-    /* The first interrupt is one second after init. Subsequent interrupts
-     * follow the required two-second cadence.
+    /* Consume every event that is already due at this interrupt edge. This
+     * keeps the queue invariant simple: once the loop exits, either the list
+     * is empty or the new head has expire > now.
      */
-    timer_program_rel(2UL * (uint64_t)g_timebase_freq);
+    while (g_timer_head != 0 && g_timer_head->expire <= now) {
+        struct timer_event *event = g_timer_head;
+
+        g_timer_head = event->next;
+        event->next = 0;
+        /* First version: callbacks run synchronously in the timer interrupt
+         * path. This keeps the implementation simple and matches the current
+         * one-shot software timer exercise.
+         */
+        event->callback(event->arg);
+        kfree(event);
+        fired_any = 1;
+
+        now = timer_read();
+        timer_sync_uptime(now);
+    }
+
+    /* Invariant: after consuming all expired events, the programmed hardware
+     * deadline must equal the new list head.
+     */
+    timer_reprogram_locked();
+
+    /* Once the entire interrupt path is done, redraw the REPL prompt. Doing
+     * it here instead of inside the callback avoids printing ">" before the
+     * allocator free trace emitted by kfree(event).
+     */
+    if (fired_any != 0) {
+        shell_redraw_prompt_delayed();
+    }
 }
 
 void timer_stop(void)
 {
-    uint64_t sie;
+    uint64_t sstatus;
 
-    /* Mask the supervisor timer interrupt source first, then push the next
-     * event effectively infinitely far away so firmware stops re-triggering it.
-     */
-    asm volatile("csrr %0, sie" : "=r"(sie));
-    sie &= ~SIE_STIE;
-    asm volatile("csrw sie, %0" : : "r"(sie));
+    timer_disable_source();
 
-    g_next_deadline = ~0ULL;
+    sstatus = timer_irq_save();
+    g_timer_enabled = 0;
+    /* Stop means "drop the whole pending queue" in this first version. */
+    while (g_timer_head != 0) {
+        struct timer_event *event = g_timer_head;
+        g_timer_head = event->next;
+        kfree(event);
+    }
+    g_next_deadline = 0;
     (void)sbi_set_timer(~0ULL);
+    timer_irq_restore(sstatus);
 
     uart_send_string("[timer] stopped\n");
+}
+
+unsigned int timer_pending_count(void)
+{
+    unsigned int count = 0;
+    struct timer_event *cur = g_timer_head;
+
+    while (cur != 0) {
+        count++;
+        cur = cur->next;
+    }
+    return count;
+}
+
+void timer_dump_queue(void)
+{
+    uint64_t now = timer_read();
+    struct timer_event *cur = g_timer_head;
+    unsigned int idx = 0;
+
+    uart_send_string("timer pending=");
+    uart_send_dec(timer_pending_count());
+    uart_send_string(" next=");
+    uart_send_dec(g_next_deadline);
+    uart_send_string(" now=");
+    uart_send_dec(now);
+    uart_send_string(" irq_count=");
+    uart_send_dec(g_timer_irq_count);
+    uart_send_string("\n");
+
+    /* This is a debug/teaching view of the pending list, not part of the
+     * timer subsystem itself.
+     */
+    while (cur != 0) {
+        uart_send_string("timer[");
+        uart_send_dec(idx++);
+        uart_send_string("] expire=");
+        uart_send_dec(cur->expire);
+        uart_send_string(" delta_ticks=");
+        uart_send_dec(cur->expire - now);
+        uart_send_string("\n");
+        cur = cur->next;
+    }
 }
