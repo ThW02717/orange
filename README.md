@@ -1,8 +1,8 @@
 # OrangePi RV2 Bare-Metal Kernel
 
-This repository is a small bare-metal kernel project for the OrangePi RV2. It is developed and tested on real hardware through a UART boot workflow instead of relying only on emulation. The project is intentionally narrow: the focus is on board bring-up, devicetree-based discovery, a layered memory allocator, RISC-V trap handling, user-mode entry, interrupt-driven UART, and a multiplexed timer subsystem.
+This repository is a bare-metal RISC-V kernel project for the OrangePi RV2, developed and tested on real hardware through a UART boot workflow. The main focus is trap handling, interrupt-driven UART, a software timer multiplexer, nested deferred interrupt handling, user-mode entry, devicetree-based platform discovery, and a layered buddy/slab memory allocator.
 
-The code is closer to a systems side project than a full OS. Each subsystem is exposed through a small shell so the control flow can be observed directly on the board.
+The code is intentionally small and board-facing. It is closer to a systems side project than a full OS, and each subsystem is exposed through a small shell so the control flow can be observed directly on the board.
 
 ## Bootloader and Boot Flow
 
@@ -81,7 +81,17 @@ The lower layer manages memory at page granularity. It tracks free memory in pow
 - merging buddy pairs on free
 - maintaining the global free-page structure
 
-The main data structure is the classic buddy free list organized by order.
+The key data structures in this layer are:
+
+- a per-page metadata array (`struct page`) used as the frame table
+- buddy free lists organized by order
+- page state such as order, allocation state, and slab ownership metadata
+
+So this layer behaves like a frame allocator:
+
+- each physical page frame has metadata
+- free blocks are linked through the per-order free lists
+- allocation and free operations update both the frame metadata and the buddy lists
 
 ### Slab allocator
 
@@ -94,11 +104,12 @@ This layer is responsible for:
 - per-size-class freelists
 - reclaiming empty slab pages back to buddy
 
-At a high level, the slab layer tracks:
+The key data structures in this layer are:
 
-- slab caches by size class
-- page metadata for each slab page
-- free objects inside each slab page
+- slab caches indexed by object size class
+- per-cache lists for partial, full, and empty slab pages
+- slab-page metadata stored in the shared page/frame table
+- in-page free-object lists for fixed-size objects
 
 So the design is:
 
@@ -108,25 +119,22 @@ So the design is:
 
 ## Trap System
 
-The kernel uses one common supervisor trap entry:
+The kernel uses one shared supervisor trap path:
 
 - `stvec -> trap_entry -> trap_dispatch()`
 
-`trap_entry.S` is responsible for:
+`trap_entry.S` saves the interrupted context, switches to the kernel stack when needed, and enters the C dispatcher. `trap_return` restores the trapframe and finishes with `sret`.
 
-- switching to the kernel stack when trapping from U-mode
-- saving the interrupted context into a trapframe
-- calling the C dispatcher
+At a high level, the trap system is organized as:
 
-`trap_return` restores that trapframe and ends with:
-
-- `sret`
-
-So the trap system has one shared entry path, one shared trapframe format, and then different logical subpaths depending on the cause.
+- mode switch: S-mode to U-mode
+- exceptions: user `ecall` and user faults
+- interrupts: UART and timer
+- nested deferred interrupt handling: top half + bottom half
 
 ### S-mode to U-mode
 
-User-mode entry is minimal but explicit:
+User-mode entry is explicit:
 
 1. `runu <name>` loads a raw binary from the initramfs into `USER_CODE_BASE`
 2. the kernel synchronizes the instruction stream after copying the image
@@ -134,11 +142,9 @@ User-mode entry is minimal but explicit:
 4. `sstatus` is prepared so `sret` returns to U-mode
 5. `trap_return -> sret` transfers control into the user program
 
-This directly implements the basic RISC-V mode switch path from S-mode to U-mode.
+### Exceptions
 
-### User program trap path
-
-There are two user programs used to validate the user trap flow:
+There are two user programs used to validate the exception path:
 
 - `runu test`
 - `runu badinst`
@@ -147,10 +153,10 @@ There are two user programs used to validate the user trap flow:
 
 1. U-mode executes `ecall`
 2. CPU traps to S-mode
-3. `trap_dispatch()` classifies it as a user `ecall`
+3. `trap_dispatch()` classifies it as a user exception
 4. the kernel prints `scause`, `sepc`, and `stval`
-5. `SYS_test` advances `sepc` and returns to U-mode through `trap_return -> sret`
-6. `SYS_exit` marks the user program as finished and returns to the shell instead of resuming U-mode
+5. `SYS_test` advances `sepc` and returns to U-mode
+6. `SYS_exit` terminates the user context and returns to the shell
 
 `badinst.bin` exercises the fault path:
 
@@ -160,12 +166,19 @@ There are two user programs used to validate the user trap flow:
 4. the user context is terminated
 5. control returns to the shell
 
-So the trap code covers both:
+So the exception side covers both:
 
-- recoverable U-mode traps
-- terminating U-mode faults
+- recoverable user traps
+- terminating user faults
 
-### UART interrupt path
+### Interrupts
+
+The interrupt side currently has two device paths:
+
+- UART external interrupt through the PLIC
+- supervisor timer interrupt
+
+#### UART interrupt path
 
 UART is interrupt-driven on OrangePi RV2 and routed through the PLIC.
 
@@ -176,86 +189,75 @@ The receive path is:
 3. PLIC delivers a supervisor external interrupt
 4. `trap_dispatch()` enters the UART external-interrupt path
 5. `plic_claim()` identifies the UART IRQ
-6. `uart_irq_isr()` drains hardware RX into the RX ring buffer
-7. the shell later consumes bytes from the RX ring buffer
+6. the UART top half masks the relevant direction and enqueues deferred work
+7. the UART bottom half drains RX into the RX ring buffer or drains TX into `THR`
 8. `plic_complete()` finishes the interrupt
-
-The transmit path is:
-
-1. shell output queues bytes into the TX ring buffer
-2. UART TX interrupts are enabled
-3. when the UART can accept more data, an external interrupt arrives
-4. `uart_irq_isr()` drains queued bytes into `THR`
-5. TX interrupts are disabled again when the TX ring buffer becomes empty
-
-The compact end-to-end check for this subsystem is:
-
-- `uartdemo`
-
-The advanced version of this path no longer keeps all work inside one interrupt handler. UART RX and TX are split into:
-
-- a short top half that claims the interrupt source, checks UART status, masks the relevant direction, and enqueues deferred work
-- bottom-half tasks that drain RX or TX with a fixed budget and requeue themselves if more work remains
 
 The main data structures are:
 
-- UART RX and TX ring buffers
+- UART RX ring buffer
+- UART TX ring buffer
 - persistent deferred tasks for UART RX and UART TX
 
-The main tradeoff is that the path becomes much closer to a real interrupt-driven design, but console output is now shared by more execution contexts and therefore needs more care during demos and debugging.
+The compact end-to-end check for this subsystem is:
 
-### Timer interrupt path
+- `demo uart`
+
+#### Timer interrupt path
 
 The timer subsystem uses one hardware timer source plus a software timer queue.
 
 The core idea is:
 
 - software timers are stored in a sorted singly linked list by absolute `expire`
-- the hardware timer is always programmed to the current head deadline
+- the hardware timer is always programmed to the current list head
 
-So timer handling is no longer a fixed periodic heartbeat. It is now a deadline dispatcher.
+So timer handling is no longer a fixed periodic heartbeat. It is a deadline multiplexer built on top of one hardware timer source.
 
 The path is:
 
 1. `addtimer <sec>` converts seconds into timer ticks and calls `add_timer(...)`
-2. `add_timer(...)` allocates a `timer_event`, computes its absolute `expire`, and inserts it into the sorted pending list
-3. the hardware timer is programmed to the earliest pending deadline
-4. when that deadline arrives, the CPU takes a supervisor timer interrupt
-5. `trap_dispatch()` dispatches to `timer_irq_isr()`
-6. `timer_irq_isr()` pops every expired event, runs its callback, frees the node, and then reprograms the next deadline
+2. `add_timer(...)` allocates a `timer_event`
+3. the event is inserted into a sorted singly linked list by absolute `expire`
+4. the hardware timer is reprogrammed to the earliest pending deadline
+5. when that deadline arrives, the CPU takes a supervisor timer interrupt
+6. the timer top half masks the timer source and enqueues deferred timer work
+7. the timer bottom half pops expired events, runs callbacks, frees nodes, and reprograms the next deadline
+
+The main data structure is:
+
+- a sorted singly linked list of `timer_event`
 
 The important invariant is:
 
 - the programmed hardware deadline always matches the list head
 
-This timer path was later extended in two ways.
-
-First, the single hardware timer was turned into a software timer queue:
-
-1. `addtimer <sec>` parses seconds and converts them into timer ticks
-2. `add_timer(...)` allocates a `timer_event`
-3. the event is inserted into a sorted singly linked list by absolute `expire`
-4. the hardware timer is always reprogrammed to the current list head
-5. when the interrupt fires, the timer path pops every expired event, runs the callback, frees the node, and reprograms the next deadline
-
-The main data structure for this part is:
-
-- a sorted singly linked list of `timer_event`
-
-Second, the timer interrupt itself was moved into the same deferred-work model as UART:
-
-- `timer_irq_top()` only masks the timer source and enqueues timer work
-- `timer_task_run()` performs the actual expired-event dispatch
-- `irq_task_run_before_return()` runs deferred tasks before `trap_return -> sret`
-
-That means the timer can now preempt ongoing UART bottom-half work instead of waiting for a long UART interrupt path to finish.
-
-The main tradeoff is that the execution model becomes more realistic and responsive, but debugging output must avoid creating new contention on the same UART TX path.
-
 The main shell-facing commands for this subsystem are:
 
 - `addtimer <sec>`
 - `timer`
+
+### Nested Interrupts and Deferred Work
+
+The advanced interrupt work extends both UART and timer into a shared deferred-work model.
+
+The execution model is:
+
+1. top halves stay short and only acknowledge, mask, and enqueue work
+2. deferred work is represented as `irq_task`
+3. `irq_task_run_before_return()` runs before `trap_return -> sret`
+4. interrupts are re-enabled while bottom halves run
+5. a timer interrupt can therefore arrive while UART bottom-half work is still in progress
+
+This is the path that enables visible nested-interrupt behavior in the demo, where timer markers can appear between UART stress markers.
+
+The main data structures are:
+
+- the generic deferred-task queue of `irq_task`
+- persistent task objects for timer, UART RX, and UART TX
+- the existing UART RX/TX ring buffers
+
+The main tradeoff is that responsiveness improves, but console output becomes harder to keep clean because shell prompts, UART stress output, timer markers, and debug logs all share the same serial line.
 
 ## Shell
 
