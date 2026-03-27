@@ -86,28 +86,6 @@ static int streq(const char *a, const char *b) {
     return *a == *b;
 }
 
-static int parse_u64_dec(const char *s, uint64_t *out) {
-    uint64_t value = 0;
-    unsigned int i = 0;
-
-    if (s == 0 || out == 0 || s[0] == '\0') {
-        return -1;
-    }
-
-    while (s[i] != '\0') {
-        char c = s[i];
-
-        if (c < '0' || c > '9') {
-            return -1;
-        }
-        value = (value * 10ULL) + (uint64_t)(c - '0');
-        i++;
-    }
-
-    *out = value;
-    return 0;
-}
-
 /* Parse decimal seconds into timer ticks using fixed-point arithmetic.
  * Accepts forms like "1", "1.5", and "0.125" without pulling in libgcc
  * floating-point helpers in the freestanding kernel build.
@@ -574,25 +552,14 @@ static void cmd_timer(void) {
  */
 static void shell_timer_callback(void *arg)
 {
-    uint64_t now;
-    uint64_t uptime;
-    uint64_t progress;
     unsigned long id = (unsigned long)(uintptr_t)arg;
 
-    now = timer_read();
-    if (g_timebase_freq != 0U) {
-        uptime = (now - g_boot_time) / g_timebase_freq;
-    } else {
-        uptime = 0U;
+    if (uart_stress_note_timer(id) == 0) {
+        return;
     }
-    progress = uart_stress_progress();
 
     uart_send_string("\n[T");
     uart_send_dec(id);
-    uart_send_string(" t=");
-    uart_send_dec((unsigned long)uptime);
-    uart_send_string("s u=");
-    uart_send_dec((unsigned long)progress);
     uart_send_string("]\n");
 }
 
@@ -683,51 +650,7 @@ static void cmd_mem(void)
  * - prints a compact pass/fail summary based on the UART driver counters
  */
 static void cmd_uartdemo(void) {
-    struct uart_demo_stats stats;
-    char c;
-    int pass;
-
-    uart_demo_reset_stats();
-
-    uart_send_string("uartdemo: TX phase\n");
-    uart_send_string("uartdemo: TX interrupt-driven output test line\n");
-
-    uart_send_string("uartdemo: RX phase, type one printable key: ");
-    c = uart_recv();
-    uart_send_string("\n");
-
-    uart_demo_get_stats(&stats);
-
-    uart_send_string("uartdemo: got '");
-    uart_send(c);
-    uart_send_string("'\n");
-
-    uart_send_string("uartdemo: stats async_ready=");
-    uart_send_dec(stats.async_ready);
-    uart_send_string(" ext_irq=");
-    uart_send_dec(stats.ext_irq_count);
-    uart_send_string(" rx_irq=");
-    uart_send_dec(stats.rx_irq_count);
-    uart_send_string(" tx_irq=");
-    uart_send_dec(stats.tx_irq_count);
-    uart_send_string(" rx_fallback=");
-    uart_send_dec(stats.rx_fallback_count);
-    uart_send_string(" tx_poll=");
-    uart_send_dec(stats.tx_poll_count);
-    uart_send_string("\n");
-
-    pass = (stats.async_ready != 0UL) &&
-           (stats.ext_irq_count != 0UL) &&
-           (stats.rx_irq_count != 0UL) &&
-           (stats.tx_irq_count != 0UL) &&
-           (stats.rx_fallback_count == 0UL) &&
-           (stats.tx_poll_count == 0UL);
-
-    if (pass) {
-        uart_send_string("uartdemo: PASS - RX/TX are interrupt-driven\n");
-    } else {
-        uart_send_string("uartdemo: FAIL - counters do not match the interrupt-driven path\n");
-    }
+    (void)demo_run("uart");
 }
 
 /* Queue many small TX chunks so timer markers have a clear chance to
@@ -735,23 +658,24 @@ static void cmd_uartdemo(void) {
  */
 static void cmd_uartstress(const char *arg)
 {
-    uint64_t count = 8192ULL;
+    char buf[48];
+    unsigned int i = 0;
+    static const char prefix[] = "stress";
 
-    if (arg != 0 && arg[0] != '\0') {
-        if (parse_u64_dec(arg, &count) != 0 || count == 0ULL) {
-            uart_send_string("usage: uartstress [count]\n");
-            return;
+    while (prefix[i] != '\0' && i + 1U < sizeof(buf)) {
+        buf[i] = prefix[i];
+        i++;
+    }
+    if (arg != 0 && arg[0] != '\0' && i + 1U < sizeof(buf)) {
+        unsigned int j = 0;
+
+        buf[i++] = ' ';
+        while (arg[j] != '\0' && i + 1U < sizeof(buf)) {
+            buf[i++] = arg[j++];
         }
     }
-
-    if (uart_stress_start(count) != 0) {
-        uart_send_string("uartstress: failed to start TX stress\n");
-        return;
-    }
-
-    uart_send_string("uartstress: started ");
-    uart_send_dec((unsigned long)count);
-    uart_send_string(" TX markers\n");
+    buf[i] = '\0';
+    (void)demo_run(buf);
 }
 
 /* Load a raw user binary from initramfs into the reserved execution window. */
@@ -852,13 +776,10 @@ void processCommand(shell_t* shell) {
         uart_send_string("  cores  - Show HSM status for core 0..7\n");
         uart_send_string("  ls     - List initrd files\n");
         uart_send_string("  cat    - Show initrd file content\n");
-        uart_send_string("  demo <name> - Run higher-level demos/tests\n");
+        uart_send_string("  demo <name> - Run demos/tests (uart|stress|mem|nested|trace)\n");
         uart_send_string("  mem    - Show allocator, slab, and buddy state\n");
         uart_send_string("  timer  - Show timer subsystem state and pending queue\n");
         uart_send_string("  addtimer <sec> - Schedule a one-shot software timer (supports 1.5)\n");
-        uart_send_string("  uartdemo - Run one-shot RX/TX interrupt-driven UART demo\n");
-        uart_send_string("  uartstress [count] - Queue many UART TX markers for interleave testing\n");
-        uart_send_string("  memtest <name> - Legacy alias for allocator tests\n");
         uart_send_string("  runu <name> - Load and run bin/<name>.bin from initramfs\n");
         return;
     }
@@ -889,7 +810,24 @@ void processCommand(shell_t* shell) {
     }
 
     if (streq(cmd, "memtest") || streq(cmd, "kmtest")) {
-        memory_run_kmtest(arg);
+        char buf[64];
+        unsigned int i = 0;
+        static const char prefix[] = "mem";
+
+        while (prefix[i] != '\0' && i + 1U < sizeof(buf)) {
+            buf[i] = prefix[i];
+            i++;
+        }
+        if (arg != 0 && arg[0] != '\0' && i + 1U < sizeof(buf)) {
+            unsigned int j = 0;
+
+            buf[i++] = ' ';
+            while (arg[j] != '\0' && i + 1U < sizeof(buf)) {
+                buf[i++] = arg[j++];
+            }
+        }
+        buf[i] = '\0';
+        demo_run(buf);
         return;
     }
 

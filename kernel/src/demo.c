@@ -1,6 +1,5 @@
 #include <stdint.h>
 #include "demo.h"
-#include "memory.h"
 #include "memory_test.h"
 #include "timer.h"
 #include "uart.h"
@@ -48,17 +47,6 @@ static const char *demo_trace_kind_name(enum demo_trace_kind kind)
     }
 }
 
-static void demo_timer_callback(void *arg)
-{
-    unsigned long id = (unsigned long)(uintptr_t)arg;
-
-    demo_trace_record(DEMO_TRACE_TIMER_BOTTOM, (uint32_t)id);
-    if (id == 8UL) {
-        g_demo_nested_active = 0;
-        memory_set_allocator_log_enabled(1);
-    }
-}
-
 static int streq_local(const char *a, const char *b)
 {
     while (*a != '\0' && *b != '\0') {
@@ -74,6 +62,29 @@ static int streq_local(const char *a, const char *b)
 static int is_space_local(char c)
 {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static int parse_u64_dec_local(const char *s, uint64_t *out)
+{
+    uint64_t value = 0;
+    unsigned int i = 0;
+
+    if (s == 0 || out == 0 || s[0] == '\0') {
+        return -1;
+    }
+
+    while (s[i] != '\0') {
+        char c = s[i];
+
+        if (c < '0' || c > '9') {
+            return -1;
+        }
+        value = (value * 10ULL) + (uint64_t)(c - '0');
+        i++;
+    }
+
+    *out = value;
+    return 0;
 }
 
 static void split_first_arg_local(char *line, char **cmd, char **arg)
@@ -99,7 +110,9 @@ static void split_first_arg_local(char *line, char **cmd, char **arg)
 void demo_print_usage(void)
 {
     uart_send_string("demo usage:\n");
-    uart_send_string("  demo nested      - schedule T1..T8 at 0.25s steps and start UART stress\n");
+    uart_send_string("  demo nested      - print the recommended manual nested-interrupt test flow\n");
+    uart_send_string("  demo uart        - run the one-shot interrupt-driven UART demo\n");
+    uart_send_string("  demo stress [n]  - queue UART TX markers for interleave testing\n");
     uart_send_string("  demo mem <name>  - run allocator test: basic|boundary|slab|multislab|reclaim|large|buddy|invalid|stress|all\n");
     uart_send_string("  demo trace       - dump recent top/bottom-half trace events\n");
     uart_send_string("  demo trace reset - clear recent trace events\n");
@@ -178,46 +191,92 @@ int demo_nested_active(void)
 
 static int demo_nested(void)
 {
-    static const unsigned int timer_count = 8U;
-    uint64_t step_ticks;
-    unsigned int i;
-
-    if (g_timebase_freq == 0U) {
-        uart_send_string("demo nested: timer frequency unavailable\n");
-        return -1;
-    }
-    step_ticks = (uint64_t)g_timebase_freq / 4ULL;
-    if (step_ticks == 0U) {
-        step_ticks = 1U;
-    }
     demo_trace_reset();
-    g_demo_nested_active = 1;
-    memory_set_allocator_log_enabled(0);
-
-    for (i = 0; i < timer_count; i++) {
-        if (add_timer(demo_timer_callback, (void *)(uintptr_t)(i + 1U),
-                      (uint64_t)(i + 1U) * step_ticks) != 0) {
-            g_demo_nested_active = 0;
-            memory_set_allocator_log_enabled(1);
-            uart_send_string("demo nested: failed to schedule timer markers\n");
-            return -1;
-        }
-    }
-
-    if (uart_stress_start(8192U) != 0) {
-        g_demo_nested_active = 0;
-        memory_set_allocator_log_enabled(1);
-        uart_send_string("demo nested: failed to start UART stress\n");
-        return -1;
-    }
-
-    uart_send_string("demo nested: schedule T1..T8 at 0.25s steps and start UART stress\n");
+    g_demo_nested_active = 0;
+    uart_send_string("manual nested-interrupt test:\n");
+    uart_send_string("  addtimer 1\n");
+    uart_send_string("  addtimer 2\n");
+    uart_send_string("  addtimer 3\n");
+    uart_send_string("  uartstress\n");
+    uart_send_string("expected: [T1]/[T2]/[T3] should appear between [U...] markers\n");
     return 0;
 }
 
 static int demo_mem(const char *name)
 {
     return memory_run_kmtest(name);
+}
+
+static int demo_uart(void)
+{
+    struct uart_demo_stats stats;
+    char c;
+    int pass;
+
+    uart_demo_reset_stats();
+
+    uart_send_string("uartdemo: TX phase\n");
+    uart_send_string("uartdemo: TX interrupt-driven output test line\n");
+
+    uart_send_string("uartdemo: RX phase, type one printable key: ");
+    c = uart_recv();
+    uart_send_string("\n");
+
+    uart_demo_get_stats(&stats);
+
+    uart_send_string("uartdemo: got '");
+    uart_send(c);
+    uart_send_string("'\n");
+
+    uart_send_string("uartdemo: stats async_ready=");
+    uart_send_dec(stats.async_ready);
+    uart_send_string(" ext_irq=");
+    uart_send_dec(stats.ext_irq_count);
+    uart_send_string(" rx_irq=");
+    uart_send_dec(stats.rx_irq_count);
+    uart_send_string(" tx_irq=");
+    uart_send_dec(stats.tx_irq_count);
+    uart_send_string(" rx_fallback=");
+    uart_send_dec(stats.rx_fallback_count);
+    uart_send_string(" tx_poll=");
+    uart_send_dec(stats.tx_poll_count);
+    uart_send_string("\n");
+
+    pass = (stats.async_ready != 0UL) &&
+           (stats.ext_irq_count != 0UL) &&
+           (stats.rx_irq_count != 0UL) &&
+           (stats.tx_irq_count != 0UL) &&
+           (stats.rx_fallback_count == 0UL) &&
+           (stats.tx_poll_count == 0UL);
+
+    if (pass) {
+        uart_send_string("uartdemo: PASS - RX/TX are interrupt-driven\n");
+    } else {
+        uart_send_string("uartdemo: FAIL - counters do not match the interrupt-driven path\n");
+    }
+    return pass ? 0 : -1;
+}
+
+static int demo_stress(const char *arg)
+{
+    uint64_t count = 1024ULL;
+
+    if (arg != 0 && arg[0] != '\0') {
+        if (parse_u64_dec_local(arg, &count) != 0 || count == 0ULL) {
+            uart_send_string("usage: demo stress [count]\n");
+            return -1;
+        }
+    }
+
+    uart_send_string("uartstress: started ");
+    uart_send_dec((unsigned long)count);
+    uart_send_string(" TX markers\n");
+
+    if (uart_stress_start(count) != 0) {
+        uart_send_string("uartstress: failed to start TX stress\n");
+        return -1;
+    }
+    return 0;
 }
 
 int demo_run(const char *name)
@@ -241,6 +300,12 @@ int demo_run(const char *name)
 
     if (streq_local(cmd, "nested")) {
         return demo_nested();
+    }
+    if (streq_local(cmd, "uart")) {
+        return demo_uart();
+    }
+    if (streq_local(cmd, "stress")) {
+        return demo_stress(arg);
     }
     if (streq_local(cmd, "trace")) {
         if (arg != 0 && streq_local(arg, "reset")) {

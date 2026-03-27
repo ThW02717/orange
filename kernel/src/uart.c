@@ -6,6 +6,7 @@
 #include "plic.h"
 #include "utils.h"
 #include "irq_task.h"
+#include "memory.h"
 
 static struct ringbuf g_uart_rx_buf;
 static struct ringbuf g_uart_tx_buf;
@@ -26,6 +27,9 @@ static volatile unsigned long g_uart_rx_fallback_count = 0;
 static volatile unsigned long g_uart_tx_poll_count = 0;
 static uint64_t g_uart_stress_next = 0;
 static uint64_t g_uart_stress_remaining = 0;
+static unsigned long g_uart_timer_marker_ids[16];
+static unsigned int g_uart_timer_marker_head = 0U;
+static unsigned int g_uart_timer_marker_tail = 0U;
 static struct irq_task g_uart_rx_task = {
     .type = IRQ_TASK_UART_RX,
     .prio = 0,
@@ -341,9 +345,89 @@ static unsigned int uart_tx_queue_stress_marker(void)
     return 1;
 }
 
+static int uart_timer_marker_pending(void)
+{
+    return g_uart_timer_marker_head != g_uart_timer_marker_tail;
+}
+
+static int uart_queue_timer_marker(unsigned long id)
+{
+    unsigned int next_tail;
+    unsigned int capacity = (unsigned int)(sizeof(g_uart_timer_marker_ids) /
+                                           sizeof(g_uart_timer_marker_ids[0]));
+
+    next_tail = (g_uart_timer_marker_tail + 1U) % capacity;
+    if (next_tail == g_uart_timer_marker_head) {
+        return -1;
+    }
+
+    g_uart_timer_marker_ids[g_uart_timer_marker_tail] = id;
+    g_uart_timer_marker_tail = next_tail;
+    return 0;
+}
+
+static int uart_tx_queue_pending_timer_marker(void)
+{
+    char buf[16];
+    char rev[24];
+    unsigned int len = 0;
+    unsigned int rev_len = 0;
+    unsigned int i;
+    unsigned int capacity = (unsigned int)(sizeof(g_uart_timer_marker_ids) /
+                                           sizeof(g_uart_timer_marker_ids[0]));
+    unsigned long id;
+    unsigned long value;
+
+    if (!uart_timer_marker_pending()) {
+        return 0;
+    }
+
+    id = g_uart_timer_marker_ids[g_uart_timer_marker_head];
+
+    buf[len++] = '\r';
+    buf[len++] = '\n';
+    buf[len++] = '[';
+    buf[len++] = 'T';
+
+    value = id;
+    if (value == 0UL) {
+        rev[rev_len++] = '0';
+    } else {
+        while (value > 0UL && rev_len < sizeof(rev)) {
+            rev[rev_len++] = (char)('0' + (value % 10UL));
+            value /= 10UL;
+        }
+    }
+
+    for (i = 0; i < rev_len; i++) {
+        buf[len++] = rev[rev_len - 1U - i];
+    }
+
+    buf[len++] = ']';
+    buf[len++] = '\r';
+    buf[len++] = '\n';
+
+    if ((RINGBUF_CAPACITY - g_uart_tx_buf.count) < len) {
+        return 0;
+    }
+
+    (void)uart_tx_queue_chars(buf, len);
+    g_uart_timer_marker_head = (g_uart_timer_marker_head + 1U) % capacity;
+    return 1;
+}
+
 static void uart_tx_fill_stress_markers(unsigned int budget_markers)
 {
-    while (budget_markers > 0U && g_uart_stress_remaining > 0U) {
+    while (budget_markers > 0U) {
+        if (uart_timer_marker_pending()) {
+            if (uart_tx_queue_pending_timer_marker() == 0U) {
+                break;
+            }
+            continue;
+        }
+        if (g_uart_stress_remaining == 0U) {
+            break;
+        }
         if (uart_tx_queue_stress_marker() == 0U) {
             break;
         }
@@ -387,6 +471,8 @@ static void uart_reset_runtime_state(void)
     g_uart_tx_task.next = 0;
     g_uart_stress_next = 0;
     g_uart_stress_remaining = 0;
+    g_uart_timer_marker_head = 0U;
+    g_uart_timer_marker_tail = 0U;
 
     uart_demo_reset_stats();
 }
@@ -638,12 +724,14 @@ int uart_tx_task_run(struct irq_task *task)
         uart_tx_fill_stress_markers(UART_IRQ_TASK_BUDGET);
     }
 
-    if (!uart_tx_buf_is_empty() || g_uart_stress_remaining != 0U) {
+    if (!uart_tx_buf_is_empty() || g_uart_stress_remaining != 0U ||
+        uart_timer_marker_pending()) {
         uart_tx_unmask();
         return 1;
     }
 
     uart_tx_mask();
+    memory_set_allocator_log_enabled(1);
     return 0;
 }
 
@@ -667,6 +755,9 @@ int uart_stress_start(uint64_t count)
     }
     g_uart_stress_next = 0;
     g_uart_stress_remaining = count;
+    g_uart_timer_marker_head = 0U;
+    g_uart_timer_marker_tail = 0U;
+    memory_set_allocator_log_enabled(0);
     uart_tx_fill_stress_markers(UART_IRQ_TASK_BUDGET);
     uart_irq_restore(sstatus);
 
@@ -683,6 +774,40 @@ uint64_t uart_stress_progress(void)
     progress = g_uart_stress_next;
     uart_irq_restore(sstatus);
     return progress;
+}
+
+int uart_stress_active(void)
+{
+    uint64_t sstatus;
+    int active;
+
+    sstatus = uart_irq_save();
+    active = (g_uart_stress_remaining != 0U) ||
+             uart_timer_marker_pending();
+    uart_irq_restore(sstatus);
+    return active;
+}
+
+int uart_stress_note_timer(unsigned long id)
+{
+    uint64_t sstatus;
+    int ret;
+
+    sstatus = uart_irq_save();
+    if (g_uart_stress_remaining == 0U && !uart_timer_marker_pending()) {
+        uart_irq_restore(sstatus);
+        return -1;
+    }
+    ret = uart_queue_timer_marker(id);
+    if (ret == 0) {
+        uart_tx_fill_stress_markers(UART_IRQ_TASK_BUDGET);
+    }
+    uart_irq_restore(sstatus);
+
+    if (ret == 0) {
+        uart_tx_kick();
+    }
+    return ret;
 }
 
 void uart_demo_note_external_irq(uint32_t irq)

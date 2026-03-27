@@ -276,7 +276,7 @@ int timer_task_run(struct irq_task *task)
      * it here instead of inside the callback avoids printing ">" before the
      * allocator free trace emitted by kfree(event).
      */
-    if (fired_any != 0 && !demo_nested_active()) {
+    if (fired_any != 0 && !demo_nested_active() && !uart_stress_active()) {
         shell_redraw_prompt_delayed();
     }
 

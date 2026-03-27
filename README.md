@@ -192,6 +192,18 @@ The compact end-to-end check for this subsystem is:
 
 - `uartdemo`
 
+The advanced version of this path no longer keeps all work inside one interrupt handler. UART RX and TX are split into:
+
+- a short top half that claims the interrupt source, checks UART status, masks the relevant direction, and enqueues deferred work
+- bottom-half tasks that drain RX or TX with a fixed budget and requeue themselves if more work remains
+
+The main data structures are:
+
+- UART RX and TX ring buffers
+- persistent deferred tasks for UART RX and UART TX
+
+The main tradeoff is that the path becomes much closer to a real interrupt-driven design, but console output is now shared by more execution contexts and therefore needs more care during demos and debugging.
+
 ### Timer interrupt path
 
 The timer subsystem uses one hardware timer source plus a software timer queue.
@@ -216,6 +228,30 @@ The important invariant is:
 
 - the programmed hardware deadline always matches the list head
 
+This timer path was later extended in two ways.
+
+First, the single hardware timer was turned into a software timer queue:
+
+1. `addtimer <sec>` parses seconds and converts them into timer ticks
+2. `add_timer(...)` allocates a `timer_event`
+3. the event is inserted into a sorted singly linked list by absolute `expire`
+4. the hardware timer is always reprogrammed to the current list head
+5. when the interrupt fires, the timer path pops every expired event, runs the callback, frees the node, and reprograms the next deadline
+
+The main data structure for this part is:
+
+- a sorted singly linked list of `timer_event`
+
+Second, the timer interrupt itself was moved into the same deferred-work model as UART:
+
+- `timer_irq_top()` only masks the timer source and enqueues timer work
+- `timer_task_run()` performs the actual expired-event dispatch
+- `irq_task_run_before_return()` runs deferred tasks before `trap_return -> sret`
+
+That means the timer can now preempt ongoing UART bottom-half work instead of waiting for a long UART interrupt path to finish.
+
+The main tradeoff is that the execution model becomes more realistic and responsive, but debugging output must avoid creating new contention on the same UART TX path.
+
 The main shell-facing commands for this subsystem are:
 
 - `addtimer <sec>`
@@ -233,12 +269,13 @@ The shell is intentionally small. It is not a process manager or userspace envir
 - `cores`: show secondary-hart bring-up state
 - `ls`: list files in the initramfs
 - `cat <file>`: print a file from the initramfs
+- `demo <name>`: run grouped demos and tests such as `demo uart`, `demo stress`, `demo mem <name>`, `demo nested`, and `demo trace`
 - `mem`: print allocator, slab, and buddy state
-- `memtest <name>`: run allocator regression tests
 - `timer`: print timer state and the pending software-timer queue
 - `addtimer <sec>`: queue a one-shot software timer
-- `uartdemo`: compact RX/TX interrupt-driven UART demo
 - `runu <name>`: load and execute `bin/<name>.bin` from the initramfs in U-mode
+
+Legacy aliases such as `uartdemo`, `uartstress`, `memtest`, and `kmtest` still exist, but the main public entry point is now `demo <name>`.
 
 ## Notes from Debugging
 
@@ -255,3 +292,24 @@ In this codebase, that bug showed up when:
 - the board still behaved as if the old program was running
 
 The fix is a `fence.i` after copying the new user image and before entering U-mode again.
+
+### Serial console state can become stale after heavy UART output
+
+During the nested-interrupt demo, the board console may become sluggish even though the kernel still receives input correctly. In practice this was usually not a permanent logic failure. Heavy UART stress output, repeated kernel reloads, and reconnecting the host serial session could leave the development setup in a stale state.
+
+In practice, the most reliable recovery was:
+
+- restart the board
+- reconnect the serial session
+- reload the kernel through the UART boot flow
+
+This is a practical board-side debugging note rather than a claim that rebooting is part of the design.
+
+### Console output from multiple paths can interleave
+
+This kernel does not implement a full TTY or console-locking layer. As a result, shell prompts, timer callbacks, allocator logs, and UART demo output can appear on the same serial line and sometimes interleave at character granularity.
+
+That behavior affects how clean the console looks, but it does not change the core interrupt design. The nested-interrupt work was validated by checking both:
+
+- visible UART/timer interleaving in the demo
+- the internal trace from `demo trace`
