@@ -1,9 +1,11 @@
 #include "uart.h"
+#include "demo.h"
 #include "fdt.h"
 #include "ringbuf.h"
 #include "trap.h"
 #include "plic.h"
 #include "utils.h"
+#include "irq_task.h"
 
 static struct ringbuf g_uart_rx_buf;
 static struct ringbuf g_uart_tx_buf;
@@ -22,6 +24,25 @@ static volatile unsigned long g_uart_rx_irq_count = 0;
 static volatile unsigned long g_uart_tx_irq_count = 0;
 static volatile unsigned long g_uart_rx_fallback_count = 0;
 static volatile unsigned long g_uart_tx_poll_count = 0;
+static uint64_t g_uart_stress_next = 0;
+static uint64_t g_uart_stress_remaining = 0;
+static struct irq_task g_uart_rx_task = {
+    .type = IRQ_TASK_UART_RX,
+    .prio = 0,
+    .state = IRQ_TASK_IDLE,
+    .next = 0,
+    .run = uart_rx_task_run,
+};
+static struct irq_task g_uart_tx_task = {
+    .type = IRQ_TASK_UART_TX,
+    .prio = 0,
+    .state = IRQ_TASK_IDLE,
+    .next = 0,
+    .run = uart_tx_task_run,
+};
+
+#define UART_IRQ_TASK_BUDGET 16U
+#define UART_STRESS_CHUNK_UNITS 64U
 
 int uart_platform_init_from_fdt(const void *fdt)
 {
@@ -109,6 +130,14 @@ static inline void uart_irq_restore(uint64_t sstatus)
     asm volatile("csrw sstatus, %0" : : "r"(sstatus));
 }
 
+static inline int uart_global_irqs_enabled(void)
+{
+    uint64_t sstatus;
+
+    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
+    return (sstatus & SSTATUS_SIE) != 0U;
+}
+
 static void uart_ier_set_bits(uint32_t bits)
 {
     uart_reg_write(UART_IER_REG, uart_reg_read(UART_IER_REG) | bits);
@@ -117,6 +146,44 @@ static void uart_ier_set_bits(uint32_t bits)
 static void uart_ier_clear_bits(uint32_t bits)
 {
     uart_reg_write(UART_IER_REG, uart_reg_read(UART_IER_REG) & ~bits);
+}
+
+void uart_rx_mask(void)
+{
+    uart_ier_clear_bits(UART_IER_RX_ENABLE | UART_IER_LINE_ENABLE | UART_IER_RTO_ENABLE);
+}
+
+void uart_rx_unmask(void)
+{
+    uart_ier_set_bits(UART_IER_RX_ENABLE | UART_IER_LINE_ENABLE | UART_IER_RTO_ENABLE);
+}
+
+void uart_tx_mask(void)
+{
+    uart_ier_clear_bits(UART_IER_TX_ENABLE);
+}
+
+void uart_tx_unmask(void)
+{
+    uart_ier_set_bits(UART_IER_TX_ENABLE);
+}
+
+static uint32_t uart_irq_status_snapshot(void)
+{
+    return uart_reg_read(UART_LSR_REG);
+}
+
+static int uart_rx_ready_from_status(uint32_t status)
+{
+    return (status & LSR_RX_READY) != 0U;
+}
+
+static int uart_tx_ready_from_status(uint32_t status)
+{
+    uint32_t ier;
+
+    ier = uart_reg_read(UART_IER_REG);
+    return ((status & LSR_TX_IDLE) != 0U) && ((ier & UART_IER_TX_ENABLE) != 0U);
 }
 
 /* RX/TX ring buffers are shared between interrupt context and normal shell
@@ -209,13 +276,88 @@ static int uart_tx_try_drain_one(void)
     return 1;
 }
 
+static unsigned int uart_tx_queue_chars(const char *s, unsigned int len)
+{
+    unsigned int i = 0;
+
+    while (i < len && !uart_tx_buf_is_full()) {
+        (void)uart_tx_push_char(s[i]);
+        i++;
+    }
+    return i;
+}
+
+static unsigned int uart_tx_queue_stress_marker(void)
+{
+    char buf[24];
+    unsigned int len = 0;
+    uint64_t value;
+    char rev[24];
+    unsigned int rev_len = 0;
+    unsigned int i;
+    uint64_t marker;
+
+    if (g_uart_stress_remaining == 0U) {
+        return 0;
+    }
+
+    marker = g_uart_stress_next;
+
+    buf[len++] = '[';
+    buf[len++] = 'U';
+
+    value = marker;
+    if (value == 0U) {
+        rev[rev_len++] = '0';
+    } else {
+        while (value > 0U && rev_len < sizeof(rev)) {
+            rev[rev_len++] = (char)('0' + (value % 10U));
+            value /= 10U;
+        }
+    }
+
+    for (i = 0; i < rev_len; i++) {
+        buf[len++] = rev[rev_len - 1U - i];
+    }
+
+    buf[len++] = ']';
+    if (((marker + 1U) % 8U) == 0U) {
+        buf[len++] = '\r';
+        buf[len++] = '\n';
+    } else {
+        buf[len++] = ' ';
+    }
+
+    if (uart_tx_buf_is_full()) {
+        return 0;
+    }
+    if ((RINGBUF_CAPACITY - g_uart_tx_buf.count) < len) {
+        return 0;
+    }
+
+    (void)uart_tx_queue_chars(buf, len);
+    g_uart_stress_next++;
+    g_uart_stress_remaining--;
+    return 1;
+}
+
+static void uart_tx_fill_stress_markers(unsigned int budget_markers)
+{
+    while (budget_markers > 0U && g_uart_stress_remaining > 0U) {
+        if (uart_tx_queue_stress_marker() == 0U) {
+            break;
+        }
+        budget_markers--;
+    }
+}
+
 static void uart_tx_kick(void)
 {
     /* TX interrupts stay disabled while the queue is empty. Once new data is
      * queued, enable TX-ready interrupts and opportunistically push one byte
      * so the hardware pipeline starts moving immediately.
      */
-    uart_ier_set_bits(UART_IER_TX_ENABLE);
+    uart_tx_unmask();
     (void)uart_tx_try_drain_one();
 }
 
@@ -228,6 +370,35 @@ static void uart_irq_ack_stale_status(void)
     (void)uart_reg_read(UART_RBR_REG);
     (void)uart_reg_read(UART_IIR_REG);
     (void)uart_reg_read(UART_MSR_REG);
+}
+
+/* Drop any software-side backlog from a previous demo run and drain stale
+ * hardware RX state before re-arming the interrupt-driven console path.
+ */
+static void uart_reset_runtime_state(void)
+{
+    ringbuf_init(&g_uart_rx_buf);
+    ringbuf_init(&g_uart_tx_buf);
+
+    g_uart_async_ready = 0;
+    g_uart_rx_task.state = IRQ_TASK_IDLE;
+    g_uart_rx_task.next = 0;
+    g_uart_tx_task.state = IRQ_TASK_IDLE;
+    g_uart_tx_task.next = 0;
+    g_uart_stress_next = 0;
+    g_uart_stress_remaining = 0;
+
+    uart_demo_reset_stats();
+}
+
+static void uart_flush_hardware_rx_fifo(void)
+{
+    unsigned int budget = 256U;
+
+    while (budget > 0U && (uart_reg_read(UART_LSR_REG) & LSR_RX_READY) != 0U) {
+        (void)uart_reg_read(UART_RBR_REG);
+        budget--;
+    }
 }
 
 void uart_init(void)
@@ -253,10 +424,10 @@ void uart_irq_init(void)
     uint64_t sie;
     uint64_t sstatus;
     
-    /* Reset software queues before arming the hardware path. */
-    ringbuf_init(&g_uart_rx_buf);
-    ringbuf_init(&g_uart_tx_buf);
-    uart_demo_reset_stats();
+    /* Start from a clean console state every boot/load so an earlier stress
+     * run cannot leave backlog in the software rings or deferred-task state.
+     */
+    uart_reset_runtime_state();
 
     /* Route the DT-discovered UART IRQ into hart0's S-mode context. */
     plic_set_priority(uart_irq_id(), 1U);
@@ -269,8 +440,10 @@ void uart_irq_init(void)
      * - OUT2 asserted so the IRQ output line is driven,
      * - UUE/LINE/RTO bits enabled so sparse shell input still raises an IRQ.
      */
+    uart_reg_write(UART_IER_REG, 0U);
     uart_reg_write(UART_FCR_REG, 0x07U);
     uart_reg_write(UART_MCR_REG, uart_reg_read(UART_MCR_REG) | UART_MCR_OUT2);
+    uart_flush_hardware_rx_fifo();
     uart_irq_ack_stale_status();
     uart_ier_set_bits(UART_IER_UUE |
                       UART_IER_RX_ENABLE |
@@ -289,7 +462,6 @@ void uart_irq_init(void)
     asm volatile("csrw sstatus, %0" : : "r"(sstatus));
 
     g_uart_irq_enabled = 1;
-    g_uart_async_ready = 0;
 #endif
 }
 
@@ -299,14 +471,18 @@ void uart_send(char c)
      * drained by TX-ready interrupts.
      */
     if (g_uart_async_ready) {
-        while (1) {
-            if (!uart_tx_buf_is_full()) {
-                (void)uart_tx_push_char(c);
-                uart_tx_kick();
-                return;
+        if (uart_global_irqs_enabled()) {
+            while (uart_tx_buf_is_full()) {
+                asm volatile("nop");
             }
-            (void)uart_tx_try_drain_one();
+            (void)uart_tx_push_char(c);
+            uart_tx_kick();
+            return;
         }
+
+        /* If global interrupts are masked, waiting for the deferred TX bottom
+         * half would deadlock. Fall back to direct polled output in that case.
+         */
     }
 
     /* Early boot fallback: keep console output alive until the first real
@@ -394,34 +570,119 @@ void uart_send_dec(unsigned long value)
     }
 }
 
-void uart_irq_isr(void)
+void uart_irq_top(void)
 {
-    /* RX side: drain every received byte that hardware already has buffered
-     * and hand it to the software RX queue for the shell to consume later.
-     */
-    while ((uart_reg_read(UART_LSR_REG) & LSR_RX_READY) != 0U) {
-        char c = (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
-        (void)uart_rx_push_char(c);
-        g_uart_rx_irq_count++;
-    }
+    uint32_t status;
 
-    /* TX side: one UART IRQ can be used to push several queued bytes while
-     * the transmitter stays ready.
-     */
-    while (uart_tx_try_drain_one()) {
-        g_uart_tx_irq_count++;
-    }
-
+    status = uart_irq_status_snapshot();
     if (!g_uart_async_ready) {
         g_uart_async_ready = 1;
     }
 
-    /* When the TX queue becomes empty, stop TX-ready interrupts so the UART
-     * does not keep interrupting with no work to do.
-     */
-    if (uart_tx_buf_is_empty()) {
-        uart_ier_clear_bits(UART_IER_TX_ENABLE);
+    if (uart_rx_ready_from_status(status)) {
+        demo_trace_record(DEMO_TRACE_UART_TOP_RX, 0U);
+        uart_rx_mask();
+        if (g_uart_rx_task.state == IRQ_TASK_IDLE) {
+            (void)irq_task_enqueue(&g_uart_rx_task);
+        }
     }
+
+    if (uart_tx_ready_from_status(status)) {
+        demo_trace_record(DEMO_TRACE_UART_TOP_TX, (uint32_t)uart_stress_progress());
+        uart_tx_mask();
+        if (g_uart_tx_task.state == IRQ_TASK_IDLE) {
+            (void)irq_task_enqueue(&g_uart_tx_task);
+        }
+    }
+}
+
+int uart_rx_task_run(struct irq_task *task)
+{
+    unsigned int budget = UART_IRQ_TASK_BUDGET;
+
+    (void)task;
+    demo_trace_record(DEMO_TRACE_UART_RX_BOTTOM, budget);
+
+    while (budget > 0U && (uart_reg_read(UART_LSR_REG) & LSR_RX_READY) != 0U) {
+        char c = (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
+        (void)uart_rx_push_char(c);
+        g_uart_rx_irq_count++;
+        budget--;
+    }
+
+    if ((uart_reg_read(UART_LSR_REG) & LSR_RX_READY) != 0U) {
+        return 1;
+    }
+
+    uart_rx_unmask();
+    return 0;
+}
+
+int uart_tx_task_run(struct irq_task *task)
+{
+    unsigned int budget = UART_IRQ_TASK_BUDGET;
+
+    (void)task;
+    demo_trace_record(DEMO_TRACE_UART_TX_BOTTOM, (uint32_t)uart_stress_progress());
+
+    if (uart_tx_buf_is_empty() && g_uart_stress_remaining != 0U) {
+        uart_tx_fill_stress_markers(UART_IRQ_TASK_BUDGET);
+    }
+
+    while (budget > 0U && uart_tx_try_drain_one()) {
+        g_uart_tx_irq_count++;
+        budget--;
+    }
+
+    if (uart_tx_buf_is_empty() && g_uart_stress_remaining != 0U) {
+        uart_tx_fill_stress_markers(UART_IRQ_TASK_BUDGET);
+    }
+
+    if (!uart_tx_buf_is_empty() || g_uart_stress_remaining != 0U) {
+        uart_tx_unmask();
+        return 1;
+    }
+
+    uart_tx_mask();
+    return 0;
+}
+
+void uart_irq_isr(void)
+{
+    uart_irq_top();
+}
+
+int uart_stress_start(uint64_t count)
+{
+    uint64_t sstatus;
+
+    if (count == 0U || g_uart_irq_enabled == 0) {
+        return -1;
+    }
+
+    sstatus = uart_irq_save();
+    if (g_uart_stress_remaining != 0U) {
+        uart_irq_restore(sstatus);
+        return -1;
+    }
+    g_uart_stress_next = 0;
+    g_uart_stress_remaining = count;
+    uart_tx_fill_stress_markers(UART_IRQ_TASK_BUDGET);
+    uart_irq_restore(sstatus);
+
+    uart_tx_kick();
+    return 0;
+}
+
+uint64_t uart_stress_progress(void)
+{
+    uint64_t sstatus;
+    uint64_t progress;
+
+    sstatus = uart_irq_save();
+    progress = g_uart_stress_next;
+    uart_irq_restore(sstatus);
+    return progress;
 }
 
 void uart_demo_note_external_irq(uint32_t irq)

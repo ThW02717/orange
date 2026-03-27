@@ -7,6 +7,7 @@
 #include "cpio.h"
 #include "memory.h"
 #include "memory_test.h"
+#include "demo.h"
 #include "trap.h"
 #include "timer.h"
 #include "user.h"
@@ -104,6 +105,55 @@ static int parse_u64_dec(const char *s, uint64_t *out) {
     }
 
     *out = value;
+    return 0;
+}
+
+/* Parse decimal seconds into timer ticks using fixed-point arithmetic.
+ * Accepts forms like "1", "1.5", and "0.125" without pulling in libgcc
+ * floating-point helpers in the freestanding kernel build.
+ */
+static int parse_seconds_to_ticks(const char *s, uint64_t *ticks_out, uint64_t *whole_out)
+{
+    uint64_t whole = 0;
+    uint64_t frac = 0;
+    uint64_t frac_scale = 1;
+    unsigned int i = 0;
+    int seen_dot = 0;
+
+    if (s == 0 || ticks_out == 0 || whole_out == 0 || s[0] == '\0' || g_timebase_freq == 0U) {
+        return -1;
+    }
+
+    while (s[i] != '\0') {
+        char c = s[i];
+
+        if (c == '.') {
+            if (seen_dot) {
+                return -1;
+            }
+            seen_dot = 1;
+            i++;
+            continue;
+        }
+        if (c < '0' || c > '9') {
+            return -1;
+        }
+
+        if (!seen_dot) {
+            whole = (whole * 10ULL) + (uint64_t)(c - '0');
+        } else {
+            if (frac_scale >= 1000ULL) {
+                return -1;
+            }
+            frac = (frac * 10ULL) + (uint64_t)(c - '0');
+            frac_scale *= 10ULL;
+        }
+        i++;
+    }
+
+    *ticks_out = (whole * (uint64_t)g_timebase_freq) +
+                 ((frac * (uint64_t)g_timebase_freq) / frac_scale);
+    *whole_out = whole;
     return 0;
 }
 
@@ -524,13 +574,26 @@ static void cmd_timer(void) {
  */
 static void shell_timer_callback(void *arg)
 {
+    uint64_t now;
+    uint64_t uptime;
+    uint64_t progress;
     unsigned long id = (unsigned long)(uintptr_t)arg;
 
-    uart_send_string("\n[timer] event ");
+    now = timer_read();
+    if (g_timebase_freq != 0U) {
+        uptime = (now - g_boot_time) / g_timebase_freq;
+    } else {
+        uptime = 0U;
+    }
+    progress = uart_stress_progress();
+
+    uart_send_string("\n[T");
     uart_send_dec(id);
-    uart_send_string(" fired at ");
-    uart_send_dec(g_uptime_seconds);
-    uart_send_string(" sec\n");
+    uart_send_string(" t=");
+    uart_send_dec((unsigned long)uptime);
+    uart_send_string("s u=");
+    uart_send_dec((unsigned long)progress);
+    uart_send_string("]\n");
 }
 
 /* Timer callbacks and allocator frees both print asynchronously while the
@@ -569,11 +632,11 @@ void shell_redraw_prompt_delayed(void)
 static void cmd_addtimer(const char *arg)
 {
     static unsigned long next_timer_id = 1;
-    uint64_t seconds;
     uint64_t ticks;
+    uint64_t whole_seconds;
     unsigned long id;
 
-    if (arg == 0 || parse_u64_dec(arg, &seconds) != 0) {
+    if (arg == 0) {
         uart_send_string("usage: addtimer <seconds>\n");
         return;
     }
@@ -581,8 +644,12 @@ static void cmd_addtimer(const char *arg)
         uart_send_string("addtimer: timer frequency unavailable\n");
         return;
     }
+    if (parse_seconds_to_ticks(arg, &ticks, &whole_seconds) != 0 || ticks == 0U) {
+        uart_send_string("usage: addtimer <seconds>\n");
+        uart_send_string("note: decimal seconds like 1.5 are supported\n");
+        return;
+    }
 
-    ticks = seconds * (uint64_t)g_timebase_freq;
     id = next_timer_id++;
 
     if (add_timer(shell_timer_callback, (void *)(uintptr_t)id, ticks) != 0) {
@@ -593,7 +660,7 @@ static void cmd_addtimer(const char *arg)
     uart_send_string("addtimer: scheduled event ");
     uart_send_dec(id);
     uart_send_string(" after ");
-    uart_send_dec((unsigned long)seconds);
+    uart_send_string(arg);
     uart_send_string(" sec\n");
 }
 
@@ -661,6 +728,30 @@ static void cmd_uartdemo(void) {
     } else {
         uart_send_string("uartdemo: FAIL - counters do not match the interrupt-driven path\n");
     }
+}
+
+/* Queue many small TX chunks so timer markers have a clear chance to
+ * interleave with UART bottom-half work.
+ */
+static void cmd_uartstress(const char *arg)
+{
+    uint64_t count = 8192ULL;
+
+    if (arg != 0 && arg[0] != '\0') {
+        if (parse_u64_dec(arg, &count) != 0 || count == 0ULL) {
+            uart_send_string("usage: uartstress [count]\n");
+            return;
+        }
+    }
+
+    if (uart_stress_start(count) != 0) {
+        uart_send_string("uartstress: failed to start TX stress\n");
+        return;
+    }
+
+    uart_send_string("uartstress: started ");
+    uart_send_dec((unsigned long)count);
+    uart_send_string(" TX markers\n");
 }
 
 /* Load a raw user binary from initramfs into the reserved execution window. */
@@ -761,11 +852,13 @@ void processCommand(shell_t* shell) {
         uart_send_string("  cores  - Show HSM status for core 0..7\n");
         uart_send_string("  ls     - List initrd files\n");
         uart_send_string("  cat    - Show initrd file content\n");
-        uart_send_string("  memtest <name> - Run allocator tests\n");
+        uart_send_string("  demo <name> - Run higher-level demos/tests\n");
         uart_send_string("  mem    - Show allocator, slab, and buddy state\n");
         uart_send_string("  timer  - Show timer subsystem state and pending queue\n");
-        uart_send_string("  addtimer <sec> - Schedule a one-shot software timer\n");
+        uart_send_string("  addtimer <sec> - Schedule a one-shot software timer (supports 1.5)\n");
         uart_send_string("  uartdemo - Run one-shot RX/TX interrupt-driven UART demo\n");
+        uart_send_string("  uartstress [count] - Queue many UART TX markers for interleave testing\n");
+        uart_send_string("  memtest <name> - Legacy alias for allocator tests\n");
         uart_send_string("  runu <name> - Load and run bin/<name>.bin from initramfs\n");
         return;
     }
@@ -800,6 +893,11 @@ void processCommand(shell_t* shell) {
         return;
     }
 
+    if (streq(cmd, "demo")) {
+        demo_run(arg);
+        return;
+    }
+
     if (streq(cmd, "mem")) {
         cmd_mem();
         return;
@@ -817,6 +915,11 @@ void processCommand(shell_t* shell) {
 
     if (streq(cmd, "uartdemo")) {
         cmd_uartdemo();
+        return;
+    }
+
+    if (streq(cmd, "uartstress")) {
+        cmd_uartstress(arg);
         return;
     }
 

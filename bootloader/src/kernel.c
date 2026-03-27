@@ -23,7 +23,8 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr) {
         }        
     }
 
-    /* Keep bootloader UART state first to avoid serial regressions. */
+    /* Start every bootloader session from a clean UART console state. */
+    uart_init();
     shell_set_context(hartid, dtb_addr);
 
     uart_send_string("\nUART Bootloader ready\n");

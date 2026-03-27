@@ -19,6 +19,15 @@ static inline void uart_reg_write(uintptr_t reg, uint32_t value)
 #endif
 }
 
+static void uart_flush_hardware_rx_fifo(void)
+{
+    unsigned int limit = 256U;
+
+    while (limit-- > 0U && (uart_reg_read(UART_LSR_REG) & LSR_RX_READY) != 0U) {
+        (void)uart_reg_read(UART_RBR_REG);
+    }
+}
+
 void uart_init(void)
 {
 #ifdef QEMU
@@ -30,7 +39,13 @@ void uart_init(void)
     uart_reg_write(UART_FCR_REG, 0x07);
     uart_reg_write(UART_MCR_REG, 0x03);
 #else
-    /* Keep bootloader UART settings for board bring-up stability. */
+    /* Keep the board's existing baud configuration, but clear any stale
+     * interrupt/FIFO state so each bootloader session starts from a clean
+     * UART console after repeated kernel loads or cable re-plugs.
+     */
+    uart_reg_write(UART_IER_REG, 0x00);
+    uart_reg_write(UART_FCR_REG, 0x07);
+    uart_flush_hardware_rx_fifo();
 #endif
 }
 

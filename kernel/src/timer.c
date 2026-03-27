@@ -1,8 +1,10 @@
 #include "timer.h"
+#include "demo.h"
 #include "trap.h"
 #include "uart.h"
 #include "memory.h"
 #include "shell.h"
+#include "irq_task.h"
 
 /* Shared timer subsystem state.
  * - g_next_deadline follows the head of the pending software-timer list
@@ -16,6 +18,13 @@ uint64_t g_timer_irq_count;
 
 static struct timer_event *g_timer_head = 0;
 static int g_timer_enabled = 0;
+static struct irq_task g_timer_task = {
+    .type = IRQ_TASK_TIMER,
+    .prio = 0,
+    .state = IRQ_TASK_IDLE,
+    .next = 0,
+    .run = timer_task_run,
+};
 /* Invariants for the software-timer queue:
  * 1. g_timer_head points to a list sorted by expire, smallest first.
  * 2. The programmed hardware deadline always matches g_timer_head->expire
@@ -48,7 +57,7 @@ static inline void timer_irq_restore(uint64_t sstatus)
 /* Enable/disable only the hardware timer interrupt source. The software queue
  * can still exist while the source is masked.
  */
-static void timer_disable_source(void)
+void timer_source_mask(void)
 {
     uint64_t sie;
 
@@ -57,7 +66,7 @@ static void timer_disable_source(void)
     asm volatile("csrw sie, %0" : : "r"(sie));
 }
 
-static void timer_enable_source(void)
+void timer_source_unmask(void)
 {
     uint64_t sie;
     uint64_t sstatus;
@@ -135,7 +144,7 @@ void timer_init(void)
     timer_reprogram_locked();
     timer_irq_restore(sstatus);
 
-    timer_enable_source();
+    timer_source_unmask();
 
     uart_send_string("[timer] subsystem armed\n");
     uart_send_string("[timer] pending events=");
@@ -209,13 +218,27 @@ int add_timer(timer_callback_t callback, void *arg, uint64_t duration_ticks)
     return 0;
 }
 
-void timer_irq_isr(void)
+void timer_irq_top(void)
+{
+    demo_trace_record(DEMO_TRACE_TIMER_TOP, timer_pending_count());
+    timer_source_mask();
+
+    if (g_timer_task.state == IRQ_TASK_IDLE) {
+        (void)irq_task_enqueue(&g_timer_task);
+    }
+}
+
+int timer_task_run(struct irq_task *task)
 {
     uint64_t now;
     int fired_any = 0;
 
+    (void)task;
+    demo_trace_record(DEMO_TRACE_TIMER_BOTTOM, timer_pending_count());
+
     if (g_timebase_freq == 0) {
-        return;
+        timer_source_unmask();
+        return 0;
     }
 
     now = timer_read();
@@ -253,19 +276,29 @@ void timer_irq_isr(void)
      * it here instead of inside the callback avoids printing ">" before the
      * allocator free trace emitted by kfree(event).
      */
-    if (fired_any != 0) {
+    if (fired_any != 0 && !demo_nested_active()) {
         shell_redraw_prompt_delayed();
     }
+
+    timer_source_unmask();
+    return 0;
+}
+
+void timer_irq_isr(void)
+{
+    timer_irq_top();
 }
 
 void timer_stop(void)
 {
     uint64_t sstatus;
 
-    timer_disable_source();
+    timer_source_mask();
 
     sstatus = timer_irq_save();
     g_timer_enabled = 0;
+    g_timer_task.state = IRQ_TASK_IDLE;
+    g_timer_task.next = 0;
     /* Stop means "drop the whole pending queue" in this first version. */
     while (g_timer_head != 0) {
         struct timer_event *event = g_timer_head;

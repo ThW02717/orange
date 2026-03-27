@@ -128,9 +128,15 @@ trap_entry:
     call user_has_exited
     bnez a0, trap_exit_stop
 
-    /* Normal trap path: restore the saved trapframe and return to the
-     * interrupted user context through sret.
+    /* Normal trap path:
+     * 1. trap_dispatch() has already finished the short top half.
+     * 2. Run deferred bottom-half work before trap_return -> sret.
+     * 3. Bottom halves may be preempted because the runner re-enables SIE.
+     * 4. Any interrupt that arrives during a bottom half only performs its
+     *    own top half and queues work; bottom-half scheduling still returns
+     *    here and is chosen by software priority rank.
      */
+    call irq_task_run_before_return
     mv a0, sp
     call trap_return
 

@@ -2,6 +2,7 @@
 #define UART_H
 
 #include <stdint.h>
+#include "irq_task.h"
 
 /* UART register layout:
  * - QEMU exposes a 16550-style byte-spaced map.
@@ -85,7 +86,16 @@ void uart_dec(unsigned long value);
 
 /* Bring up the UART0 -> PLIC -> S-mode external-interrupt path. */
 void uart_irq_init(void);
+void uart_irq_top(void);
+int uart_rx_task_run(struct irq_task *task);
+int uart_tx_task_run(struct irq_task *task);
+void uart_rx_mask(void);
+void uart_rx_unmask(void);
+void uart_tx_mask(void);
+void uart_tx_unmask(void);
 void uart_irq_isr(void);
+int uart_stress_start(uint64_t count);
+uint64_t uart_stress_progress(void);
 void uart_demo_note_external_irq(uint32_t irq);
 void uart_demo_reset_stats(void);
 void uart_demo_get_stats(struct uart_demo_stats *stats);

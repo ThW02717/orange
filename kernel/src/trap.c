@@ -88,7 +88,7 @@ void trap_dispatch(struct trapframe *tf)
 
     if (trap_is_interrupt(tf->scause)) {
         if (trap_scause_code(tf->scause) == SCAUSE_S_TIMER_INT) {
-            timer_irq_isr();
+            timer_irq_top();
             return;
         }
 
@@ -98,7 +98,7 @@ void trap_dispatch(struct trapframe *tf)
             irq = plic_claim();
             if (irq == uart_irq_id()) {
                 uart_demo_note_external_irq(irq);
-                uart_irq_isr();
+                uart_irq_top();
             }
             if (irq != 0U) {
                 plic_complete(irq);

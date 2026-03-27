@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "sbi.h"
+#include "irq_task.h"
 
 /* Software timers execute deferred work by remembering which callback should
  * run later plus one opaque argument passed back to that callback.
@@ -48,6 +49,10 @@ struct sbiret timer_program_abs(uint64_t deadline);
 struct sbiret timer_program_rel(uint64_t delta_ticks);
 
 void timer_init(void);
+void timer_irq_top(void);
+int timer_task_run(struct irq_task *task);
+void timer_source_mask(void);
+void timer_source_unmask(void);
 void timer_irq_isr(void);
 void timer_stop(void);
 /* Queue one one-shot software timer relative to "now".

@@ -7,6 +7,7 @@
 #include "memory.h"
 #include "timer.h"
 #include "trap.h"
+#include "irq_task.h"
 
 /* Bootstrap-core-only kernel entry. Secondary harts are started after the
  * primary hart initializes memory, shell context, and other global state.
@@ -187,6 +188,8 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
     timer_probe_state();
     timer_probe_readout();
     timer_probe_sbi_support();
+
+    irq_task_backend_init();
 
     /* The multiplexed timer subsystem no longer depends on a fixed periodic
      * heartbeat, so it is safe to arm the timer path during boot. The single
