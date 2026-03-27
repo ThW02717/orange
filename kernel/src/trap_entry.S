@@ -117,11 +117,11 @@ trap_entry:
     csrr t0, stval
     sd t0, TF_STVAL(sp)
 
-    /* Hand the completed trapframe to the C dispatcher. */
+    /* Hand the completed trapframe to the C-side trap dispatcher. */
     mv a0, sp
-    call do_trap
+    call trap_dispatch
 
-    /* do_trap() may classify the trap as SYS_exit and mark the current
+    /* trap_dispatch() may classify the trap as SYS_exit and mark the current
      * user context as finished. In that case we must not restore the user
      * registers and execute another sret back to U-mode.
      */

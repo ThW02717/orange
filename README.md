@@ -110,7 +110,7 @@ So the design is:
 
 The kernel uses one common supervisor trap entry:
 
-- `stvec -> trap_entry -> do_trap()`
+- `stvec -> trap_entry -> trap_dispatch()`
 
 `trap_entry.S` is responsible for:
 
@@ -147,7 +147,7 @@ There are two user programs used to validate the user trap flow:
 
 1. U-mode executes `ecall`
 2. CPU traps to S-mode
-3. `do_trap()` classifies it as a user `ecall`
+3. `trap_dispatch()` classifies it as a user `ecall`
 4. the kernel prints `scause`, `sepc`, and `stval`
 5. `SYS_test` advances `sepc` and returns to U-mode through `trap_return -> sret`
 6. `SYS_exit` marks the user program as finished and returns to the shell instead of resuming U-mode
@@ -174,9 +174,9 @@ The receive path is:
 1. a byte arrives at UART0
 2. UART raises its interrupt line
 3. PLIC delivers a supervisor external interrupt
-4. `do_trap()` enters the UART external-interrupt path
+4. `trap_dispatch()` enters the UART external-interrupt path
 5. `plic_claim()` identifies the UART IRQ
-6. `uart_handle_irq()` drains hardware RX into the RX ring buffer
+6. `uart_irq_isr()` drains hardware RX into the RX ring buffer
 7. the shell later consumes bytes from the RX ring buffer
 8. `plic_complete()` finishes the interrupt
 
@@ -185,7 +185,7 @@ The transmit path is:
 1. shell output queues bytes into the TX ring buffer
 2. UART TX interrupts are enabled
 3. when the UART can accept more data, an external interrupt arrives
-4. `uart_handle_irq()` drains queued bytes into `THR`
+4. `uart_irq_isr()` drains queued bytes into `THR`
 5. TX interrupts are disabled again when the TX ring buffer becomes empty
 
 The compact end-to-end check for this subsystem is:
@@ -209,8 +209,8 @@ The path is:
 2. `add_timer(...)` allocates a `timer_event`, computes its absolute `expire`, and inserts it into the sorted pending list
 3. the hardware timer is programmed to the earliest pending deadline
 4. when that deadline arrives, the CPU takes a supervisor timer interrupt
-5. `do_trap()` dispatches to `timer_handle_interrupt()`
-6. `timer_handle_interrupt()` pops every expired event, runs its callback, frees the node, and then reprograms the next deadline
+5. `trap_dispatch()` dispatches to `timer_irq_isr()`
+6. `timer_irq_isr()` pops every expired event, runs its callback, frees the node, and then reprograms the next deadline
 
 The important invariant is:
 

@@ -145,7 +145,7 @@ extern void trap_entry(void);
 extern void trap_return(struct trapframe *tf);
 
 void trap_init(void);
-void do_trap(struct trapframe *tf);
+void trap_dispatch(struct trapframe *tf);
 void handle_user_ecall(struct trapframe *tf);
 void handle_user_fault(struct trapframe *tf);
 

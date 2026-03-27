@@ -5,9 +5,9 @@
 #include "uart.h"
 #include "user.h"
 
-/* C-side trap dispatch for the minimal user-mode path.
- * Assembly is responsible for saving/restoring CPU state. This file decides
- * whether the trap is an ecall, a user fault, or an unimplemented interrupt.
+/* C-side trap dispatcher for the minimal user-mode path.
+ * Assembly is responsible for saving/restoring CPU state. This file only
+ * classifies the trap and dispatches to the appropriate handler or ISR.
  */
 
 static void trap_print_tf(const struct trapframe *tf)
@@ -79,7 +79,7 @@ void handle_user_fault(struct trapframe *tf)
     user_mark_exit();
 }
 
-void do_trap(struct trapframe *tf)
+void trap_dispatch(struct trapframe *tf)
 {
     if (tf == 0) {
         uart_send_string("[trap] null trapframe\n");
@@ -88,7 +88,7 @@ void do_trap(struct trapframe *tf)
 
     if (trap_is_interrupt(tf->scause)) {
         if (trap_scause_code(tf->scause) == SCAUSE_S_TIMER_INT) {
-            timer_handle_interrupt();
+            timer_irq_isr();
             return;
         }
 
@@ -98,7 +98,7 @@ void do_trap(struct trapframe *tf)
             irq = plic_claim();
             if (irq == uart_irq_id()) {
                 uart_demo_note_external_irq(irq);
-                uart_handle_irq();
+                uart_irq_isr();
             }
             if (irq != 0U) {
                 plic_complete(irq);

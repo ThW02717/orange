@@ -85,7 +85,7 @@ void uart_dec(unsigned long value);
 
 /* Bring up the UART0 -> PLIC -> S-mode external-interrupt path. */
 void uart_irq_init(void);
-void uart_handle_irq(void);
+void uart_irq_isr(void);
 void uart_demo_note_external_irq(uint32_t irq);
 void uart_demo_reset_stats(void);
 void uart_demo_get_stats(struct uart_demo_stats *stats);

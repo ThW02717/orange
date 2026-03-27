@@ -48,7 +48,7 @@ struct sbiret timer_program_abs(uint64_t deadline);
 struct sbiret timer_program_rel(uint64_t delta_ticks);
 
 void timer_init(void);
-void timer_handle_interrupt(void);
+void timer_irq_isr(void);
 void timer_stop(void);
 /* Queue one one-shot software timer relative to "now".
  * The subsystem stores absolute expire times internally and keeps the pending

@@ -394,7 +394,7 @@ void uart_send_dec(unsigned long value)
     }
 }
 
-void uart_handle_irq(void)
+void uart_irq_isr(void)
 {
     /* RX side: drain every received byte that hardware already has buffered
      * and hand it to the software RX queue for the shell to consume later.

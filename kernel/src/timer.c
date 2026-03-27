@@ -209,7 +209,7 @@ int add_timer(timer_callback_t callback, void *arg, uint64_t duration_ticks)
     return 0;
 }
 
-void timer_handle_interrupt(void)
+void timer_irq_isr(void)
 {
     uint64_t now;
     int fired_any = 0;
@@ -222,7 +222,8 @@ void timer_handle_interrupt(void)
     timer_sync_uptime(now);
     g_timer_irq_count++;
 
-    /* Consume every event that is already due at this interrupt edge. This
+    /* Timer ISR body: consume every event that is already due at this
+     * interrupt edge. This
      * keeps the queue invariant simple: once the loop exits, either the list
      * is empty or the new head has expire > now.
      */
