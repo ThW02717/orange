@@ -1,6 +1,6 @@
 
 sudo screen /dev/ttyUSB0 115200
-
+sudo minicom -D /dev/ttyUSB0 -b 115200
 
 
 sudo python3 bootloader/tools/uart_load.py /dev/ttyUSB0 kernel/kernel.bin --initrd kernel/initramfs.cpio --load-cmd never

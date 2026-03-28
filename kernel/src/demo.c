@@ -1,11 +1,18 @@
 #include <stdint.h>
 #include "demo.h"
 #include "memory_test.h"
+#include "thread.h"
 #include "timer.h"
 #include "uart.h"
 
 #define DEMO_TRACE_CAPACITY 128U
 
+/* =========================
+ * Demo Trace Support
+ *
+ * Records recent top-half / bottom-half events so nested-interrupt behavior
+ * can be checked without relying only on UART output interleaving.
+ * ========================= */
 struct demo_trace_event {
     uint64_t now;
     uint32_t aux;
@@ -16,6 +23,11 @@ static struct demo_trace_event g_demo_trace[DEMO_TRACE_CAPACITY];
 static unsigned int g_demo_trace_head = 0;
 static unsigned int g_demo_trace_count = 0;
 static int g_demo_nested_active = 0;
+
+struct demo_thread_arg {
+    char tag;
+    unsigned int rounds;
+};
 
 static uint64_t demo_trace_irq_save(void)
 {
@@ -110,7 +122,9 @@ static void split_first_arg_local(char *line, char **cmd, char **arg)
 void demo_print_usage(void)
 {
     uart_send_string("demo usage:\n");
+    uart_send_string("  demo foo         - create threads with thread_create(foo, ...)\n");
     uart_send_string("  demo nested      - print the recommended manual nested-interrupt test flow\n");
+    uart_send_string("  demo thread      - run a cooperative RR kernel-thread demo and enter idle\n");
     uart_send_string("  demo uart        - run the one-shot interrupt-driven UART demo\n");
     uart_send_string("  demo stress [n]  - queue UART TX markers for interleave testing\n");
     uart_send_string("  demo mem <name>  - run allocator test: basic|boundary|slab|multislab|reclaim|large|buddy|invalid|stress|all\n");
@@ -189,6 +203,13 @@ int demo_nested_active(void)
     return g_demo_nested_active;
 }
 
+/* =========================
+ * Nested Interrupt Demo
+ *
+ * This does not run the full test automatically. It prints the recommended
+ * manual sequence so the user can combine addtimer + uartstress and then
+ * check whether timer markers appear between UART markers.
+ * ========================= */
 static int demo_nested(void)
 {
     demo_trace_reset();
@@ -207,6 +228,150 @@ static int demo_mem(const char *name)
     return memory_run_kmtest(name);
 }
 
+/* =========================
+ * demo foo
+ *
+ * Minimal thread-create example that mirrors the spec most directly:
+ * thread_create(foo, ...). The goal is only to show that a plain function
+ * name can be passed as the thread entry.
+ * ========================= */
+static void foo(void *arg)
+{
+    unsigned int id = *(unsigned int *)arg;
+    unsigned int i;
+
+    for (i = 0; i < 5U; i++) {
+        uart_send_string("[foo ");
+        uart_send_dec(id);
+        uart_send_string(":");
+        uart_send_dec(i);
+        uart_send_string("]");
+        if (id == 3U) {
+            uart_send_string("\n");
+        } else {
+            uart_send_string(" ");
+        }
+        thread_yield();
+    }
+
+    uart_send_string("[foo ");
+    uart_send_dec(id);
+    uart_send_string(":done]\n");
+}
+
+/* Bootstrap current shell flow as idle, create three foo workers, then hand
+ * control to the cooperative scheduler by entering the idle loop. */
+static int demo_foo(void)
+{
+    unsigned int ids[3];
+    int tid;
+
+    ids[0] = 1U;
+    ids[1] = 2U;
+    ids[2] = 3U;
+
+    uart_send_string("[foo] bootstrap shell -> idle\n");
+    thread_system_bootstrap_init();
+
+    tid = thread_create(foo, &ids[0], 0);
+    if (tid < 0) {
+        uart_send_string("demo foo: failed to create foo #1\n");
+        return -1;
+    }
+    tid = thread_create(foo, &ids[1], 0);
+    if (tid < 0) {
+        uart_send_string("demo foo: failed to create foo #2\n");
+        return -1;
+    }
+    tid = thread_create(foo, &ids[2], 0);
+    if (tid < 0) {
+        uart_send_string("demo foo: failed to create foo #3\n");
+        return -1;
+    }
+
+    uart_send_string("[foo] using thread_create(foo, ...)\n");
+    uart_send_string("[foo] expect [foo 1:0] [foo 2:0] [foo 3:0] ...\n");
+    thread_enter_idle();
+    return -1;
+}
+
+/* =========================
+ * demo thread
+ *
+ * Main cooperative RR scheduler demo. Three worker threads share the same
+ * entry function but receive different arguments so the output shows
+ * interleaving like A/B/C -> A/B/C -> ...
+ * ========================= */
+static void demo_thread_worker(void *arg)
+{
+    struct demo_thread_arg *cfg = (struct demo_thread_arg *)arg;
+    unsigned int i;
+
+    for (i = 0; i < cfg->rounds; i++) {
+        uart_send_string("[");
+        uart_send(cfg->tag);
+        uart_send_string(":");
+        uart_send_dec(i);
+        uart_send_string("]");
+        if (cfg->tag == 'C') {
+            uart_send_string("\n");
+        } else {
+            uart_send_string(" ");
+        }
+        thread_yield();
+    }
+
+    uart_send_string("[");
+    uart_send(cfg->tag);
+    uart_send_string(":done]\n");
+}
+
+/* Bootstrap current shell flow as idle, create three tagged workers, then
+ * enter the idle loop permanently. This demo intentionally does not return
+ * to the shell. */
+static int demo_thread(void)
+{
+    struct demo_thread_arg args[3];
+    int tid;
+
+    args[0].tag = 'A';
+    args[0].rounds = 5U;
+    args[1].tag = 'B';
+    args[1].rounds = 5U;
+    args[2].tag = 'C';
+    args[2].rounds = 5U;
+
+    uart_send_string("[thread] bootstrap shell -> idle\n");
+    thread_system_bootstrap_init();
+
+    tid = thread_create(demo_thread_worker, &args[0], 0);
+    if (tid < 0) {
+        uart_send_string("thread demo: failed to create worker A\n");
+        return -1;
+    }
+    tid = thread_create(demo_thread_worker, &args[1], 0);
+    if (tid < 0) {
+        uart_send_string("thread demo: failed to create worker B\n");
+        return -1;
+    }
+    tid = thread_create(demo_thread_worker, &args[2], 0);
+    if (tid < 0) {
+        uart_send_string("thread demo: failed to create worker C\n");
+        return -1;
+    }
+
+    uart_send_string("[thread] RR: [A:0] [B:0] [C:0] ...\n");
+    uart_send_string("[thread] enter idle\n");
+    thread_enter_idle();
+    return -1;
+}
+
+/* =========================
+ * UART Interrupt Demo
+ *
+ * Verifies the one-shot interrupt-driven UART RX/TX path and prints the
+ * counters used to judge whether polling was avoided.
+ * ========================= */
 static int demo_uart(void)
 {
     struct uart_demo_stats stats;
@@ -279,6 +444,11 @@ static int demo_stress(const char *arg)
     return 0;
 }
 
+/* =========================
+ * Demo Command Dispatch
+ *
+ * Parses `demo <name> [arg]` and routes to the corresponding test entry.
+ * ========================= */
 int demo_run(const char *name)
 {
     char buf[64];
@@ -301,8 +471,14 @@ int demo_run(const char *name)
     if (streq_local(cmd, "nested")) {
         return demo_nested();
     }
+    if (streq_local(cmd, "foo")) {
+        return demo_foo();
+    }
     if (streq_local(cmd, "uart")) {
         return demo_uart();
+    }
+    if (streq_local(cmd, "thread")) {
+        return demo_thread();
     }
     if (streq_local(cmd, "stress")) {
         return demo_stress(arg);

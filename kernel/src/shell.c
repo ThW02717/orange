@@ -776,7 +776,7 @@ void processCommand(shell_t* shell) {
         uart_send_string("  cores  - Show HSM status for core 0..7\n");
         uart_send_string("  ls     - List initrd files\n");
         uart_send_string("  cat    - Show initrd file content\n");
-        uart_send_string("  demo <name> - Run demos/tests (uart|stress|mem|nested|trace)\n");
+        uart_send_string("  demo <name> - Run demos/tests (thread|uart|stress|mem|nested|trace)\n");
         uart_send_string("  mem    - Show allocator, slab, and buddy state\n");
         uart_send_string("  timer  - Show timer subsystem state and pending queue\n");
         uart_send_string("  addtimer <sec> - Schedule a one-shot software timer (supports 1.5)\n");

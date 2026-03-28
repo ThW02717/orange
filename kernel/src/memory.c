@@ -533,16 +533,16 @@ void memory_reserve(uint64_t start, uint64_t size) {
     g_reserve_count++;
     // logging
     log_prefix();
-    uart_send_string("[Reserve] Reserve address [");
+    uart_send_string("[Reserve] [");
     log_hex_u64(rs);
     uart_send_string(", ");
     log_hex_u64(re);
-    uart_send_string(").");
+    uart_send_string(")");
     {
         uint64_t start_idx;
         uint64_t end_idx;
         if (pa_to_index(rs, &start_idx, 0) == 0 && pa_to_index(re - PAGE_SIZE, &end_idx, 0) == 0) {
-            uart_send_string(" Range of pages: [");
+            uart_send_string(" pages [");
             uart_send_dec((unsigned long)start_idx);
             uart_send_string(", ");
             uart_send_dec((unsigned long)(end_idx + 1ULL));
@@ -1247,34 +1247,6 @@ void *kmalloc(unsigned long size) {
             return 0;
         }
         page_kind_set(base_idx, PAGE_KIND_LARGE);
-
-        log_prefix();
-        uart_send_string("[Page] Allocate ");
-        log_hex_u64((uint64_t)(uintptr_t)base);
-        uart_send_string(" at order ");
-        {
-            unsigned int order = 0;
-            while ((1ULL << order) < (uint64_t)pages) {
-                order++;
-            }
-            uart_send_dec(order);
-            uart_send_string(", page ");
-            uart_send_dec((unsigned long)base_idx);
-            uart_send_string(". Next address at order ");
-            uart_send_dec(order);
-            uart_send_string(": ");
-            if (base_idx + (1ULL << order) < g_total_pages) {
-                uint64_t next_pa = 0;
-                if (index_to_pa(base_idx + (1ULL << order), &next_pa) == 0) {
-                    log_hex_u64(next_pa);
-                } else {
-                    uart_send_string("none");
-                }
-            } else {
-                uart_send_string("none");
-            }
-        }
-        uart_send_string("\n");
         return base;
     }
 }

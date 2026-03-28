@@ -259,6 +259,67 @@ The main data structures are:
 
 The main tradeoff is that responsiveness improves, but console output becomes harder to keep clean because shell prompts, UART stress output, timer markers, and debug logs all share the same serial line.
 
+## Thread and User Process
+
+This codebase now has two different execution models above the trap layer:
+
+- cooperative kernel threads for the Basic Exercise 1 scheduler work
+- explicit U-mode entry for loading and running a user binary through `runu`
+
+They are intentionally separate in the current design. Kernel threads do not reuse the user-mode trap path, and `runu` is not yet integrated into the scheduler as a schedulable process.
+
+### Kernel Threads
+
+The kernel-thread work is intentionally small in scope:
+
+- single hart
+- cooperative scheduling
+- round-robin policy
+- one idle thread
+- zombie recycling by the idle thread
+
+The key data structures are:
+
+- `struct thread` for thread metadata, saved context, and kernel-stack ownership
+- `struct thread_context` for `ra`, `sp`, and `s0` through `s11`
+- `struct runqueue` for the runnable queue, current thread, and idle thread
+- a zombie list for terminated threads waiting to be reclaimed
+
+The core path is:
+
+1. `thread_create(entry, arg, ...)` allocates a thread object and a kernel stack
+2. the initial saved context is seeded with `sp = kstack_top` and `ra = thread_bootstrap`
+3. `schedule()` pops the next runnable thread from the FIFO run queue
+4. `switch_to(prev, next)` saves the old context and restores the new one
+5. `thread_bootstrap()` calls `entry(arg)` the first time a fresh thread runs
+6. `thread_exit()` marks the thread as zombie and hands control back to the scheduler
+7. the idle thread reclaims zombie stacks and thread objects
+
+The thread demo is exposed through:
+
+- `demo thread`: tagged worker threads (`A/B/C`) to show visible round-robin interleaving
+- `demo foo`: a minimal example that directly uses `thread_create(foo, ...)` to show that a function name is passed as the thread entry
+
+The main tradeoff is that this scheduler is cooperative rather than timer-preemptive. That keeps it decoupled from the existing trap/deferred-interrupt backend and makes the context-switching path easier to validate first.
+
+### User Program Path
+
+User execution is still exposed through `runu <name>` and remains separate from the kernel-thread scheduler.
+
+The current user path is:
+
+1. load `bin/<name>.bin` from the initramfs
+2. copy it to the fixed user-code window at `USER_CODE_BASE`
+3. execute `fence.i` so the CPU does not reuse stale instructions
+4. prepare `sepc` and `sstatus`
+5. return to U-mode with `sret`
+
+So at this stage:
+
+- kernel threads are a kernel-only scheduling exercise
+- `runu` is an explicit user-mode launch path
+- there is not yet a unified process model combining the two
+
 ## Shell
 
 The shell is intentionally small. It is not a process manager or userspace environment; it is a board-side debug interface for the kernel subsystems above.
@@ -271,7 +332,7 @@ The shell is intentionally small. It is not a process manager or userspace envir
 - `cores`: show secondary-hart bring-up state
 - `ls`: list files in the initramfs
 - `cat <file>`: print a file from the initramfs
-- `demo <name>`: run grouped demos and tests such as `demo uart`, `demo stress`, `demo mem <name>`, `demo nested`, and `demo trace`
+- `demo <name>`: run grouped demos and tests such as `demo foo`, `demo thread`, `demo uart`, `demo stress`, `demo mem <name>`, `demo nested`, and `demo trace`
 - `mem`: print allocator, slab, and buddy state
 - `timer`: print timer state and the pending software-timer queue
 - `addtimer <sec>`: queue a one-shot software timer
