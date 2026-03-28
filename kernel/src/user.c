@@ -1,136 +1,117 @@
 #include <stdint.h>
-#include "shell.h"
+#include "thread.h"
 #include "trap.h"
 #include "uart.h"
 #include "user.h"
 
-/* Minimal user-mode launch state for Basic Exercise 1. */
+/* Current-aware user-mode entry for the BE2 transition.
+ *
+ * The old Basic Exercise 1 path used one global user stack and one global
+ * "user exited" flag. The new path starts from the currently scheduled task
+ * instead: each schedulable user task owns its own kernel stack and its own
+ * trapframe location on that stack.
+ */
 
-/* Single kernel stack used when the current user context traps back into S-mode. */
-static uint8_t g_user_kstack[USER_KSTACK_SIZE] __attribute__((aligned(16)));
-static int g_user_exited = 0;
-static int32_t g_shell_resume_pid = 1;
-
-/* Minimal state needed to enter U-mode and recover on the next trap. */
-struct user_state {
-    uintptr_t user_entry;
-    uintptr_t user_sp;
-    uintptr_t kstack_top;
-};
-
-static struct user_state g_user_state;
-
-/* Prepare the initial user entry, user stack, and kernel trap stack. */
-static void user_prepare_state(void)
+void user_reset_trapframe(struct thread *task)
 {
-    g_user_state.user_entry = USER_CODE_BASE;
-    g_user_state.user_sp = USER_STACK_TOP;
-    g_user_state.kstack_top = (uintptr_t)&g_user_kstack[USER_KSTACK_SIZE];
-}
-
-/* Build the initial trapframe image that trap_return will restore into U-mode. */
-static void user_prepare_trapframe(struct trapframe *tf, uint64_t sstatus)
-{
+    uint64_t sstatus;
     unsigned int i;
-    uint64_t *raw = (uint64_t *)tf;
+    uint64_t *raw;
 
-    for (i = 0; i < (sizeof(*tf) / sizeof(uint64_t)); i++) {
+    if (task == 0 || task->tf == 0) {
+        return;
+    }
+
+    raw = (uint64_t *)task->tf;
+    for (i = 0; i < (sizeof(*task->tf) / sizeof(uint64_t)); i++) {
         raw[i] = 0;
     }
 
-    tf->sp = g_user_state.user_sp;
-    tf->sepc = g_user_state.user_entry;
-    tf->sstatus = sstatus;
+    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
+    sstatus &= ~SSTATUS_SPP;
+    sstatus |= SSTATUS_SPIE;
+
+    task->tf->sp = task->user_stack_top;
+    task->tf->tp = (uint64_t)(uintptr_t)task;
+    task->tf->sepc = task->user_entry;
+    task->tf->sstatus = sstatus;
 }
 
-void user_mark_exit(void) {
-    g_user_exited = 1;
+static void user_enter_current_task(void)
+{
+    struct thread *task;
+
+    task = thread_current();
+    if (task == 0 || task->kind != THREAD_USER || task->tf == 0) {
+        uart_send_string("[user] no current user task\n");
+        for (;;) {
+            asm volatile("wfi");
+        }
+    }
+
+    trap_init();
+    trap_return(task->tf);
+
+    for (;;) {
+        asm volatile("wfi");
+    }
 }
 
-int user_has_exited(void) {
-    return g_user_exited;
-}
-
-/* Resume the interactive shell after SYS_exit or a fatal user fault.
- * This kernel does not have a scheduler yet, so the simplest safe handoff is
- * to re-enter the shell loop directly on the current kernel stack.
+/* Legacy name kept temporarily while the BE2 path is migrating away from the
+ * old singleton user state. It now enters the current user task rather than a
+ * global one-shot user context.
  */
-void user_return_to_shell(void)
+void enter_user_mode(void)
+{
+    user_enter_current_task();
+}
+
+/* New schedulable user task entry used by thread_create_user(). */
+void user_task_entry(void *arg)
+{
+    (void)arg;
+    user_enter_current_task();
+}
+
+void user_mark_exit(void)
+{
+    struct thread *task;
+
+    task = thread_current();
+    if (task == 0 || task->kind != THREAD_USER) {
+        return;
+    }
+
+    thread_mark_current_zombie(0);
+}
+
+int user_has_exited(void)
+{
+    struct thread *task;
+
+    task = thread_current();
+    if (task == 0 || task->kind != THREAD_USER) {
+        return 0;
+    }
+    return task->state == THREAD_ZOMBIE;
+}
+
+/* User exit/fault no longer jumps directly back into the shell loop. Instead,
+ * mark the current task dead and let the scheduler switch back to idle. That
+ * returns control to the original shell-side caller naturally once the user
+ * task is gone.
+ */
+void user_schedule_after_exit(void)
 {
     uint64_t sstatus;
 
-    /* Once control is back in the shell, later S-mode interrupts must follow
-     * the normal trap-return path again. Leave the "user exited" state as a
-     * one-shot handoff signal instead of a permanent sticky flag.
-     */
-    g_user_exited = 0;
-
-    /* trap_exit_stop reaches the shell without going through trap_return, so
-     * the current S-mode interrupt-enable bit stays cleared unless we restore
-     * it here. The shell relies on UART external interrupts to fill the RX/TX
-     * ring buffers, so re-enable S-mode interrupts before re-entering the
-     * REPL.
-     */
     asm volatile("csrr %0, sstatus" : "=r"(sstatus));
     sstatus |= SSTATUS_SIE;
     asm volatile("csrw sstatus, %0" : : "r"(sstatus));
 
-    while (1) {
-        runAShell(g_shell_resume_pid++);
-    }
-}
+    schedule();
 
-/* Prepare the initial user-mode context and transfer control through trap_return. */
-void enter_user_mode(void)
-{
-    uint64_t sstatus;
-    struct trapframe *tf;
-
-    g_user_exited = 0;
-
-    /* Prepare the minimal execution state for the next user-mode entry. */
-    user_prepare_state();
-
-    uart_send_string("[user] prepare U-mode entry=");
-    uart_send_hex((unsigned long)g_user_state.user_entry);
-    uart_send_string(" sp=");
-    uart_send_hex((unsigned long)g_user_state.user_sp);
-    uart_send_string(" kstack=");
-    uart_send_hex((unsigned long)g_user_state.kstack_top);
-    uart_send_string("\n");
-
-    /* Register the supervisor trap entry before dropping privilege. */
-    trap_init();
-
-    /* sscratch holds the kernel stack top used by trap_entry. */
-    asm volatile("csrw sscratch, %0" : : "r"(g_user_state.kstack_top));
-
-    /* sepc is the PC that sret will jump to when entering U-mode. */
-    asm volatile("csrw sepc, %0" : : "r"(g_user_state.user_entry));
-
-    /* Program the return state for a later sret:
-     * clear SPP so sret returns to U-mode, and set SPIE so the restored
-     * interrupt-enable state matches the expected supervisor return path.
-     */
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    sstatus &= ~SSTATUS_SPP;
-    sstatus |= SSTATUS_SPIE;
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
-
-    /* Place the initial trapframe at the top of the dedicated user kernel stack
-     * so trap_return will re-arm sscratch to the same stack for the next trap.
-     */
-    tf = (struct trapframe *)(uintptr_t)(g_user_state.kstack_top - TRAPFRAME_ALLOC_SIZE);
-    user_prepare_trapframe(tf, sstatus);
-
-    uart_send_string("[user] sret -> U-mode\n");
-
-    /* trap_return restores this synthetic trapframe and performs the first
-     * sret into the loaded user program.
-     */
-    trap_return(tf);
-
-    while (1) {
+    for (;;) {
         asm volatile("wfi");
     }
 }

@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+struct trapframe;
+
 /* First cooperative-thread version:
  * - single hart only
  * - kernel threads only
@@ -11,9 +13,15 @@
  * - no user process integration
  */
 
+enum thread_kind {
+    THREAD_KERNEL = 0,
+    THREAD_USER,
+};
+
 enum thread_state {
     THREAD_RUNNING = 0,
     THREAD_RUNNABLE,
+    THREAD_BLOCKED,
     THREAD_ZOMBIE,
 };
 
@@ -48,7 +56,8 @@ struct thread_context {
  */
 struct thread {
     struct thread_context ctx; /* thread* can be used as ctx base */
-    int32_t tid;
+    int32_t pid;
+    enum thread_kind kind;
     enum thread_state state;
 
     void (*entry)(void *arg);
@@ -59,22 +68,42 @@ struct thread {
 
     struct thread *next;   /* run queue linkage */
     struct thread *znext;  /* zombie list linkage */
+    struct thread *all_next; /* global task list linkage */
 
     int is_idle;
+
+    /* BE2 foundation: optional user-mode state carried by the same
+     * schedulable entity so kernel threads and user processes can share
+     * the same run queue / scheduler machinery.
+     */
+    uintptr_t user_entry;
+    uintptr_t user_stack_base;
+    uintptr_t user_stack_top;
+    int exit_status;
+    struct trapframe *tf;
 };
 
 /* Minimal API for the first cooperative-only scheduler milestone. */
 void thread_init(void);
 void thread_system_bootstrap_init(void);
+int thread_system_active(void);
 struct thread *thread_current(void);
+struct thread *thread_find_by_pid(int32_t pid);
 int thread_create(void (*entry)(void *arg), void *arg, int is_idle);
+int thread_create_user(uintptr_t user_entry, uintptr_t user_stack_base, uintptr_t user_stack_top);
 /* Save the current thread context into `prev`, restore `next`, then set
  * tp to the new current-thread pointer before returning into `next`.
  */
 void switch_to(struct thread *prev, struct thread *next);
 void thread_enter_idle(void);
+void thread_run_until_idle(void);
 void thread_yield(void);
 void thread_exit(void);
+void thread_mark_current_zombie(int exit_status);
+int thread_stop_pid(int32_t pid, int exit_status);
+int thread_has_runnable_tasks(void);
+void thread_request_resched(void);
+int thread_consume_resched_request(void);
 void schedule(void);
 
 #endif

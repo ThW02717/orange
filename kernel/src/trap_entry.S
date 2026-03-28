@@ -128,6 +128,11 @@ trap_entry:
     call user_has_exited
     bnez a0, trap_exit_stop
 
+    call thread_consume_resched_request
+    beqz a0, 1f
+    call schedule
+1:
+
     /* Normal trap path:
      * 1. trap_dispatch() has already finished the short top half.
      * 2. Run deferred bottom-half work before trap_return -> sret.
@@ -145,7 +150,7 @@ trap_entry:
  * we stay on the current kernel stack and re-enter the shell loop directly.
  */
 trap_exit_stop:
-    call user_return_to_shell
+    call user_schedule_after_exit
 1:
     wfi
     j 1b

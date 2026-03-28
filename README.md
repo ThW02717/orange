@@ -261,12 +261,24 @@ The main tradeoff is that responsiveness improves, but console output becomes ha
 
 ## Thread and User Process
 
-This codebase now has two different execution models above the trap layer:
+This codebase now has one scheduler substrate that carries both:
 
-- cooperative kernel threads for the Basic Exercise 1 scheduler work
-- explicit U-mode entry for loading and running a user binary through `runu`
+- cooperative kernel threads from the Basic Exercise 1 work
+- schedulable user processes for Basic Exercise 2
 
-They are intentionally separate in the current design. Kernel threads do not reuse the user-mode trap path, and `runu` is not yet integrated into the scheduler as a schedulable process.
+The key design decision is that the scheduler context and the trapframe are
+separate:
+
+- `struct thread_context` is the kernel-side saved context used by `switch_to()`
+- `struct trapframe` is the user-side saved context used at the U-mode/S-mode boundary
+
+So a user process is represented as:
+
+- one schedulable `struct thread`
+- one kernel stack
+- one trapframe at the top of that kernel stack
+- one private user stack
+- one user entry PC in the shared user-code window
 
 ### Kernel Threads
 
@@ -300,25 +312,85 @@ The thread demo is exposed through:
 - `demo thread`: tagged worker threads (`A/B/C`) to show visible round-robin interleaving
 - `demo foo`: a minimal example that directly uses `thread_create(foo, ...)` to show that a function name is passed as the thread entry
 
-The main tradeoff is that this scheduler is cooperative rather than timer-preemptive. That keeps it decoupled from the existing trap/deferred-interrupt backend and makes the context-switching path easier to validate first.
+The kernel-thread-only path is still cooperative. The timer-driven preemption
+work is applied to user processes first.
 
-### User Program Path
+### User Processes and Syscalls
 
-User execution is still exposed through `runu <name>` and remains separate from the kernel-thread scheduler.
+User execution is no longer a singleton one-shot path. A shell command or demo
+loads a user binary, allocates a private user stack, creates a schedulable
+user task, and lets the scheduler run it until the system naturally falls back
+to idle.
 
-The current user path is:
+The current user-process path is:
 
 1. load `bin/<name>.bin` from the initramfs
 2. copy it to the fixed user-code window at `USER_CODE_BASE`
 3. execute `fence.i` so the CPU does not reuse stale instructions
-4. prepare `sepc` and `sstatus`
-5. return to U-mode with `sret`
+4. allocate a private user stack
+5. create a `THREAD_USER` task with its own kernel stack and trapframe
+6. enqueue it on the run queue
+7. schedule it, prepare its trapframe, and return to U-mode with `sret`
 
-So at this stage:
+The system-call ABI follows the RISC-V `ecall` convention:
 
-- kernel threads are a kernel-only scheduling exercise
-- `runu` is an explicit user-mode launch path
-- there is not yet a unified process model combining the two
+- arguments in `a0`, `a1`, `a2`, ...
+- syscall number in `a7`
+- return value in `a0`
+
+The currently implemented syscall numbers are:
+
+- `0`: `getpid()`
+- `1`: `uart_read(char *buf, long count)`
+- `2`: `uart_write(const char *buf, long count)`
+- `3`: `exec(const char *path)`
+- `4`: `fork()`
+- `5`: `exit(int status)`
+- `6`: `stop(long pid)`
+
+The most important BE2 behaviors validated in this repository are:
+
+- `demo test`: smoke test for `getpid`, `uart_write`, and `exit`
+- `demo badinst`: illegal-instruction fault path and user-process termination
+- `demo fork`: `fork()` with private child user stacks, distinct `sp`, and distinct `&cnt`
+- `demo preempt`: timer-driven user preemption with two busy-loop user tasks
+
+### Fork
+
+`fork()` does not restart the child from the program entry. Instead, it copies
+the parent's execution snapshot at the syscall boundary so the child resumes
+from the instruction after the `fork()` call.
+
+The implementation currently does:
+
+1. allocate a new child task
+2. allocate a new child kernel stack and a new child user stack
+3. copy the parent's user stack into the child stack
+4. copy the parent's trapframe into the child trapframe
+5. set child `a0 = 0`
+6. return child pid to the parent
+7. remap all saved values that still point into the parent's user stack so they
+   point into the corresponding child stack locations instead
+
+That last step matters because user code may address locals through frame
+pointers such as `s0`, not only through `sp`. This repository hit that bug
+directly during debugging: `sp` differed between parent and child, but `&cnt`
+was still shared until `s0` and other stack-related saved values were remapped
+correctly.
+
+### User Preemption
+
+The timer subsystem now also provides a periodic scheduler tick in addition to
+the one-shot software-timer queue. On each timer interrupt:
+
+1. the current user task traps into S-mode
+2. the timer top half runs
+3. if other runnable tasks exist, the kernel sets a reschedule request
+4. the trap path consumes that request before returning to U-mode
+5. `schedule()` may switch to another runnable user process
+
+This is validated by `demo preempt`, where two busy-loop user tasks alternate
+without explicitly calling `yield()`.
 
 ## Shell
 
@@ -332,7 +404,18 @@ The shell is intentionally small. It is not a process manager or userspace envir
 - `cores`: show secondary-hart bring-up state
 - `ls`: list files in the initramfs
 - `cat <file>`: print a file from the initramfs
-- `demo <name>`: run grouped demos and tests such as `demo foo`, `demo thread`, `demo uart`, `demo stress`, `demo mem <name>`, `demo nested`, and `demo trace`
+- `demo <name>`: run grouped demos and tests such as:
+  - `demo foo`
+  - `demo thread`
+  - `demo test`
+  - `demo badinst`
+  - `demo fork`
+  - `demo preempt`
+  - `demo uart`
+  - `demo stress`
+  - `demo mem <name>`
+  - `demo nested`
+  - `demo trace`
 - `mem`: print allocator, slab, and buddy state
 - `timer`: print timer state and the pending software-timer queue
 - `addtimer <sec>`: queue a one-shot software timer
@@ -355,6 +438,42 @@ In this codebase, that bug showed up when:
 - the board still behaved as if the old program was running
 
 The fix is a `fence.i` after copying the new user image and before entering U-mode again.
+
+### `fork()` required stack-address relocation, not just stack copying
+
+One of the most important BE2 bugs was that copying the parent stack was not
+enough by itself. The child also inherited saved values that still pointed into
+the parent's stack image.
+
+The bug showed up as:
+
+- parent and child had different `sp`
+- but the address of a local variable such as `&cnt` was still identical
+
+The root cause was that the compiler addressed the local variable through the
+frame pointer `s0`, and the saved child state still held a parent-stack frame
+base. The fix was to remap:
+
+- trapframe register values that fell inside the parent stack range
+- copied stack words that still pointed back into the parent stack
+
+This was validated by `demo fork`, where parent, child1, and child2 now all
+show distinct `sp` and distinct `&cnt`.
+
+### User-space UART output must emit CRLF, not LF alone
+
+Another practical bug was purely about console presentation. Kernel-side
+`uart_send_string()` already converted `\n` into `\r\n`, but user-space
+`uart_write()` initially forwarded only `\n`.
+
+On a serial terminal that meant:
+
+- move to the next row
+- but keep the same column
+
+So user-process output formed a staircase drifting to the right. The fix was
+to translate user-space `\n` into `\r\n` inside the `SYS_uart_write` path as
+well.
 
 ### Serial console state can become stale after heavy UART output
 

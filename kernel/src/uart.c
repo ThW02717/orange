@@ -260,6 +260,15 @@ static int uart_tx_buf_is_empty(void)
     return ret;
 }
 
+void uart_tx_wait_idle(void)
+{
+    for (;;) {
+        if (uart_tx_buf_is_empty() && (uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) != 0U) {
+            return;
+        }
+    }
+}
+
 static int uart_tx_try_drain_one(void)
 {
     char c;
@@ -731,7 +740,6 @@ int uart_tx_task_run(struct irq_task *task)
     }
 
     uart_tx_mask();
-    memory_set_allocator_log_enabled(1);
     return 0;
 }
 
@@ -757,7 +765,6 @@ int uart_stress_start(uint64_t count)
     g_uart_stress_remaining = count;
     g_uart_timer_marker_head = 0U;
     g_uart_timer_marker_tail = 0U;
-    memory_set_allocator_log_enabled(0);
     uart_tx_fill_stress_markers(UART_IRQ_TASK_BUDGET);
     uart_irq_restore(sstatus);
 

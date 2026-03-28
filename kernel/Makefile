@@ -23,6 +23,14 @@ USER_TEST_BIN := $(USER_ROOTFS_DIR)/test.bin
 USER_BADINST_SRC := $(USER_DIR)/badinst.S
 USER_BADINST_ELF := $(USER_BUILD_DIR)/badinst.elf
 USER_BADINST_BIN := $(USER_ROOTFS_DIR)/badinst.bin
+USER_FORK_START_SRC := $(USER_DIR)/fork_start.S
+USER_FORK_SRC := $(USER_DIR)/fork.c
+USER_FORK_ELF := $(USER_BUILD_DIR)/fork.elf
+USER_FORK_BIN := $(USER_ROOTFS_DIR)/fork.bin
+USER_PREEMPT_START_SRC := $(USER_DIR)/preempt_start.S
+USER_PREEMPT_SRC := $(USER_DIR)/preempt.c
+USER_PREEMPT_ELF := $(USER_BUILD_DIR)/preempt.elf
+USER_PREEMPT_BIN := $(USER_ROOTFS_DIR)/preempt.bin
 
 C_SRCS    := $(wildcard $(SRC_DIR)/*.c)
 ASM_SRCS  := $(wildcard $(SRC_DIR)/*.S)
@@ -37,6 +45,7 @@ BOARD_CFLAGS := $(COMMON_CFLAGS) -DBOARD
 QEMU_CFLAGS  := $(COMMON_CFLAGS) -DQEMU
 BOARD_LDFLAGS := --defsym=KERNEL_LOAD_ADDR=0x20000000
 QEMU_LDFLAGS  := --defsym=KERNEL_LOAD_ADDR=0x82000000
+USER_LINK_ADDR := 0x32000000
 
 .PHONY: all qemu clean
 
@@ -76,18 +85,30 @@ kernel.bin: $(BUILD_DIR)/kernel_board.elf
 	$(OBJCOPY) -O binary -S $< $@
 
 $(USER_TEST_ELF): $(USER_TEST_SRC) | $(USER_BUILD_DIR)
-	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=0x0 -Wl,-e,_start -o $@ $<
+	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $<
 
 $(USER_TEST_BIN): $(USER_TEST_ELF) | $(USER_ROOTFS_DIR)
 	$(OBJCOPY) -O binary -S $< $@
 
 $(USER_BADINST_ELF): $(USER_BADINST_SRC) | $(USER_BUILD_DIR)
-	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=0x0 -Wl,-e,_start -o $@ $<
+	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $<
 
 $(USER_BADINST_BIN): $(USER_BADINST_ELF) | $(USER_ROOTFS_DIR)
 	$(OBJCOPY) -O binary -S $< $@
 
-$(INITRAMFS): $(ROOTFS_FILES) $(USER_TEST_BIN) $(USER_BADINST_BIN)
+$(USER_FORK_ELF): $(USER_FORK_START_SRC) $(USER_FORK_SRC) | $(USER_BUILD_DIR)
+	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_FORK_START_SRC) $(USER_FORK_SRC)
+
+$(USER_FORK_BIN): $(USER_FORK_ELF) | $(USER_ROOTFS_DIR)
+	$(OBJCOPY) -O binary -S $< $@
+
+$(USER_PREEMPT_ELF): $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC) | $(USER_BUILD_DIR)
+	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC)
+
+$(USER_PREEMPT_BIN): $(USER_PREEMPT_ELF) | $(USER_ROOTFS_DIR)
+	$(OBJCOPY) -O binary -S $< $@
+
+$(INITRAMFS): $(ROOTFS_FILES) $(USER_TEST_BIN) $(USER_BADINST_BIN) $(USER_FORK_BIN) $(USER_PREEMPT_BIN)
 	@if [ ! -d "$(ROOTFS_DIR)" ]; then \
 		echo "Missing $(ROOTFS_DIR)/ directory"; \
 		exit 1; \

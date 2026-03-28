@@ -76,6 +76,7 @@ char uart_recv(void);
 void uart_send_string(const char *str);
 void uart_send_hex(unsigned long value);
 void uart_send_dec(unsigned long value);
+void uart_tx_wait_idle(void);
 
 /* Compatibility wrappers for existing code. */
 void uart_putc(char c);

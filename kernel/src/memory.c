@@ -112,7 +112,7 @@ static uint64_t g_page_free_count = 0;
 static uint64_t g_object_alloc_count = 0;
 static uint64_t g_object_free_count = 0;
 static uint64_t g_slab_reclaim_count = 0;
-static int g_allocator_log_enabled = 1;
+static int g_allocator_log_enabled = 0;
 
 // slab allocate thing
 // kmem_cache for each class
@@ -1076,27 +1076,29 @@ void p_free(void *ptr) {
     block_mark_free(merged_idx, merged_order);
     freelist_push(merged_order, merged_idx);
 
-    log_prefix();
-    uart_send_string("[Page] Free ");
-    log_hex_u64(pa);
-    uart_send_string(" and add back to order ");
-    uart_send_dec(merged_order);
-    uart_send_string(", page ");
-    uart_send_dec((unsigned long)merged_idx);
-    uart_send_string(". Next address at order ");
-    uart_send_dec(merged_order);
-    uart_send_string(": ");
-    if (g_free_lists[merged_order] >= 0) {
-        uint64_t next_pa = 0;
-        if (index_to_pa((uint64_t)g_free_lists[merged_order], &next_pa) == 0) {
-            log_hex_u64(next_pa);
+    if (g_allocator_log_enabled) {
+        log_prefix();
+        uart_send_string("[Page] Free ");
+        log_hex_u64(pa);
+        uart_send_string(" and add back to order ");
+        uart_send_dec(merged_order);
+        uart_send_string(", page ");
+        uart_send_dec((unsigned long)merged_idx);
+        uart_send_string(". Next address at order ");
+        uart_send_dec(merged_order);
+        uart_send_string(": ");
+        if (g_free_lists[merged_order] >= 0) {
+            uint64_t next_pa = 0;
+            if (index_to_pa((uint64_t)g_free_lists[merged_order], &next_pa) == 0) {
+                log_hex_u64(next_pa);
+            } else {
+                uart_send_string("none");
+            }
         } else {
             uart_send_string("none");
         }
-    } else {
-        uart_send_string("none");
+        uart_send_string("\n");
     }
-    uart_send_string("\n");
     g_page_free_count++;
 }
 
@@ -1603,6 +1605,8 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
         return;
     }
 
+    g_allocator_log_enabled = 1;
+
     g_regions_direct_map = 0;
     g_direct_map_base = 0;
     g_direct_map_first_idx = 0;
@@ -1718,4 +1722,10 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
     uart_send_string(" pages=");
     uart_send_dec((unsigned long)g_total_pages);
     uart_send_string("\n");
+
+    /* Keep allocator logs for boot-time bring-up only. Runtime allocations from
+     * runu/fork/thread demos are too noisy; memory tests re-enable them
+     * explicitly around allocator validation.
+     */
+    g_allocator_log_enabled = 0;
 }

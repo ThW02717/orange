@@ -1,5 +1,7 @@
 #include "thread.h"
 #include "memory.h"
+#include "trap.h"
+#include "user.h"
 
 #define THREAD_STACK_SIZE 4096UL
 
@@ -12,10 +14,12 @@
  */
 
 static struct thread *g_zombie_head = 0;
+static struct thread *g_all_threads = 0;
 static struct thread g_boot_idle_thread;
 static struct thread *g_thread_current = 0;
 static int32_t g_next_tid = 1;
 static int g_threading_started = 0;
+static int g_need_resched = 0;
 
 struct runqueue {
     struct thread *head;
@@ -43,6 +47,40 @@ static uint64_t thread_irq_save(void)
 static void thread_irq_restore(uint64_t sstatus)
 {
     asm volatile("csrw sstatus, %0" : : "r"(sstatus));
+}
+
+static void thread_list_add(struct thread *t)
+{
+    uint64_t sstatus;
+
+    sstatus = thread_irq_save();
+    t->all_next = g_all_threads;
+    g_all_threads = t;
+    thread_irq_restore(sstatus);
+}
+
+static void thread_list_remove(struct thread *t)
+{
+    uint64_t sstatus;
+    struct thread *prev = 0;
+    struct thread *cur;
+
+    sstatus = thread_irq_save();
+    cur = g_all_threads;
+    while (cur != 0) {
+        if (cur == t) {
+            if (prev == 0) {
+                g_all_threads = cur->all_next;
+            } else {
+                prev->all_next = cur->all_next;
+            }
+            cur->all_next = 0;
+            break;
+        }
+        prev = cur;
+        cur = cur->all_next;
+    }
+    thread_irq_restore(sstatus);
 }
 
 static inline struct thread *thread_current_from_tp(void)
@@ -121,6 +159,10 @@ static void kill_zombies(void)
         if (z->is_idle != 0) {
             continue;
         }
+        thread_list_remove(z);
+        if (z->kind == THREAD_USER && z->user_stack_base != 0) {
+            kfree((void *)(uintptr_t)z->user_stack_base);
+        }
         if (z->kstack_base != 0) {
             kfree(z->kstack_base);
         }
@@ -166,6 +208,11 @@ struct thread *thread_current(void)
     return g_thread_current;
 }
 
+int thread_system_active(void)
+{
+    return g_threading_started;
+}
+
 /* Reset global scheduler state. This does not yet claim the current shell
  * execution flow as a thread; that happens in thread_system_bootstrap_init().
  */
@@ -194,7 +241,8 @@ void thread_init(void)
     g_boot_idle_thread.ctx.s9 = 0;
     g_boot_idle_thread.ctx.s10 = 0;
     g_boot_idle_thread.ctx.s11 = 0;
-    g_boot_idle_thread.tid = 0;
+    g_boot_idle_thread.pid = 0;
+    g_boot_idle_thread.kind = THREAD_KERNEL;
     g_boot_idle_thread.state = THREAD_RUNNING;
     g_boot_idle_thread.entry = 0;
     g_boot_idle_thread.arg = 0;
@@ -202,11 +250,19 @@ void thread_init(void)
     g_boot_idle_thread.kstack_top = 0;
     g_boot_idle_thread.next = 0;
     g_boot_idle_thread.znext = 0;
+    g_boot_idle_thread.all_next = 0;
     g_boot_idle_thread.is_idle = 1;
+    g_boot_idle_thread.user_entry = 0;
+    g_boot_idle_thread.user_stack_base = 0;
+    g_boot_idle_thread.user_stack_top = 0;
+    g_boot_idle_thread.exit_status = 0;
+    g_boot_idle_thread.tf = 0;
 
     g_thread_current = 0;
+    g_all_threads = 0;
     g_next_tid = 1;
     g_threading_started = 0;
+    g_need_resched = 0;
     thread_irq_restore(sstatus);
 }
 
@@ -230,6 +286,7 @@ void thread_system_bootstrap_init(void)
     g_thread_current = &g_boot_idle_thread;
     g_rq.current = &g_boot_idle_thread;
     g_rq.idle = &g_boot_idle_thread;
+    g_all_threads = &g_boot_idle_thread;
     thread_set_tp(&g_boot_idle_thread);
     g_threading_started = 1;
     thread_irq_restore(sstatus);
@@ -285,18 +342,127 @@ int thread_create(void (*entry)(void *arg), void *arg, int is_idle)
     th->ctx.s11 = 0;
 
     sstatus = thread_irq_save();
-    th->tid = g_next_tid++;
+    th->pid = g_next_tid++;
     thread_irq_restore(sstatus);
+    th->kind = THREAD_KERNEL;
     th->state = THREAD_RUNNABLE;
     th->entry = entry;
     th->arg = arg;
     th->kstack_top = top;
     th->next = 0;
     th->znext = 0;
+    th->all_next = 0;
     th->is_idle = 0;
+    th->user_entry = 0;
+    th->user_stack_base = 0;
+    th->user_stack_top = 0;
+    th->exit_status = 0;
+    th->tf = 0;
 
+    thread_list_add(th);
     runq_push(th);
-    return th->tid;
+    return th->pid;
+}
+
+/* First BE2 scaffolding: allocate a schedulable entity that will later own a
+ * user trapframe and return to U-mode. This does not yet replace the old
+ * singleton runu path; it only gives the scheduler a per-task container for
+ * user-mode state.
+ */
+int thread_create_user(uintptr_t user_entry, uintptr_t user_stack_base, uintptr_t user_stack_top)
+{
+    struct thread *th;
+    uint64_t top;
+    uint64_t sstatus;
+    unsigned int i;
+    uint64_t *raw;
+
+    if (user_entry == 0 || user_stack_top <= user_stack_base) {
+        return -1;
+    }
+
+    th = (struct thread *)kmalloc(sizeof(*th));
+    if (th == 0) {
+        return -1;
+    }
+
+    th->kstack_base = kmalloc(THREAD_STACK_SIZE);
+    if (th->kstack_base == 0) {
+        kfree(th);
+        return -1;
+    }
+
+    top = (uint64_t)(uintptr_t)th->kstack_base + THREAD_STACK_SIZE;
+    top &= ~0xFUL;
+
+    th->ctx.ra = (uint64_t)(uintptr_t)thread_bootstrap;
+    /* Keep the top-of-kstack trapframe slot untouched until the first
+     * U-mode entry. The user bootstrap call chain runs just below it.
+     */
+    th->ctx.sp = top - TRAPFRAME_ALLOC_SIZE;
+    th->ctx.s0 = 0;
+    th->ctx.s1 = 0;
+    th->ctx.s2 = 0;
+    th->ctx.s3 = 0;
+    th->ctx.s4 = 0;
+    th->ctx.s5 = 0;
+    th->ctx.s6 = 0;
+    th->ctx.s7 = 0;
+    th->ctx.s8 = 0;
+    th->ctx.s9 = 0;
+    th->ctx.s10 = 0;
+    th->ctx.s11 = 0;
+
+    sstatus = thread_irq_save();
+    th->pid = g_next_tid++;
+    thread_irq_restore(sstatus);
+    th->kind = THREAD_USER;
+    th->state = THREAD_RUNNABLE;
+    th->entry = user_task_entry;
+    th->arg = 0;
+    th->kstack_top = top;
+    th->next = 0;
+    th->znext = 0;
+    th->all_next = 0;
+    th->is_idle = 0;
+    th->user_entry = user_entry;
+    th->user_stack_base = user_stack_base;
+    th->user_stack_top = user_stack_top;
+    th->exit_status = 0;
+    th->tf = (struct trapframe *)(uintptr_t)(top - TRAPFRAME_ALLOC_SIZE);
+
+    raw = (uint64_t *)th->tf;
+    for (i = 0; i < (sizeof(*th->tf) / sizeof(uint64_t)); i++) {
+        raw[i] = 0;
+    }
+    th->tf->sp = th->user_stack_top;
+    /* Keep the current-task pointer live across the first U-mode entry so a
+     * later trap from U-mode can still identify which schedulable user task
+     * owns the fault/syscall.
+     */
+    th->tf->tp = (uint64_t)(uintptr_t)th;
+    th->tf->sepc = th->user_entry;
+
+    thread_list_add(th);
+    runq_push(th);
+    return th->pid;
+}
+
+struct thread *thread_find_by_pid(int32_t pid)
+{
+    struct thread *cur;
+    uint64_t sstatus;
+
+    sstatus = thread_irq_save();
+    cur = g_all_threads;
+    while (cur != 0) {
+        if (cur->pid == pid) {
+            break;
+        }
+        cur = cur->all_next;
+    }
+    thread_irq_restore(sstatus);
+    return cur;
 }
 
 /* Cooperative round-robin scheduler.
@@ -325,6 +491,9 @@ void schedule(void)
      * previous worker to the tail.
      */
     next = runq_pop();
+    while (next != 0 && next->state != THREAD_RUNNABLE) {
+        next = runq_pop();
+    }
     if (next == 0) {
         if (prev->is_idle != 0) {
             return;
@@ -368,6 +537,78 @@ void thread_yield(void)
     schedule();
 }
 
+void thread_mark_current_zombie(int exit_status)
+{
+    struct thread *cur = thread_current();
+    uint64_t sstatus;
+
+    if (cur == 0 || cur->is_idle != 0) {
+        return;
+    }
+
+    sstatus = thread_irq_save();
+    cur->state = THREAD_ZOMBIE;
+    cur->exit_status = exit_status;
+    cur->znext = g_zombie_head;
+    g_zombie_head = cur;
+    thread_irq_restore(sstatus);
+}
+
+int thread_stop_pid(int32_t pid, int exit_status)
+{
+    struct thread *target;
+    uint64_t sstatus;
+
+    target = thread_find_by_pid(pid);
+    if (target == 0 || target->is_idle != 0) {
+        return -1;
+    }
+    if (target == thread_current()) {
+        thread_mark_current_zombie(exit_status);
+        return 0;
+    }
+
+    sstatus = thread_irq_save();
+    target->state = THREAD_ZOMBIE;
+    target->exit_status = exit_status;
+    target->znext = g_zombie_head;
+    g_zombie_head = target;
+    thread_irq_restore(sstatus);
+    return 0;
+}
+
+int thread_has_runnable_tasks(void)
+{
+    uint64_t sstatus;
+    int has_runnable;
+
+    sstatus = thread_irq_save();
+    has_runnable = (g_rq.head != 0);
+    thread_irq_restore(sstatus);
+    return has_runnable;
+}
+
+void thread_request_resched(void)
+{
+    uint64_t sstatus;
+
+    sstatus = thread_irq_save();
+    g_need_resched = 1;
+    thread_irq_restore(sstatus);
+}
+
+int thread_consume_resched_request(void)
+{
+    uint64_t sstatus;
+    int requested;
+
+    sstatus = thread_irq_save();
+    requested = g_need_resched;
+    g_need_resched = 0;
+    thread_irq_restore(sstatus);
+    return requested;
+}
+
 /* Mark the current worker as dead and hand control back to the scheduler.
  *
  * The exiting thread is pushed onto a zombie list so the idle side can recycle
@@ -375,10 +616,7 @@ void thread_yield(void)
  */
 void thread_exit(void)
 {
-    struct thread *cur = thread_current();
-    uint64_t sstatus;
-
-    if (cur == 0 || cur->is_idle != 0) {
+    if (thread_current() == 0 || thread_current()->is_idle != 0) {
         for (;;) {
             asm volatile("wfi");
         }
@@ -387,11 +625,7 @@ void thread_exit(void)
     /* After the current worker marks itself ZOMBIE, it must never re-enter the
      * runnable queue. The idle side later frees the detached stack/object.
      */
-    sstatus = thread_irq_save();
-    cur->state = THREAD_ZOMBIE;
-    cur->znext = g_zombie_head;
-    g_zombie_head = cur;
-    thread_irq_restore(sstatus);
+    thread_mark_current_zombie(0);
     schedule();
 
     for (;;) {
@@ -413,6 +647,36 @@ void thread_enter_idle(void)
 
     for (;;) {
         kill_zombies();
+        schedule();
+    }
+}
+
+/* Shell-side BE2 helper: keep running the scheduler until control naturally
+ * falls back to idle with no runnable tasks left. This lets runu launch a
+ * schedulable user task and still return to the shell afterward.
+ */
+void thread_run_until_idle(void)
+{
+    if (g_threading_started == 0) {
+        return;
+    }
+
+    for (;;) {
+        uint64_t sstatus;
+        struct thread *cur;
+        int has_runnable;
+
+        kill_zombies();
+
+        sstatus = thread_irq_save();
+        cur = g_rq.current;
+        has_runnable = (g_rq.head != 0);
+        thread_irq_restore(sstatus);
+
+        if (cur != 0 && cur->is_idle != 0 && !has_runnable) {
+            return;
+        }
+
         schedule();
     }
 }

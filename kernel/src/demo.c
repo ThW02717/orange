@@ -1,6 +1,9 @@
 #include <stdint.h>
 #include "demo.h"
+#include "memory.h"
 #include "memory_test.h"
+#include "shell.h"
+#include "trap.h"
 #include "thread.h"
 #include "timer.h"
 #include "uart.h"
@@ -122,9 +125,13 @@ static void split_first_arg_local(char *line, char **cmd, char **arg)
 void demo_print_usage(void)
 {
     uart_send_string("demo usage:\n");
+    uart_send_string("  demo badinst     - run the illegal-instruction user test and return to shell\n");
     uart_send_string("  demo foo         - create threads with thread_create(foo, ...)\n");
+    uart_send_string("  demo fork        - run the user-space fork demo and return to shell\n");
+    uart_send_string("  demo preempt     - run two busy user tasks to test timer preemption\n");
     uart_send_string("  demo nested      - print the recommended manual nested-interrupt test flow\n");
     uart_send_string("  demo thread      - run a cooperative RR kernel-thread demo and enter idle\n");
+    uart_send_string("  demo test        - run the user-space syscall smoke test and return to shell\n");
     uart_send_string("  demo uart        - run the one-shot interrupt-driven UART demo\n");
     uart_send_string("  demo stress [n]  - queue UART TX markers for interleave testing\n");
     uart_send_string("  demo mem <name>  - run allocator test: basic|boundary|slab|multislab|reclaim|large|buddy|invalid|stress|all\n");
@@ -226,6 +233,60 @@ static int demo_nested(void)
 static int demo_mem(const char *name)
 {
     return memory_run_kmtest(name);
+}
+
+static int demo_launch_user_program(const char *name,
+                                    const char *label,
+                                    unsigned int instances)
+{
+    uintptr_t entry;
+    unsigned long size;
+    unsigned int i;
+
+    if (shell_load_user_program_named(name, &entry, &size) != 0) {
+        uart_send_string("demo ");
+        uart_send_string(name);
+        uart_send_string(": failed to load bin/");
+        uart_send_string(name);
+        uart_send_string(".bin\n");
+        return -1;
+    }
+
+    if (!thread_system_active()) {
+        uart_send_string(label);
+        uart_send_string(": bootstrap shell -> idle\n");
+        thread_system_bootstrap_init();
+    }
+
+    for (i = 0; i < instances; i++) {
+        uintptr_t user_stack_base;
+        uintptr_t user_stack_top;
+
+        user_stack_base = (uintptr_t)kmalloc(USER_STACK_SIZE);
+        if (user_stack_base == 0) {
+            uart_send_string("demo ");
+            uart_send_string(name);
+            uart_send_string(": failed to allocate user stack\n");
+            return -1;
+        }
+        user_stack_top = (user_stack_base + USER_STACK_SIZE) & ~0xFUL;
+        if (thread_create_user(entry, user_stack_base, user_stack_top) < 0) {
+            kfree((void *)(uintptr_t)user_stack_base);
+            uart_send_string("demo ");
+            uart_send_string(name);
+            uart_send_string(": failed to create user task\n");
+            return -1;
+        }
+    }
+
+    uart_send_string(label);
+    uart_send_string(": run user demo\n");
+    uart_tx_wait_idle();
+    thread_run_until_idle();
+    uart_send_string(label);
+    uart_send_string(": done\n");
+    (void)size;
+    return 0;
 }
 
 /* =========================
@@ -367,6 +428,32 @@ static int demo_thread(void)
 }
 
 /* =========================
+ * demo fork
+ *
+ * Launch the user-space fork smoke test, let the scheduler run until all user
+ * work is gone, then return control to the shell.
+ * ========================= */
+static int demo_fork(void)
+{
+    return demo_launch_user_program("fork", "[fork]", 1U);
+}
+
+static int demo_preempt(void)
+{
+    return demo_launch_user_program("preempt", "[preempt]", 2U);
+}
+
+static int demo_test(void)
+{
+    return demo_launch_user_program("test", "[test]", 1U);
+}
+
+static int demo_badinst(void)
+{
+    return demo_launch_user_program("badinst", "[badinst]", 1U);
+}
+
+/* =========================
  * UART Interrupt Demo
  *
  * Verifies the one-shot interrupt-driven UART RX/TX path and prints the
@@ -473,6 +560,18 @@ int demo_run(const char *name)
     }
     if (streq_local(cmd, "foo")) {
         return demo_foo();
+    }
+    if (streq_local(cmd, "fork")) {
+        return demo_fork();
+    }
+    if (streq_local(cmd, "test")) {
+        return demo_test();
+    }
+    if (streq_local(cmd, "badinst")) {
+        return demo_badinst();
+    }
+    if (streq_local(cmd, "preempt")) {
+        return demo_preempt();
     }
     if (streq_local(cmd, "uart")) {
         return demo_uart();

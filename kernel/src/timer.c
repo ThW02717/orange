@@ -18,6 +18,8 @@ uint64_t g_timer_irq_count;
 
 static struct timer_event *g_timer_head = 0;
 static int g_timer_enabled = 0;
+static uint64_t g_sched_tick_interval = 0;
+static uint64_t g_sched_tick_deadline = 0;
 static struct irq_task g_timer_task = {
     .type = IRQ_TASK_TIMER,
     .prio = 0,
@@ -109,12 +111,22 @@ struct sbiret timer_program_rel(uint64_t delta_ticks)
  */
 static void timer_reprogram_locked(void)
 {
-    if (g_timer_head != 0) {
-        (void)timer_program_abs(g_timer_head->expire);
-    } else {
-        g_next_deadline = 0;
-        (void)sbi_set_timer(~0ULL);
+    uint64_t deadline = 0;
+
+    if (g_sched_tick_interval != 0 && g_sched_tick_deadline != 0) {
+        deadline = g_sched_tick_deadline;
     }
+    if (g_timer_head != 0 && (deadline == 0 || g_timer_head->expire < deadline)) {
+        deadline = g_timer_head->expire;
+    }
+
+    if (deadline != 0) {
+        (void)timer_program_abs(deadline);
+        return;
+    }
+
+    g_next_deadline = 0;
+    (void)sbi_set_timer(~0ULL);
 }
 
 /* Use the first timer read after initialization as the uptime baseline. */
@@ -125,6 +137,8 @@ void timer_init_state(uint32_t timebase_freq)
     g_next_deadline = 0;
     g_uptime_seconds = 0;
     g_timer_irq_count = 0;
+    g_sched_tick_interval = 0;
+    g_sched_tick_deadline = 0;
 }
 
 void timer_init(void)
@@ -141,6 +155,8 @@ void timer_init(void)
      */
     sstatus = timer_irq_save();
     g_timer_enabled = 1;
+    g_sched_tick_interval = (g_timebase_freq >= 20U) ? ((uint64_t)g_timebase_freq / 20ULL) : 1ULL;
+    g_sched_tick_deadline = timer_read() + g_sched_tick_interval;
     timer_reprogram_locked();
     timer_irq_restore(sstatus);
 
@@ -244,6 +260,9 @@ int timer_task_run(struct irq_task *task)
     now = timer_read();
     timer_sync_uptime(now);
     g_timer_irq_count++;
+    while (g_sched_tick_interval != 0 && g_sched_tick_deadline <= now) {
+        g_sched_tick_deadline += g_sched_tick_interval;
+    }
 
     /* Timer ISR body: consume every event that is already due at this
      * interrupt edge. This
@@ -306,6 +325,8 @@ void timer_stop(void)
         kfree(event);
     }
     g_next_deadline = 0;
+    g_sched_tick_interval = 0;
+    g_sched_tick_deadline = 0;
     (void)sbi_set_timer(~0ULL);
     timer_irq_restore(sstatus);
 

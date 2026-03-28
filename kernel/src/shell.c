@@ -10,6 +10,7 @@
 #include "demo.h"
 #include "trap.h"
 #include "timer.h"
+#include "thread.h"
 #include "user.h"
 
 /* Interactive UART shell with initramfs-backed file commands and user-program launch. */
@@ -181,6 +182,40 @@ static int build_user_program_path(const char *name, char *out, unsigned int out
     }
 
     out[pos] = '\0';
+    return 0;
+}
+
+int shell_load_user_program_named(const char *name, uintptr_t *entry_out, unsigned long *size_out)
+{
+    const void *data;
+    unsigned long size;
+    unsigned int mode;
+    char path[64];
+
+    if (name == 0 || entry_out == 0 || size_out == 0) {
+        return -1;
+    }
+    if (g_initrd_start == 0 || g_initrd_end <= g_initrd_start) {
+        return -1;
+    }
+    if (build_user_program_path(name, path, sizeof(path)) != 0) {
+        return -1;
+    }
+    if (cpio_find((const void *)g_initrd_start, (const void *)g_initrd_end,
+                  path, &data, &size, &mode) != 0) {
+        return -1;
+    }
+    if ((mode & CPIO_MODE_TYPE_MASK) != CPIO_MODE_REGULAR) {
+        return -1;
+    }
+    if (size == 0 || size > USER_CODE_SIZE) {
+        return -1;
+    }
+
+    copy_bytes((void *)(uintptr_t)USER_CODE_BASE, data, size);
+    asm volatile(".word 0x0000100f" ::: "memory");
+    *entry_out = (uintptr_t)USER_CODE_BASE;
+    *size_out = size;
     return 0;
 }
 
@@ -678,83 +713,119 @@ static void cmd_uartstress(const char *arg)
     (void)demo_run(buf);
 }
 
+static int shell_launch_user_program_instances(const char *name,
+                                               const char *label,
+                                               unsigned int instances,
+                                               int verbose)
+{
+    unsigned long size;
+    uintptr_t entry;
+    unsigned int i;
+
+    if (name == 0 || label == 0 || instances == 0U) {
+        return -1;
+    }
+
+    if (g_initrd_start == 0 || g_initrd_end <= g_initrd_start) {
+        uart_send_string(label);
+        uart_send_string(": initramfs unavailable\n");
+        return -1;
+    }
+    if (shell_load_user_program_named(name, &entry, &size) != 0) {
+        uart_send_string(label);
+        uart_send_string(": failed to load user program\n");
+        return -1;
+    }
+
+    if (verbose != 0) {
+        uart_send_string(label);
+        uart_send_string(": found file bin/");
+        uart_send_string(name);
+        uart_send_string(".bin\n");
+        uart_send_string(label);
+        uart_send_string(": copied to ");
+        uart_send_hex((unsigned long)entry);
+        uart_send_string("\n");
+        uart_send_string(label);
+        uart_send_string(": size = ");
+        uart_send_dec(size);
+        uart_send_string("\n");
+        uart_send_string(label);
+        uart_send_string(": entry = ");
+        uart_send_hex((unsigned long)entry);
+        uart_send_string("\n");
+        uart_send_string(label);
+        uart_send_string(": requested name = ");
+        uart_send_string(name);
+        uart_send_string("\n");
+    }
+
+    if (!thread_system_active()) {
+        uart_send_string(label);
+        uart_send_string(": bootstrap shell as idle\n");
+        thread_system_bootstrap_init();
+    }
+
+    for (i = 0; i < instances; i++) {
+        uintptr_t user_stack_base;
+        uintptr_t user_stack_top;
+
+        user_stack_base = (uintptr_t)kmalloc(USER_STACK_SIZE);
+        if (user_stack_base == 0) {
+            uart_send_string(label);
+            uart_send_string(": failed to allocate user stack\n");
+            return -1;
+        }
+        user_stack_top = (user_stack_base + USER_STACK_SIZE) & ~0xFUL;
+
+        if (verbose != 0) {
+            uart_send_string(label);
+            uart_send_string(": user stack top = ");
+            uart_send_hex((unsigned long)user_stack_top);
+            uart_send_string("\n");
+        }
+
+        if (thread_create_user(entry, user_stack_base, user_stack_top) < 0) {
+            kfree((void *)(uintptr_t)user_stack_base);
+            uart_send_string(label);
+            uart_send_string(": failed to create user task\n");
+            return -1;
+        }
+    }
+
+    if (instances == 1U) {
+        uart_send_string(label);
+        uart_send_string(": enqueue user task and schedule\n");
+    } else {
+        uart_send_string(label);
+        uart_send_string(": enqueue ");
+        uart_send_dec(instances);
+        uart_send_string(" user tasks and schedule\n");
+    }
+    uart_tx_wait_idle();
+    thread_run_until_idle();
+    uart_send_string(label);
+    uart_send_string(": user task finished, back to shell\n");
+    return 0;
+}
+
 /* Load a raw user binary from initramfs into the reserved execution window. */
 static void cmd_runu(const char *arg) {
-    const void *data;
-    unsigned long size;
-    unsigned int mode;
-    char path[64];
-
-    /* Validate shell input and make sure initramfs is available first. */
     if (arg == 0) {
         uart_send_string("usage: runu <name>\n");
         return;
     }
+    (void)shell_launch_user_program_instances(arg, "runu", 1U, 1);
+}
 
-    if (g_initrd_start == 0 || g_initrd_end <= g_initrd_start) {
-        uart_send_string("runu: initramfs unavailable\n");
-        return;
-    }
+static void cmd_fork_test(void)
+{
+    (void)shell_launch_user_program_instances("fork", "fork_test", 1U, 0);
+}
 
-    if (build_user_program_path(arg, path, sizeof(path)) != 0) {
-        uart_send_string("runu: program name too long\n");
-        return;
-    }
-
-    if (cpio_find((const void *)g_initrd_start, (const void *)g_initrd_end,
-                  path, &data, &size, &mode) != 0) {
-        uart_send_string("runu: file not found: ");
-        uart_send_string(path);
-        uart_send_string("\n");
-        return;
-    }
-
-    /* Accept only regular files that fit in the reserved user code window. */
-    if ((mode & CPIO_MODE_TYPE_MASK) != CPIO_MODE_REGULAR) {
-        uart_send_string("runu: not a regular file: ");
-        uart_send_string(path);
-        uart_send_string("\n");
-        return;
-    }
-
-    if (size == 0 || size > USER_CODE_SIZE) {
-        uart_send_string("runu: invalid program size: ");
-        uart_send_dec(size);
-        uart_send_string("\n");
-        return;
-    }
-
-    /* Stage the raw user binary at the fixed execution address. */
-    copy_bytes((void *)(uintptr_t)USER_CODE_BASE, data, size);
-    /* Freshly copied user code will be executed from the same fixed address on
-     * every runu invocation. Make the new instruction stream visible to the
-     * CPU before enter_user_mode() jumps there, otherwise a previous program
-     * may still be sitting in the I-cache.
-     */
-    asm volatile(".word 0x0000100f" ::: "memory");
-
-    uart_send_string("runu: found file ");
-    uart_send_string(path);
-    uart_send_string("\n");
-    uart_send_string("runu: copied to ");
-    uart_send_hex((unsigned long)USER_CODE_BASE);
-    uart_send_string("\n");
-    uart_send_string("runu: size = ");
-    uart_send_dec(size);
-    uart_send_string("\n");
-    uart_send_string("runu: entry = ");
-    uart_send_hex((unsigned long)USER_CODE_BASE);
-    uart_send_string("\n");
-    uart_send_string("runu: user stack top = ");
-    uart_send_hex((unsigned long)USER_STACK_TOP);
-    uart_send_string("\n");
-    uart_send_string("runu: requested name = ");
-    uart_send_string(arg);
-    uart_send_string("\n");
-    uart_send_string("runu: switching S-mode -> U-mode via sret\n");
-
-    /* Hand control to the prepared user-mode entry path. */
-    enter_user_mode();
+static void cmd_preempt_test(void)
+{
+    (void)shell_launch_user_program_instances("preempt", "preempt_test", 2U, 0);
 }
 
 /* Main command dispatcher for the interactive shell. */
@@ -781,6 +852,8 @@ void processCommand(shell_t* shell) {
         uart_send_string("  timer  - Show timer subsystem state and pending queue\n");
         uart_send_string("  addtimer <sec> - Schedule a one-shot software timer (supports 1.5)\n");
         uart_send_string("  runu <name> - Load and run bin/<name>.bin from initramfs\n");
+        uart_send_string("  fork_test - Run the user-space fork test and return to shell\n");
+        uart_send_string("  preempt_test - Run two busy user tasks to test timer preemption\n");
         return;
     }
 
@@ -863,6 +936,16 @@ void processCommand(shell_t* shell) {
 
     if (streq(cmd, "runu")) {
         cmd_runu(arg);
+        return;
+    }
+
+    if (streq(cmd, "fork_test")) {
+        cmd_fork_test();
+        return;
+    }
+
+    if (streq(cmd, "preempt_test")) {
+        cmd_preempt_test();
         return;
     }
 

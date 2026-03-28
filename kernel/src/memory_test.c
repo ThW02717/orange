@@ -723,42 +723,60 @@ void memory_print_kmtest_usage(void) {
 }
 
 int memory_run_kmtest(const char *name) {
+    int rc;
+
     if (name == 0 || name[0] == '\0') {
         memory_print_kmtest_usage();
         return -1;
     }
 
+    memory_set_allocator_log_enabled(1);
+
     if (streq_local(name, "basic")) {
-        return kmtest_basic();
+        rc = kmtest_basic();
+        goto out;
     }
     if (streq_local(name, "boundary")) {
-        return kmtest_boundary();
+        rc = kmtest_boundary();
+        goto out;
     }
     if (streq_local(name, "reclaim")) {
-        return kmtest_reclaim();
+        rc = kmtest_reclaim();
+        goto out;
     }
     if (streq_local(name, "slab")) {
-        return kmtest_slab();
+        rc = kmtest_slab();
+        goto out;
     }
     if (streq_local(name, "multislab")) {
-        return kmtest_multislab();
+        rc = kmtest_multislab();
+        goto out;
     }
     if (streq_local(name, "large")) {
-        return kmtest_large();
+        rc = kmtest_large();
+        goto out;
     }
     if (streq_local(name, "buddy")) {
-        return kmtest_buddy();
+        rc = kmtest_buddy();
+        goto out;
     }
     if (streq_local(name, "invalid")) {
-        return kmtest_invalid();
+        rc = kmtest_invalid();
+        goto out;
     }
     if (streq_local(name, "stress")) {
-        return kmtest_stress();
+        rc = kmtest_stress();
+        goto out;
     }
     if (streq_local(name, "all")) {
-        return kmtest_all();
+        rc = kmtest_all();
+        goto out;
     }
 
     memory_print_kmtest_usage();
-    return -1;
+    rc = -1;
+
+out:
+    memory_set_allocator_log_enabled(0);
+    return rc;
 }
