@@ -1,6 +1,16 @@
+/*
+ * uart.c - 16550-compatible UART driver (polling mode).
+ *
+ * All I/O is done by busy-wait polling — no interrupts.
+ * The bootloader never enables UART interrupts; it just
+ * spins on the line-status register (LSR) until the hardware
+ * is ready to send/receive a byte.
+ */
+
 #include "peripherals/mini_uart.h"
 #include "utils.h"
 
+/* read a 32-bit UART register */
 static inline uint32_t uart_reg_read(uintptr_t reg)
 {
 #ifdef QEMU
@@ -10,6 +20,7 @@ static inline uint32_t uart_reg_read(uintptr_t reg)
 #endif
 }
 
+/* write a 32-bit value to a UART register */
 static inline void uart_reg_write(uintptr_t reg, uint32_t value)
 {
 #ifdef QEMU
@@ -19,6 +30,10 @@ static inline void uart_reg_write(uintptr_t reg, uint32_t value)
 #endif
 }
 
+/*
+ * Drain the RX FIFO: read-and-discard any stale bytes left
+ * by a previous kernel session or cable noise.
+ */
 static void uart_flush_hardware_rx_fifo(void)
 {
     unsigned int limit = 256U;
@@ -28,6 +43,15 @@ static void uart_flush_hardware_rx_fifo(void)
     }
 }
 
+/*
+ * uart_init: prepare the UART for polling-based communication.
+ *
+ * On real hardware the baud rate was already configured by U-Boot,
+ * so we skip re-configuration and only:
+ *   1. Disable interrupts   (IER = 0)
+ *   2. Clear TX/RX FIFOs    (FCR = 0x07)
+ *   3. Flush any leftover data from the RX FIFO
+ */
 void uart_init(void)
 {
 #ifdef QEMU
@@ -39,30 +63,38 @@ void uart_init(void)
     uart_reg_write(UART_FCR_REG, 0x07);
     uart_reg_write(UART_MCR_REG, 0x03);
 #else
-    /* Keep the board's existing baud configuration, but clear any stale
-     * interrupt/FIFO state so each bootloader session starts from a clean
-     * UART console after repeated kernel loads or cable re-plugs.
-     */
     uart_reg_write(UART_IER_REG, 0x00);
     uart_reg_write(UART_FCR_REG, 0x07);
     uart_flush_hardware_rx_fifo();
 #endif
 }
 
+/*
+ * uart_send: send one byte (blocking until TX FIFO has space).
+ */
 void uart_send(char c)
 {
     while ((uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) == 0U) {
+        /* spin — wait for TX holding register to empty */
     }
     uart_reg_write(UART_THR_REG, (uint32_t)(uint8_t)c);
 }
 
+/*
+ * uart_recv: receive one byte (blocking until data is ready).
+ */
 char uart_recv(void)
 {
     while ((uart_reg_read(UART_LSR_REG) & LSR_RX_READY) == 0U) {
+        /* spin — wait for a byte to arrive */
     }
     return (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
 }
 
+/*
+ * uart_send_string: send a null-terminated string.
+ * Converts '\n' to "\r\n" for terminal compatibility.
+ */
 void uart_send_string(const char *str)
 {
     for (int i = 0; str[i] != '\0'; i++) {
@@ -73,6 +105,7 @@ void uart_send_string(const char *str)
     }
 }
 
+/* uart_send_hex: print an unsigned long in hexadecimal */
 void uart_send_hex(unsigned long value)
 {
     for (int shift = (int)(sizeof(unsigned long) * 8U) - 4; shift >= 0; shift -= 4) {
@@ -82,6 +115,7 @@ void uart_send_hex(unsigned long value)
     }
 }
 
+/* uart_send_dec: print an unsigned long in decimal */
 void uart_send_dec(unsigned long value)
 {
     char buf[24];
