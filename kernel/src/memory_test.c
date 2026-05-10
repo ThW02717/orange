@@ -161,7 +161,8 @@ static int kmtest_boundary(void) {
         {33UL, 2}, {63UL, 2}, {64UL, 2}, {65UL, 3}, {127UL, 3}, {128UL, 3},
         {129UL, 4}, {255UL, 4}, {256UL, 4}, {257UL, 5}, {511UL, 5}, {512UL, 5},
         {513UL, 6}, {1023UL, 6}, {1024UL, 6}, {1025UL, 7}, {2047UL, 7}, {2048UL, 7},
-        {2049UL, -1}
+        {2049UL, 8}, {4095UL, 8}, {4096UL, 8}, {4097UL, 9}, {8191UL, 9}, {8192UL, 9},
+        {8193UL, -1}
     };
     const char *name = "boundary";
     struct memory_stats_snapshot before;
@@ -195,12 +196,12 @@ static int kmtest_boundary(void) {
                 case_failed = 1;
                 goto cleanup_case;
             }
-            if (cases[i].size == 2049UL) {
+            if (cases[i].size == 8193UL) {
                 struct memory_stats_snapshot pre_free;
                 struct memory_stats_snapshot post_free;
 
                 if (require(post_case.page_allocs == pre_case.page_allocs + 1U, name,
-                            "2049-byte large alloc did not hit page allocator once") != 0) {
+                            "8193-byte large alloc did not hit page allocator once") != 0) {
                     case_failed = 1;
                     goto cleanup_case;
                 }
@@ -209,7 +210,7 @@ static int kmtest_boundary(void) {
                 ptr = 0;
                 memory_get_stats(&post_free);
                 if (require(post_free.page_frees == pre_free.page_frees + 1U, name,
-                            "2049-byte large free did not release one page allocation") != 0) {
+                            "8193-byte large free did not release one page allocation") != 0) {
                     case_failed = 1;
                     goto cleanup_case;
                 }
@@ -231,10 +232,10 @@ cleanup_case:
     }
 
     memory_get_stats(&after);
-    if (require(after.object_allocs == before.object_allocs + 23U, name, "unexpected small-object alloc count") != 0) {
+    if (require(after.object_allocs == before.object_allocs + 29U, name, "unexpected small-object alloc count") != 0) {
         return -1;
     }
-    if (require(after.object_frees == before.object_frees + 23U, name, "unexpected small-object free count") != 0) {
+    if (require(after.object_frees == before.object_frees + 29U, name, "unexpected small-object free count") != 0) {
         return -1;
     }
     if (require(memory_check_slabs_ok(), name, "slab invariant check failed") != 0) {
@@ -461,8 +462,8 @@ static int kmtest_large(void) {
 
     memory_get_stats(&before);
 
-    a = kmalloc(2049U);
-    b = kmalloc(5000U);
+    a = kmalloc(8193U);
+    b = kmalloc(12000U);
     if (require(a != 0 && b != 0, name, "large allocation returned null") != 0) {
         goto cleanup;
     }
@@ -589,8 +590,8 @@ static int kmtest_invalid(void) {
     kfree(small);
     small = 0;
 
-    large = (uint8_t *)kmalloc(5000U);
-    if (require(large != 0, name, "kmalloc(5000) returned null") != 0) {
+    large = (uint8_t *)kmalloc(9000U);
+    if (require(large != 0, name, "kmalloc(9000) returned null") != 0) {
         goto cleanup;
     }
     large_saved = large;
@@ -633,7 +634,7 @@ cleanup:
 
 static int kmtest_stress(void) {
     const char *name = "stress";
-    static const unsigned long sizes[] = {16UL, 32UL, 64UL, 128UL, 256UL, 5000UL};
+    static const unsigned long sizes[] = {16UL, 32UL, 64UL, 128UL, 256UL, 9000UL};
     struct memory_stats_snapshot before;
     struct memory_stats_snapshot after;
     unsigned int i;

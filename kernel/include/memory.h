@@ -3,8 +3,10 @@
 
 #include <stdint.h>
 
+/* This kernel uses the standard RISC-V 4KB page granularity. */
 #define PAGE_SIZE 4096UL
 
+/* Allocator counters used by tests and the shell mem command. */
 struct memory_stats_snapshot {
     uint64_t page_allocs;
     uint64_t page_frees;
@@ -16,6 +18,7 @@ struct memory_stats_snapshot {
     unsigned int empty_slab_limit;
 };
 
+/* Per-size-class slab state used by tests and debug output. */
 struct memory_slab_class_snapshot {
     unsigned int class_idx;
     unsigned int obj_size;
@@ -26,19 +29,26 @@ struct memory_slab_class_snapshot {
     unsigned int cached_empty_count;
 };
 
-// Startup Allocator
+/* Initialize the allocator from the devicetree and bootloader initrd hints. */
 void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_end_hint);
+
+/* Mark a physical range unavailable before buddy free lists are built. */
 void memory_reserve(uint64_t start, uint64_t size);
 
-// Buddy System
+/* Page allocator API. p_alloc(n) returns at least n contiguous physical pages;
+ * internally it rounds to a power-of-two buddy order. p_free() requires the
+ * exact page-aligned pointer returned by p_alloc().
+ */
 void *p_alloc(unsigned int pages);
 void p_free(void *ptr);
 
-// Slab
+/* General kernel allocator API.
+ * Small allocations use slab caches; large allocations use whole buddy pages.
+ */
 void *kmalloc(unsigned long size);
 void kfree(void *ptr);
 
-// Debug / observability
+/* Debug / observability helpers for shell commands and allocator tests. */
 void memory_print_memstat(void);
 void memory_print_slabinfo(void);
 void memory_print_buddyinfo(void);
