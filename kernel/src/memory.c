@@ -750,16 +750,14 @@ static int is_reserved_pa(uint64_t pa) {
     }
     return 0;
 }
-/* Initialize the bump allocator used before buddy metadata exists.
- * The startup allocator is only for early metadata such as g_frame_array.
- */
+/* Prepare and validate the early allocation range before the buddy allocator starts. */
 static void startup_allocator_init(uint64_t base, uint64_t size) {
     uint64_t end = base + size;
     if (end < base) {
         end = (uint64_t)-1;
     }
-    g_startup_cur = align_up_u64(base, 16U);
-    g_startup_end = align_down_u64(end, 16U);
+    g_startup_cur = base;
+    g_startup_end = end;
     if (g_startup_cur < PAGE_SIZE) {
         g_startup_cur = PAGE_SIZE;
     }
