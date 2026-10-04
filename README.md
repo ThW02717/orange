@@ -1,497 +1,255 @@
-# OrangePi RV2 Bare-Metal Kernel
+# Orange
 
-This repository is a bare-metal RISC-V kernel project for the OrangePi RV2, developed and tested on real hardware through a UART boot workflow. The main focus is trap handling, interrupt-driven UART, a software timer multiplexer, nested deferred interrupt handling, user-mode entry, devicetree-based platform discovery, and a layered buddy/slab memory allocator.
+An educational RV64 kernel for OrangePi RV2, written in C and RISC-V assembly.
 
-The code is intentionally small and board-facing. It is closer to a systems side project than a full OS, and each subsystem is exposed through a small shell so the control flow can be observed directly on the board.
+## Core Design
 
-## Bootloader and Boot Flow
+### Memory Layout
 
-The development workflow avoids rewriting the SD card for every kernel change. A host-side UART loader sends the kernel image to the board over `/dev/ttyUSB0`, and the board-side boot flow jumps to the loaded image.
+The kernel uses physical addresses directly. There are no per-process page
+tables: kernel code, user images, stacks, and allocator storage share one flat
+address space. Separate stack allocations do not provide memory isolation.
+The addresses below refer to the board build, not the QEMU build.
 
-At a high level:
+#### Physical RAM and reservations
 
-1. the host builds `kernel.bin`
-2. the host sends it through `bootloader/tools/uart_load.py`
-3. the image is loaded at the kernel execution address used by this project
-4. firmware transfers control to the kernel and passes the devicetree address in `a1`
+[`memory_init()`](kernel/src/memory.c) reads RAM regions from the DTB rather than
+assuming one fixed RAM range. Only complete 4 KiB pages inside those regions are
+tracked. Reservations are rounded outward to keep any occupied page out of the
+initial buddy free lists.
 
-This workflow keeps iteration fast on real hardware and matches the bring-up environment used throughout the project.
+```text
+RAM declared by the DTB (one or more regions)
+|
++-- Reserved before buddy free-list creation
+|   +-- Physical page 0, if it falls within declared RAM
+|   +-- Kernel image, including static storage and the boot stack
+|   +-- DTB
+|   +-- Initramfs archive
+|   +-- Board /reserved-memory ranges
+|   `-- Frame metadata array allocated by the startup allocator
+|
+`-- Remaining complete pages
+    +-- Free buddy blocks
+    `-- Runtime allocations
+        +-- Slab backing blocks and other kernel objects
+        +-- Per-thread kernel stacks
+        `-- Per-user-task user stacks
 
-## Build and Board Test Flow
-
-The normal edit / build / test loop on OrangePi RV2 is:
-
-1. build the kernel image
-2. open a serial console to the board
-3. send the new kernel image through UART
-4. observe boot logs and interact with the shell
-
-Typical commands look like this:
-
-```bash
-make -C kernel
-sudo screen /dev/ttyUSB0 115200
-sudo python3 bootloader/tools/uart_load.py /dev/ttyUSB0 kernel/kernel.bin --initrd kernel/initramfs.cpio --load-cmd never
+Accounting view, not physical address order; blocks need not be adjacent.
 ```
 
-In practice:
-
-- `make -C kernel` builds `kernel.bin` and related artifacts
-- `screen` is used as the board console
-- `uart_load.py` sends the kernel through the UART boot path instead of rewriting the SD card
-
-Once the kernel boots, all subsystem checks in this project are done from the on-board shell.
-
-## Devicetree and Initramfs
-
-The kernel does not assume hardcoded board addresses for major devices. Instead, it parses the flattened devicetree passed at boot and uses it as the source of platform information.
-
-The current devicetree usage is:
-
-- UART MMIO base
-- PLIC MMIO base
-- UART IRQ ID
-- `timebase-frequency`
-- memory regions
-- initramfs start/end from `/chosen`
-
-The parser is intentionally small. It implements the minimum FDT pieces needed for this kernel:
-
-- header validation
-- structure-block token walking
-- node lookup by path
-- property lookup by name
-- compatibility matching
-
-The initramfs is a `newc` cpio archive. The kernel reads the initrd range from the devicetree instead of hardcoding a ramdisk address, then uses a simple cpio parser to implement:
-
-- `ls`
-- `cat <file>`
-- `runu <name>` for loading user programs from `bin/<name>.bin`
-
-## Memory System
-
-The memory system is layered.
-
-### Buddy allocator
-
-The lower layer manages memory at page granularity. It tracks free memory in power-of-two page blocks and is responsible for:
-
-- splitting larger blocks when a smaller request arrives
-- merging buddy pairs on free
-- maintaining the global free-page structure
-
-The key data structures in this layer are:
-
-- a per-page metadata array (`struct page`) used as the frame table
-- buddy free lists organized by order
-- page state such as order, allocation state, and slab ownership metadata
-
-So this layer behaves like a frame allocator:
-
-- each physical page frame has metadata
-- free blocks are linked through the per-order free lists
-- allocation and free operations update both the frame metadata and the buddy lists
-
-### Slab allocator
-
-The upper layer provides small kernel-object allocation on top of the buddy allocator. Each slab cache corresponds to an object size class, and slab pages are carved into fixed-size objects.
-
-This layer is responsible for:
-
-- fast small allocations
-- object reuse
-- per-size-class freelists
-- reclaiming empty slab pages back to buddy
-
-The key data structures in this layer are:
-
-- slab caches indexed by object size class
-- per-cache lists for partial, full, and empty slab pages
-- slab-page metadata stored in the shared page/frame table
-- in-page free-object lists for fixed-size objects
-
-So the design is:
-
-- buddy allocator for pages
-- slab allocator for small objects
-- `kmalloc` / `kfree` route requests to the correct layer
-
-## Trap System
-
-The kernel uses one shared supervisor trap path:
-
-- `stvec -> trap_entry -> trap_dispatch()`
-
-`trap_entry.S` saves the interrupted context, switches to the kernel stack when needed, and enters the C dispatcher. `trap_return` restores the `trap_context` and finishes with `sret`.
-
-At a high level, the trap system is organized as:
-
-- mode switch: S-mode to U-mode
-- exceptions: user `ecall` and user faults
-- interrupts: UART and timer
-- nested deferred interrupt handling: top half + bottom half
-
-### S-mode to U-mode
-
-User-mode entry is explicit:
-
-1. `runu <name>` loads a raw binary from the initramfs into `USER_CODE_BASE`
-2. the kernel synchronizes the instruction stream after copying the image
-3. `enter_user_mode()` writes the user entry PC to `sepc`
-4. `sstatus` is prepared so `sret` returns to U-mode
-5. `trap_return -> sret` transfers control into the user program
-
-### Exceptions
-
-There are two user programs used to validate the exception path:
-
-- `runu test`
-- `runu badinst`
-
-`test.bin` exercises the syscall path:
-
-1. U-mode executes `ecall`
-2. CPU traps to S-mode
-3. `trap_dispatch()` classifies it as a user exception
-4. the kernel prints `scause`, `sepc`, and `stval`
-5. `SYS_test` advances `sepc` and returns to U-mode
-6. `SYS_exit` terminates the user context and returns to the shell
-
-`badinst.bin` exercises the fault path:
-
-1. U-mode executes an illegal instruction
-2. CPU traps to S-mode with `scause = illegal instruction`
-3. the kernel prints the fault diagnostics
-4. the user context is terminated
-5. control returns to the shell
-
-So the exception side covers both:
-
-- recoverable user traps
-- terminating user faults
-
-### Interrupts
-
-The interrupt side currently has two device paths:
-
-- UART external interrupt through the PLIC
-- supervisor timer interrupt
-
-#### UART interrupt path
-
-UART is interrupt-driven on OrangePi RV2 and routed through the PLIC.
-
-The receive path is:
-
-1. a byte arrives at UART0
-2. UART raises its interrupt line
-3. PLIC delivers a supervisor external interrupt
-4. `trap_dispatch()` enters the UART external-interrupt path
-5. `plic_claim()` identifies the UART IRQ
-6. the UART top half masks the relevant direction and enqueues deferred work
-7. the UART bottom half drains RX into the RX ring buffer or drains TX into `THR`
-8. `plic_complete()` finishes the interrupt
-
-The main data structures are:
-
-- UART RX ring buffer
-- UART TX ring buffer
-- persistent deferred tasks for UART RX and UART TX
-
-The compact end-to-end check for this subsystem is:
-
-- `demo uart`
-
-#### Timer interrupt path
-
-The timer subsystem uses one hardware timer source plus a software timer queue.
-
-The core idea is:
-
-- software timers are stored in a sorted singly linked list by absolute `expire`
-- the hardware timer is always programmed to the current list head
-
-So timer handling is no longer a fixed periodic heartbeat. It is a deadline multiplexer built on top of one hardware timer source.
-
-The path is:
-
-1. `addtimer <sec>` converts seconds into timer ticks and calls `add_timer(...)`
-2. `add_timer(...)` allocates a `timer_event`
-3. the event is inserted into a sorted singly linked list by absolute `expire`
-4. the hardware timer is reprogrammed to the earliest pending deadline
-5. when that deadline arrives, the CPU takes a supervisor timer interrupt
-6. the timer top half masks the timer source and enqueues deferred timer work
-7. the timer bottom half pops expired events, runs callbacks, frees nodes, and reprograms the next deadline
-
-The main data structure is:
-
-- a sorted singly linked list of `timer_event`
-
-The important invariant is:
-
-- the programmed hardware deadline always matches the list head
-
-The main shell-facing commands for this subsystem are:
-
-- `addtimer <sec>`
-- `timer`
-
-### Nested Interrupts and Deferred Work
-
-The advanced interrupt work extends both UART and timer into a shared deferred-work model.
-
-The execution model is:
-
-1. top halves stay short and only acknowledge, mask, and enqueue work
-2. deferred work is represented as `irq_task`
-3. `irq_task_run_before_return()` runs before `trap_return -> sret`
-4. interrupts are re-enabled while bottom halves run
-5. a timer interrupt can therefore arrive while UART bottom-half work is still in progress
-
-This is the path that enables visible nested-interrupt behavior in the demo, where timer markers can appear between UART stress markers.
-
-The main data structures are:
-
-- the generic deferred-task queue of `irq_task`
-- persistent task objects for timer, UART RX, and UART TX
-- the existing UART RX/TX ring buffers
-
-The main tradeoff is that responsiveness improves, but console output becomes harder to keep clean because shell prompts, UART stress output, timer markers, and debug logs all share the same serial line.
-
-## Thread and User Process
-
-This codebase now has one scheduler substrate that carries both:
-
-- cooperative kernel threads from the Basic Exercise 1 work
-- schedulable user processes for Basic Exercise 2
-
-The key design decision is that the scheduler context and the `trap_context` are
-separate:
-
-- `struct thread_context`, stored in `th->thread_context`, is the kernel-side saved context used by `switch_to()`
-- `struct trap_context`, accessed through `th->tc`, saves the interrupted registers and CSR state for trap entry/return
-
-So a user process is represented as:
-
-- one schedulable `struct thread`
-- one kernel stack
-- one `trap_context` at the top of that kernel stack
-- one private user stack
-- one user entry PC in the shared user-code window
-
-### Kernel Threads
-
-The kernel-thread work is intentionally small in scope:
-
-- single hart
-- cooperative scheduling
-- round-robin policy
-- one idle thread
-- zombie recycling by the idle thread
-
-The key data structures are:
-
-- `struct thread` for thread metadata, saved context, and kernel-stack ownership
-- `struct thread_context` for `ra`, `sp`, and `s0` through `s11`
-- `struct runqueue` for the runnable queue, current thread, and idle thread
-- a zombie list for terminated threads waiting to be reclaimed
-
-The core path is:
-
-1. `thread_create(entry, arg, ...)` allocates a thread object and a kernel stack
-2. the initial saved context is seeded with `sp = kstack_top` and `ra = thread_bootstrap`
-3. `schedule()` pops the next runnable thread from the FIFO run queue
-4. `switch_to(prev, next)` saves the old context and restores the new one
-5. `thread_bootstrap()` calls `entry(arg)` the first time a fresh thread runs
-6. `thread_exit()` marks the thread as zombie and hands control back to the scheduler
-7. the idle thread reclaims zombie stacks and thread objects
-
-The thread demo is exposed through:
-
-- `demo thread`: tagged worker threads (`A/B/C`) to show visible round-robin interleaving
-- `demo foo`: a minimal example that directly uses `thread_create(foo, ...)` to show that a function name is passed as the thread entry
-
-The kernel-thread-only path is still cooperative. The timer-driven preemption
-work is applied to user processes first.
-
-### User Processes and Syscalls
-
-User execution is no longer a singleton one-shot path. A shell command or demo
-loads a user binary, allocates a private user stack, creates a schedulable
-user task, and lets the scheduler run it until the system naturally falls back
-to idle.
-
-The current user-process path is:
-
-1. load `bin/<name>.bin` from the initramfs
-2. copy it to the fixed user-code window at `USER_CODE_BASE`
-3. execute `fence.i` so the CPU does not reuse stale instructions
-4. allocate a private user stack
-5. create a `THREAD_USER` task with its own kernel stack and `trap_context`
-6. enqueue it on the run queue
-7. schedule it, prepare its `trap_context`, and return to U-mode with `sret`
-
-The system-call ABI follows the RISC-V `ecall` convention:
-
-- arguments in `a0`, `a1`, `a2`, ...
-- syscall number in `a7`
-- return value in `a0`
-
-The currently implemented syscall numbers are:
-
-- `0`: `getpid()`
-- `1`: `uart_read(char *buf, long count)`
-- `2`: `uart_write(const char *buf, long count)`
-- `3`: `exec(const char *path)`
-- `4`: `fork()`
-- `5`: `exit(int status)`
-- `6`: `stop(long pid)`
-
-The most important BE2 behaviors validated in this repository are:
-
-- `demo test`: smoke test for `getpid`, `uart_write`, and `exit`
-- `demo badinst`: illegal-instruction fault path and user-process termination
-- `demo fork`: `fork()` with private child user stacks, distinct `sp`, and distinct `&cnt`
-- `demo preempt`: timer-driven user preemption with two busy-loop user tasks
-
-### Fork
-
-`fork()` does not restart the child from the program entry. Instead, it copies
-the parent's execution snapshot at the syscall boundary so the child resumes
-from the instruction after the `fork()` call.
-
-The implementation currently does:
-
-1. allocate a new child task
-2. allocate a new child kernel stack and a new child user stack
-3. copy the parent's user stack into the child stack
-4. copy the parent's `trap_context` into the child's `trap_context`
-5. set child `a0 = 0`
-6. return child pid to the parent
-7. remap all saved values that still point into the parent's user stack so they
-   point into the corresponding child stack locations instead
-
-That last step matters because user code may address locals through frame
-pointers such as `s0`, not only through `sp`. This repository hit that bug
-directly during debugging: `sp` differed between parent and child, but `&cnt`
-was still shared until `s0` and other stack-related saved values were remapped
-correctly.
-
-### User Preemption
-
-The timer subsystem now also provides a periodic scheduler tick in addition to
-the one-shot software-timer queue. On each timer interrupt:
-
-1. the current user task traps into S-mode
-2. the timer top half runs
-3. if other runnable tasks exist, the kernel sets a reschedule request
-4. the trap path consumes that request before returning to U-mode
-5. `schedule()` may switch to another runnable user process
-
-This is validated by `demo preempt`, where two busy-loop user tasks alternate
-without explicitly calling `yield()`.
-
-## Shell
-
-The shell is intentionally small. It is not a process manager or userspace environment; it is a board-side debug interface for the kernel subsystems above.
-
-### Command summary
-
-- `help`: print the command list
-- `hello`: quick shell sanity check
-- `info`: print board, SBI, memory, and initrd information
-- `cores`: show secondary-hart bring-up state
-- `ls`: list files in the initramfs
-- `cat <file>`: print a file from the initramfs
-- `demo <name>`: run grouped demos and tests such as:
-  - `demo foo`
-  - `demo thread`
-  - `demo test`
-  - `demo badinst`
-  - `demo fork`
-  - `demo preempt`
-  - `demo uart`
-  - `demo stress`
-  - `demo mem <name>`
-  - `demo nested`
-  - `demo trace`
-- `mem`: print allocator, slab, and buddy state
-- `timer`: print timer state and the pending software-timer queue
-- `addtimer <sec>`: queue a one-shot software timer
-- `runu <name>`: load and execute `bin/<name>.bin` from the initramfs in U-mode
-
-Legacy aliases such as `uartdemo`, `uartstress`, `memtest`, and `kmtest` still exist, but the main public entry point is now `demo <name>`.
-
-## Notes from Debugging
-
-One bug was especially important in this project.
-
-### Reusing one user-code window requires instruction-stream sync
-
-All user binaries are copied to the same execution address. That means loading a new program is really an overwrite of the previous one. Without instruction-stream synchronization, the CPU may still execute stale instructions from the previous image.
-
-In this codebase, that bug showed up when:
-
-- `runu test` was executed first
-- then `runu badinst` was loaded into the same address
-- the board still behaved as if the old program was running
-
-The fix is a `fence.i` after copying the new user image and before entering U-mode again.
-
-### `fork()` required stack-address relocation, not just stack copying
-
-One of the most important BE2 bugs was that copying the parent stack was not
-enough by itself. The child also inherited saved values that still pointed into
-the parent's stack image.
-
-The bug showed up as:
-
-- parent and child had different `sp`
-- but the address of a local variable such as `&cnt` was still identical
-
-The root cause was that the compiler addressed the local variable through the
-frame pointer `s0`, and the saved child state still held a parent-stack frame
-base. The fix was to remap:
-
-- `trap_context` register values that fell inside the parent stack range
-- copied stack words that still pointed back into the parent stack
-
-This was validated by `demo fork`, where parent, child1, and child2 now all
-show distinct `sp` and distinct `&cnt`.
-
-### User-space UART output must emit CRLF, not LF alone
-
-Another practical bug was purely about console presentation. Kernel-side
-`uart_send_string()` already converted `\n` into `\r\n`, but user-space
-`uart_write()` initially forwarded only `\n`.
-
-On a serial terminal that meant:
-
-- move to the next row
-- but keep the same column
-
-So user-process output formed a staircase drifting to the right. The fix was
-to translate user-space `\n` into `\r\n` inside the `SYS_uart_write` path as
-well.
-
-### Serial console state can become stale after heavy UART output
-
-During the nested-interrupt demo, the board console may become sluggish even though the kernel still receives input correctly. In practice this was usually not a permanent logic failure. Heavy UART stress output, repeated kernel reloads, and reconnecting the host serial session could leave the development setup in a stale state.
-
-In practice, the most reliable recovery was:
-
-- restart the board
-- reconnect the serial session
-- reload the kernel through the UART boot flow
-
-This is a practical board-side debugging note rather than a claim that rebooting is part of the design.
-
-### Console output from multiple paths can interleave
-
-This kernel does not implement a full TTY or console-locking layer. As a result, shell prompts, timer callbacks, allocator logs, and UART demo output can appear on the same serial line and sometimes interleave at character granularity.
-
-That behavior affects how clean the console looks, but it does not change the core interrupt design. The nested-interrupt work was validated by checking both:
-
-- visible UART/timer interleaving in the demo
-- the internal trace from `demo trace`
+`g_regions` describes RAM; `g_reserves` records occupied ranges. Neither array
+is itself the memory it describes. Both are static kernel storage. Likewise,
+the `g_frame_array` pointer is static, but the metadata array it points to is
+allocated during startup and reserved before buddy initialization.
+
+The initramfs is a CPIO archive containing files, including user binaries. Its
+storage is reserved; a user binary is copied elsewhere before execution. UART
+and PLIC registers are MMIO, not allocator-managed RAM.
+
+#### Kernel image
+
+[`kernel/linker.ld`](kernel/linker.ld) places the board kernel at `0x20000000`
+and defines the image boundaries. [`boot.S`](kernel/src/boot.S) sets `sp` to
+`_stack_top` and clears `[__bss_start, __bss_end)` before calling `kernel_main()`.
+
+```text
+Higher addresses
+
+_phys_end = _stack_top
+             +--------------------------------------------+
+             | Boot stack: 16 KiB                         |
+             | Used by bootstrap kernel / shell execution |
+             | Grows toward lower addresses               |
+             +--------------------------------------------+
+             | Alignment padding, if needed               |
+__bss_end    +--------------------------------------------+
+             | .bss, including .sbss and COMMON           |
+             | Zero-initialized globals and static arrays |
+             | Includes secondary-hart stacks             |
+__bss_start  +--------------------------------------------+
+             | .data / .sdata: initialized writable data  |
+             +--------------------------------------------+
+             | .rodata / .srodata: constants              |
+             +--------------------------------------------+
+             | .text: kernel instructions                 |
+             | .text.boot is kept at the beginning        |
+_phys_start  +--------------------------------------------+
+0x20000000
+
+Lower addresses
+```
+
+Section sizes and alignment gaps depend on the linked build. The whole
+`[_phys_start, _phys_end)` range is reserved, including the boot stack.
+Compiler-generated small-data sections are grouped with their corresponding
+data sections in this diagram.
+
+The bootstrap shell later becomes the idle thread and keeps using the boot
+stack. Secondary harts use separate static 4 KiB stacks in `.bss`; they do not
+participate in the scheduler. Scheduling runs on the bootstrap hart.
+
+#### User image and per-task storage
+
+User programs are linked at `0x32000000`, converted from ELF to raw `.bin`
+files, and packed into initramfs. The
+[`shell loader`](kernel/src/shell.c) copies `bin/<name>.bin` into the fixed
+1 MiB window `[0x32000000, 0x32100000)`. The entry address is `0x32000000`;
+the window size is a loading limit, not the size of every program.
+
+Each scheduled user task has a separate control block, kernel stack, and user
+stack. Their addresses come from the allocator, not from a fixed per-process
+virtual memory map.
+
+```text
+Kernel-owned task resources                Shared user-image window
+
+Task A                                     0x32000000
++-- struct thread A                        +--------------------------+
++-- Kernel stack A: 4 KiB                  | One loaded raw image     |
++-- User stack A: 64 KiB                   | Entry at the window base |
+`-- user_entry --------------------------->|                          |
+                                           | Unused window capacity   |
+Task B                                     +--------------------------+
++-- struct thread B                        0x32100000 (exclusive end)
++-- Kernel stack B: 4 KiB
++-- User stack B: 64 KiB
+`-- user_entry ---------------------------> same image entry
+
+Resource relationships, not physical address order or separate address spaces.
+```
+
+Kernel-only worker threads have a control block and a 4 KiB kernel stack, but
+no user stack. All these allocations remain kernel-managed and are reclaimed
+after the thread exits, once it is no longer executing on its own stack.
+
+This is not an ELF process loader. It does not construct per-process text,
+data, BSS, heap, or TLS mappings. Loading another binary overwrites the shared
+image window. Also, `memory_init()` does not explicitly reserve that window;
+its fixed address alone does not protect it from allocator reuse.
+
+### Execution Contexts
+
+A `struct thread` is the scheduler's control block, not a register snapshot or
+a stack. It holds identity, state, queue links, stack addresses, and two
+different kinds of saved execution state.
+
+| State | Storage | Contents | Save / restore boundary |
+| --- | --- | --- | --- |
+| `thread_context` | Inline in `struct thread` | `ra`, `sp`, `s0`-`s11` (112 bytes) | Kernel function-call boundary in `switch_to()` |
+| `trap_context` | On a kernel stack | Slots for 31 integer registers and `sepc`, `sstatus`, `scause`, `stval` (280 bytes) | Trap entry and return; also seeded for first user entry |
+
+#### Control block and kernel stack
+
+[`struct thread`](kernel/include/thread.h) embeds `thread_context` as its first
+field, so assembly can use the thread pointer as the saved-context base.
+`tc` is a pointer into the user task's kernel stack, not another embedded
+context. User-origin traps use its top-of-stack slot; supervisor-origin traps
+allocate a context below the current kernel `sp`.
+
+```text
+struct thread (kernel allocation)
++----------------------------------------+
+| thread_context                         |  Inline; not on the kernel stack
+|   ra, sp, s0 ... s11                   |
++----------------------------------------+
+| pid, kind, state, entry, queue links   |
+| kstack_base, kstack_top                | --> Kernel stack allocation
+| user_stack_base, user_stack_top        | --> User stack allocation
+| tc                                     | --> Top-of-stack trap-context slot
++----------------------------------------+
+```
+
+For a newly created user task, let `K` be its kernel-stack base. The stack is
+4 KiB, and the 280-byte context occupies a 288-byte slot to preserve 16-byte
+stack alignment.
+
+```text
+Higher addresses
+
+K + 4096  +-----------------------------------------+  kstack_top
+          | Alignment padding: 8 bytes              |
+K + 4088  +-----------------------------------------+
+          | trap_context: 280 bytes                 |
+          | Integer register slots + four CSRs      |
+K + 3808  +-----------------------------------------+  tc
+          | Initial thread_context.sp points here   |
+          |                                         |
+          | Kernel call frames and local variables  |
+          | Stack grows toward lower addresses      |
+K         +-----------------------------------------+  kstack_base
+
+Lower addresses
+```
+
+The stack is working storage for kernel calls. The contexts are register
+snapshots. Neither snapshot is updated continuously as instructions execute.
+The diagram shows the initial user-task layout, not the position of every
+nested supervisor trap.
+
+#### Why two contexts
+
+[`switch_to()`](kernel/src/switch_to.S) is called by kernel code. It saves the
+callee-saved registers plus `ra` and `sp`, restores the next thread's values,
+sets `tp` to that thread, and returns into its saved kernel continuation.
+Caller-saved registers do not need a second copy at this function-call boundary.
+
+A trap can interrupt code between arbitrary instructions. Its context needs
+slots for caller-saved registers as well, plus the return PC and privilege
+state. The CPU supplies trap information in CSRs; assembly creates the memory
+snapshot. `trap_return()` restores `sepc`, `sstatus`, and the integer-register
+slots before executing `sret`. `scause` and `stval` are diagnostic fields, not
+restored execution state.
+
+```text
+Task A running in U-mode
+        |
+        | trap: switch to A's kernel stack and create trap_context
+        v
+Kernel handling A's trap
+        |
+        +-- No task switch --> trap_return() --> sret --> A in U-mode
+        |
+        `-- schedule() --> switch_to(A, B)
+                              |
+                              | Save A's kernel thread_context
+                              | Restore B's kernel thread_context
+                              v
+                         B's kernel continuation
+
+Later, when A is scheduled again:
+restore A's thread_context --> resume its kernel path
+                          --> trap_return() --> sret --> A in U-mode
+```
+
+A privilege transition is not necessarily a task switch. If A is suspended
+inside the trap handler, its trap context remains on A's kernel stack while
+`thread_context` records where its kernel execution should resume.
+
+#### First user entry and register convention
+
+[`thread_create_user()`](kernel/src/thread.c) builds both initial contexts:
+
+- `thread_context.ra = thread_bootstrap`; `thread_context.sp = kstack_top - 288`.
+- `tc->sp = user_stack_top`; `tc->tp = thread`; `tc->sepc = user_entry`.
+- The initial trap context is zeroed, so `sstatus.SPP = 0` selects U-mode.
+
+The first switch follows this path without requiring a previous user trap:
+
+```text
+switch_to() -> thread_bootstrap() -> user_task_entry()
+            -> trap_return(tc) -> sret -> user entry
+```
+
+In this kernel, `tp` points to the current `struct thread` in both U-mode and
+S-mode; user TLS is not implemented. While a task runs in U-mode, `sp` points
+into its user stack and `sscratch` holds its kernel-stack top. On a user-origin
+trap, `csrrw sp, sscratch, sp` switches stacks and retains the interrupted user
+`sp` for the snapshot. A supervisor-origin trap keeps the current kernel stack.
+
+Current register-preservation limitation: in
+[`trap_entry.S`](kernel/src/trap_entry.S), the entry path uses `t0` before saving
+it, and the return path reuses `t1` after restoring it. The original `t0` and
+`t1` values therefore are not fully preserved across traps. The context layout
+above describes the storage format, not complete trap-register preservation.
