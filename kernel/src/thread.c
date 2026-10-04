@@ -227,20 +227,20 @@ void thread_init(void)
     g_rq.idle = 0;
     g_zombie_head = 0;
 
-    g_boot_idle_thread.ctx.ra = 0;
-    g_boot_idle_thread.ctx.sp = 0;
-    g_boot_idle_thread.ctx.s0 = 0;
-    g_boot_idle_thread.ctx.s1 = 0;
-    g_boot_idle_thread.ctx.s2 = 0;
-    g_boot_idle_thread.ctx.s3 = 0;
-    g_boot_idle_thread.ctx.s4 = 0;
-    g_boot_idle_thread.ctx.s5 = 0;
-    g_boot_idle_thread.ctx.s6 = 0;
-    g_boot_idle_thread.ctx.s7 = 0;
-    g_boot_idle_thread.ctx.s8 = 0;
-    g_boot_idle_thread.ctx.s9 = 0;
-    g_boot_idle_thread.ctx.s10 = 0;
-    g_boot_idle_thread.ctx.s11 = 0;
+    g_boot_idle_thread.thread_context.ra = 0;
+    g_boot_idle_thread.thread_context.sp = 0;
+    g_boot_idle_thread.thread_context.s0 = 0;
+    g_boot_idle_thread.thread_context.s1 = 0;
+    g_boot_idle_thread.thread_context.s2 = 0;
+    g_boot_idle_thread.thread_context.s3 = 0;
+    g_boot_idle_thread.thread_context.s4 = 0;
+    g_boot_idle_thread.thread_context.s5 = 0;
+    g_boot_idle_thread.thread_context.s6 = 0;
+    g_boot_idle_thread.thread_context.s7 = 0;
+    g_boot_idle_thread.thread_context.s8 = 0;
+    g_boot_idle_thread.thread_context.s9 = 0;
+    g_boot_idle_thread.thread_context.s10 = 0;
+    g_boot_idle_thread.thread_context.s11 = 0;
     g_boot_idle_thread.pid = 0;
     g_boot_idle_thread.kind = THREAD_KERNEL;
     g_boot_idle_thread.state = THREAD_RUNNING;
@@ -256,7 +256,7 @@ void thread_init(void)
     g_boot_idle_thread.user_stack_base = 0;
     g_boot_idle_thread.user_stack_top = 0;
     g_boot_idle_thread.exit_status = 0;
-    g_boot_idle_thread.tf = 0;
+    g_boot_idle_thread.tc = 0;
 
     g_thread_current = 0;
     g_all_threads = 0;
@@ -271,7 +271,7 @@ void thread_init(void)
  * This is the key "do not overbuild it" step for the first version: instead
  * of manufacturing a separate bootstrap stack, the existing shell context
  * becomes the idle thread. Its saved context is still empty here; the first
- * switch away from idle will naturally populate ctx.ra/sp/s0-s11.
+ * switch away from idle will naturally populate thread_context.ra/sp/s0-s11.
  */
 void thread_system_bootstrap_init(void)
 {
@@ -296,8 +296,8 @@ void thread_system_bootstrap_init(void)
  *
  * A brand-new thread has never executed before, so thread_create() must build
  * the first saved context image by hand:
- * - ctx.sp starts at the top of the new kernel stack
- * - ctx.ra starts at thread_bootstrap()
+ * - thread_context.sp starts at the top of the new kernel stack
+ * - thread_context.ra starts at thread_bootstrap()
  *
  * After that, the scheduler can switch to the worker exactly like any other
  * saved context.
@@ -326,20 +326,20 @@ int thread_create(void (*entry)(void *arg), void *arg, int is_idle)
     top = (uint64_t)(uintptr_t)th->kstack_base + THREAD_STACK_SIZE;
     top &= ~0xFUL;
 
-    th->ctx.ra = (uint64_t)(uintptr_t)thread_bootstrap;
-    th->ctx.sp = top;
-    th->ctx.s0 = 0;
-    th->ctx.s1 = 0;
-    th->ctx.s2 = 0;
-    th->ctx.s3 = 0;
-    th->ctx.s4 = 0;
-    th->ctx.s5 = 0;
-    th->ctx.s6 = 0;
-    th->ctx.s7 = 0;
-    th->ctx.s8 = 0;
-    th->ctx.s9 = 0;
-    th->ctx.s10 = 0;
-    th->ctx.s11 = 0;
+    th->thread_context.ra = (uint64_t)(uintptr_t)thread_bootstrap;
+    th->thread_context.sp = top;
+    th->thread_context.s0 = 0;
+    th->thread_context.s1 = 0;
+    th->thread_context.s2 = 0;
+    th->thread_context.s3 = 0;
+    th->thread_context.s4 = 0;
+    th->thread_context.s5 = 0;
+    th->thread_context.s6 = 0;
+    th->thread_context.s7 = 0;
+    th->thread_context.s8 = 0;
+    th->thread_context.s9 = 0;
+    th->thread_context.s10 = 0;
+    th->thread_context.s11 = 0;
 
     sstatus = thread_irq_save();
     th->pid = g_next_tid++;
@@ -357,7 +357,7 @@ int thread_create(void (*entry)(void *arg), void *arg, int is_idle)
     th->user_stack_base = 0;
     th->user_stack_top = 0;
     th->exit_status = 0;
-    th->tf = 0;
+    th->tc = 0;
 
     thread_list_add(th);
     runq_push(th);
@@ -365,7 +365,7 @@ int thread_create(void (*entry)(void *arg), void *arg, int is_idle)
 }
 
 /* First BE2 scaffolding: allocate a schedulable entity that will later own a
- * user trapframe and return to U-mode. This does not yet replace the old
+ * user trap_context and return to U-mode. This does not yet replace the old
  * singleton runu path; it only gives the scheduler a per-task container for
  * user-mode state.
  */
@@ -395,23 +395,23 @@ int thread_create_user(uintptr_t user_entry, uintptr_t user_stack_base, uintptr_
     top = (uint64_t)(uintptr_t)th->kstack_base + THREAD_STACK_SIZE;
     top &= ~0xFUL;
 
-    th->ctx.ra = (uint64_t)(uintptr_t)thread_bootstrap;
-    /* Keep the top-of-kstack trapframe slot untouched until the first
+    th->thread_context.ra = (uint64_t)(uintptr_t)thread_bootstrap;
+    /* Keep the top-of-kstack trap_context slot untouched until the first
      * U-mode entry. The user bootstrap call chain runs just below it.
      */
-    th->ctx.sp = top - TRAPFRAME_ALLOC_SIZE;
-    th->ctx.s0 = 0;
-    th->ctx.s1 = 0;
-    th->ctx.s2 = 0;
-    th->ctx.s3 = 0;
-    th->ctx.s4 = 0;
-    th->ctx.s5 = 0;
-    th->ctx.s6 = 0;
-    th->ctx.s7 = 0;
-    th->ctx.s8 = 0;
-    th->ctx.s9 = 0;
-    th->ctx.s10 = 0;
-    th->ctx.s11 = 0;
+    th->thread_context.sp = top - TRAP_CONTEXT_ALLOC_SIZE;
+    th->thread_context.s0 = 0;
+    th->thread_context.s1 = 0;
+    th->thread_context.s2 = 0;
+    th->thread_context.s3 = 0;
+    th->thread_context.s4 = 0;
+    th->thread_context.s5 = 0;
+    th->thread_context.s6 = 0;
+    th->thread_context.s7 = 0;
+    th->thread_context.s8 = 0;
+    th->thread_context.s9 = 0;
+    th->thread_context.s10 = 0;
+    th->thread_context.s11 = 0;
 
     sstatus = thread_irq_save();
     th->pid = g_next_tid++;
@@ -429,19 +429,19 @@ int thread_create_user(uintptr_t user_entry, uintptr_t user_stack_base, uintptr_
     th->user_stack_base = user_stack_base;
     th->user_stack_top = user_stack_top;
     th->exit_status = 0;
-    th->tf = (struct trapframe *)(uintptr_t)(top - TRAPFRAME_ALLOC_SIZE);
+    th->tc = (struct trap_context *)(uintptr_t)(top - TRAP_CONTEXT_ALLOC_SIZE);
 
-    raw = (uint64_t *)th->tf;
-    for (i = 0; i < (sizeof(*th->tf) / sizeof(uint64_t)); i++) {
+    raw = (uint64_t *)th->tc;
+    for (i = 0; i < (sizeof(*th->tc) / sizeof(uint64_t)); i++) {
         raw[i] = 0;
     }
-    th->tf->sp = th->user_stack_top;
+    th->tc->sp = th->user_stack_top;
     /* Keep the current-task pointer live across the first U-mode entry so a
      * later trap from U-mode can still identify which schedulable user task
      * owns the fault/syscall.
      */
-    th->tf->tp = (uint64_t)(uintptr_t)th;
-    th->tf->sepc = th->user_entry;
+    th->tc->tp = (uint64_t)(uintptr_t)th;
+    th->tc->sepc = th->user_entry;
 
     thread_list_add(th);
     runq_push(th);

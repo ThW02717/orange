@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-struct trapframe;
+struct trap_context;
 
 /* First cooperative-thread version:
  * - single hart only
@@ -25,11 +25,9 @@ enum thread_state {
     THREAD_ZOMBIE,
 };
 
-/* Context saved across cooperative thread switches.
- *
- * This first version only needs callee-saved registers plus ra/sp because
- * threads switch explicitly through the scheduler instead of being preempted
- * from an arbitrary instruction by a timer interrupt.
+/* Kernel execution context saved/restored by switch_to().
+ * Save callee-saved registers plus ra/sp at the function-call boundary.
+ * Registers interrupted by a trap are saved separately in trap_context.
  */
 struct thread_context {
     uint64_t ra;
@@ -50,12 +48,12 @@ struct thread_context {
 
 /* Thread control block.
  *
- * Keep ctx first so a later switch_to.S implementation can treat a
+ * Keep thread_context first so switch_to.S can treat a
  * `struct thread *` as the base address of the saved context without adding
  * another offset in assembly.
  */
 struct thread {
-    struct thread_context ctx; /* thread* can be used as ctx base */
+    struct thread_context thread_context; /* first field: assembly context base */
     int32_t pid;
     enum thread_kind kind;
     enum thread_state state;
@@ -80,7 +78,7 @@ struct thread {
     uintptr_t user_stack_base;
     uintptr_t user_stack_top;
     int exit_status;
-    struct trapframe *tf;
+    struct trap_context *tc; /* points into this thread's kernel stack */
 };
 
 /* Minimal API for the first cooperative-only scheduler milestone. */

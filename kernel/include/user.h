@@ -6,7 +6,7 @@
 void enter_user_mode(void);
 void user_task_entry(void *arg);
 
-void user_reset_trapframe(struct thread *task);
+void user_reset_trap_context(struct thread *task);
 void user_mark_exit(void);
 int user_has_exited(void);
 void user_schedule_after_exit(void);

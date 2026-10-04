@@ -9,21 +9,21 @@
  * The old Basic Exercise 1 path used one global user stack and one global
  * "user exited" flag. The new path starts from the currently scheduled task
  * instead: each schedulable user task owns its own kernel stack and its own
- * trapframe location on that stack.
+ * trap_context location on that stack.
  */
 
-void user_reset_trapframe(struct thread *task)
+void user_reset_trap_context(struct thread *task)
 {
     uint64_t sstatus;
     unsigned int i;
     uint64_t *raw;
 
-    if (task == 0 || task->tf == 0) {
+    if (task == 0 || task->tc == 0) {
         return;
     }
 
-    raw = (uint64_t *)task->tf;
-    for (i = 0; i < (sizeof(*task->tf) / sizeof(uint64_t)); i++) {
+    raw = (uint64_t *)task->tc;
+    for (i = 0; i < (sizeof(*task->tc) / sizeof(uint64_t)); i++) {
         raw[i] = 0;
     }
 
@@ -31,10 +31,10 @@ void user_reset_trapframe(struct thread *task)
     sstatus &= ~SSTATUS_SPP;
     sstatus |= SSTATUS_SPIE;
 
-    task->tf->sp = task->user_stack_top;
-    task->tf->tp = (uint64_t)(uintptr_t)task;
-    task->tf->sepc = task->user_entry;
-    task->tf->sstatus = sstatus;
+    task->tc->sp = task->user_stack_top;
+    task->tc->tp = (uint64_t)(uintptr_t)task;
+    task->tc->sepc = task->user_entry;
+    task->tc->sstatus = sstatus;
 }
 
 static void user_enter_current_task(void)
@@ -42,7 +42,7 @@ static void user_enter_current_task(void)
     struct thread *task;
 
     task = thread_current();
-    if (task == 0 || task->kind != THREAD_USER || task->tf == 0) {
+    if (task == 0 || task->kind != THREAD_USER || task->tc == 0) {
         uart_send_string("[user] no current user task\n");
         for (;;) {
             asm volatile("wfi");
@@ -50,7 +50,7 @@ static void user_enter_current_task(void)
     }
 
     trap_init();
-    trap_return(task->tf);
+    trap_return(task->tc);
 
     for (;;) {
         asm volatile("wfi");

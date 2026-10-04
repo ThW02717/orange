@@ -13,14 +13,14 @@
  * classifies the trap and dispatches to the appropriate handler or ISR.
  */
 
-static void trap_print_tf(const struct trapframe *tf)
+static void trap_print_tc(const struct trap_context *tc)
 {
     uart_send_string("[trap] scause=");
-    uart_send_hex((unsigned long)tf->scause);
+    uart_send_hex((unsigned long)tc->scause);
     uart_send_string(" sepc=");
-    uart_send_hex((unsigned long)tf->sepc);
+    uart_send_hex((unsigned long)tc->sepc);
     uart_send_string(" stval=");
-    uart_send_hex((unsigned long)tf->stval);
+    uart_send_hex((unsigned long)tc->stval);
     uart_send_string("\n");
 }
 
@@ -112,7 +112,7 @@ static long sys_uart_read(char *buf, long count)
     return count;
 }
 
-static long sys_exec(const char *path, struct trapframe *tf)
+static long sys_exec(const char *path, struct trap_context *tc)
 {
     struct thread *task = current_user_task();
     char name[64];
@@ -120,7 +120,7 @@ static long sys_exec(const char *path, struct trapframe *tf)
     unsigned long size;
     unsigned int i = 0;
 
-    if (task == 0 || tf == 0 || path == 0) {
+    if (task == 0 || tc == 0 || path == 0) {
         return -1;
     }
     while (i + 1U < sizeof(name)) {
@@ -146,12 +146,12 @@ static long sys_exec(const char *path, struct trapframe *tf)
 
     task->user_entry = entry;
     (void)size;
-    user_reset_trapframe(task);
-    tf->a0 = 0;
+    user_reset_trap_context(task);
+    tc->a0 = 0;
     return 1;
 }
 
-static long sys_fork(struct trapframe *parent_tf)
+static long sys_fork(struct trap_context *parent_tc)
 {
     struct thread *parent = current_user_task();
     struct thread *child;
@@ -161,11 +161,11 @@ static long sys_fork(struct trapframe *parent_tf)
     uintptr_t child_sp;
     uint64_t stack_off;
     unsigned int i;
-    uint64_t *dst_tf_words;
-    const uint64_t *src_tf_words;
+    uint64_t *dst_tc_words;
+    const uint64_t *src_tc_words;
     int child_pid;
 
-    if (parent == 0 || parent_tf == 0) {
+    if (parent == 0 || parent_tc == 0) {
         return -1;
     }
 
@@ -203,21 +203,21 @@ static long sys_fork(struct trapframe *parent_tf)
     }
 
     child = thread_find_by_pid(child_pid);
-    if (child == 0 || child->tf == 0) {
+    if (child == 0 || child->tc == 0) {
         thread_stop_pid(child_pid, -1);
         return -1;
     }
 
-    dst_tf_words = (uint64_t *)child->tf;
-    src_tf_words = (const uint64_t *)parent_tf;
-    for (i = 0; i < (sizeof(*child->tf) / sizeof(uint64_t)); i++) {
-        dst_tf_words[i] = src_tf_words[i];
+    dst_tc_words = (uint64_t *)child->tc;
+    src_tc_words = (const uint64_t *)parent_tc;
+    for (i = 0; i < (sizeof(*child->tc) / sizeof(uint64_t)); i++) {
+        dst_tc_words[i] = src_tc_words[i];
     }
-    child->tf->tp = (uint64_t)(uintptr_t)child;
-    child->tf->a0 = 0;
-    child->tf->sepc += 4;
+    child->tc->tp = (uint64_t)(uintptr_t)child;
+    child->tc->a0 = 0;
+    child->tc->sepc += 4;
 
-    parent_sp = (uintptr_t)parent_tf->sp;
+    parent_sp = (uintptr_t)parent_tc->sp;
     if (parent_sp < parent->user_stack_base || parent_sp > parent->user_stack_top) {
         thread_stop_pid(child_pid, -1);
         return -1;
@@ -225,7 +225,7 @@ static long sys_fork(struct trapframe *parent_tf)
 
     stack_off = (uint64_t)(parent_sp - parent->user_stack_base);
     child_sp = child->user_stack_base + stack_off;
-    child->tf->sp = child_sp;
+    child->tc->sp = child_sp;
 
     /* Any saved GPR that still points into the parent's user stack must be
      * remapped to the corresponding address in the child's private stack.
@@ -234,9 +234,9 @@ static long sys_fork(struct trapframe *parent_tf)
      */
 #define REMAP_STACK_FIELD(field)                                                     \
     do {                                                                             \
-        uintptr_t v__ = (uintptr_t)child->tf->field;                                 \
+        uintptr_t v__ = (uintptr_t)child->tc->field;                                 \
         if (v__ >= parent->user_stack_base && v__ <= parent->user_stack_top) {       \
-            child->tf->field = child->user_stack_base +                              \
+            child->tc->field = child->user_stack_base +                              \
                                (uint64_t)(v__ - parent->user_stack_base);            \
         }                                                                            \
     } while (0)
@@ -288,37 +288,37 @@ void trap_init(void)
     asm volatile("csrw stvec, %0" : : "r"(trap_entry));
 }
 
-void handle_user_ecall(struct trapframe *tf)
+void handle_user_ecall(struct trap_context *tc)
 {
     long ret = -1;
     int exec_reset = 0;
 
-    switch (tf->a7) {
+    switch (tc->a7) {
     case SYS_getpid:
         ret = sys_getpid();
         break;
     case SYS_uart_read:
-        ret = sys_uart_read((char *)(uintptr_t)tf->a0, (long)tf->a1);
+        ret = sys_uart_read((char *)(uintptr_t)tc->a0, (long)tc->a1);
         break;
     case SYS_uart_write:
-        ret = sys_uart_write((const char *)(uintptr_t)tf->a0, (long)tf->a1);
+        ret = sys_uart_write((const char *)(uintptr_t)tc->a0, (long)tc->a1);
         break;
     case SYS_exec:
-        ret = sys_exec((const char *)(uintptr_t)tf->a0, tf);
+        ret = sys_exec((const char *)(uintptr_t)tc->a0, tc);
         if (ret >= 0) {
             exec_reset = 1;
             ret = 0;
         }
         break;
     case SYS_fork:
-        ret = sys_fork(tf);
+        ret = sys_fork(tc);
         break;
     case SYS_exit:
-        thread_mark_current_zombie((int)tf->a0);
+        thread_mark_current_zombie((int)tc->a0);
         return;
     case SYS_stop:
-        ret = sys_stop((long)tf->a0);
-        if (ret == 0 && (long)tf->a0 == (long)sys_getpid()) {
+        ret = sys_stop((long)tc->a0);
+        if (ret == 0 && (long)tc->a0 == (long)sys_getpid()) {
             return;
         }
         break;
@@ -327,15 +327,15 @@ void handle_user_ecall(struct trapframe *tf)
         break;
     }
 
-    tf->a0 = (uint64_t)ret;
+    tc->a0 = (uint64_t)ret;
     if (!exec_reset) {
-        tf->sepc += 4;
+        tc->sepc += 4;
     }
 }
 
-void handle_user_fault(struct trapframe *tf)
+void handle_user_fault(struct trap_context *tc)
 {
-    trap_print_tf(tf);
+    trap_print_tc(tc);
     uart_send_string("[trap] user fault, terminate\n");
     /* Force trap_entry.S to abandon the current user context and re-enter
      * the shell instead of restoring the faulting user state.
@@ -343,15 +343,15 @@ void handle_user_fault(struct trapframe *tf)
     user_mark_exit();
 }
 
-void trap_dispatch(struct trapframe *tf)
+void trap_dispatch(struct trap_context *tc)
 {
-    if (tf == 0) {
-        uart_send_string("[trap] null trapframe\n");
+    if (tc == 0) {
+        uart_send_string("[trap] null trap_context\n");
         return;
     }
 
-    if (trap_is_interrupt(tf->scause)) {
-        if (trap_scause_code(tf->scause) == SCAUSE_S_TIMER_INT) {
+    if (trap_is_interrupt(tc->scause)) {
+        if (trap_scause_code(tc->scause) == SCAUSE_S_TIMER_INT) {
             timer_irq_top();
             if (current_user_task() != 0 && thread_has_runnable_tasks()) {
                 thread_request_resched();
@@ -359,7 +359,7 @@ void trap_dispatch(struct trapframe *tf)
             return;
         }
 
-        if (trap_scause_code(tf->scause) == SCAUSE_S_EXT_INT) {
+        if (trap_scause_code(tc->scause) == SCAUSE_S_EXT_INT) {
             uint32_t irq;
 
             irq = plic_claim();
@@ -374,17 +374,17 @@ void trap_dispatch(struct trapframe *tf)
         }
 
         uart_send_string("[trap] unhandled interrupt\n");
-        trap_print_tf(tf);
+        trap_print_tc(tc);
         return;
     }
 
     /* Basic Exercise 1 only expects U-mode ecall plus a generic user fault
      * fallback for every other exception.
      */
-    if (trap_scause_code(tf->scause) == SCAUSE_U_ECALL) {
-        handle_user_ecall(tf);
+    if (trap_scause_code(tc->scause) == SCAUSE_U_ECALL) {
+        handle_user_ecall(tc);
         return;
     }
 
-    handle_user_fault(tf);
+    handle_user_fault(tc);
 }

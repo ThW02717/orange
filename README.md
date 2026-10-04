@@ -123,7 +123,7 @@ The kernel uses one shared supervisor trap path:
 
 - `stvec -> trap_entry -> trap_dispatch()`
 
-`trap_entry.S` saves the interrupted context, switches to the kernel stack when needed, and enters the C dispatcher. `trap_return` restores the trapframe and finishes with `sret`.
+`trap_entry.S` saves the interrupted context, switches to the kernel stack when needed, and enters the C dispatcher. `trap_return` restores the `trap_context` and finishes with `sret`.
 
 At a high level, the trap system is organized as:
 
@@ -266,17 +266,17 @@ This codebase now has one scheduler substrate that carries both:
 - cooperative kernel threads from the Basic Exercise 1 work
 - schedulable user processes for Basic Exercise 2
 
-The key design decision is that the scheduler context and the trapframe are
+The key design decision is that the scheduler context and the `trap_context` are
 separate:
 
-- `struct thread_context` is the kernel-side saved context used by `switch_to()`
-- `struct trapframe` is the user-side saved context used at the U-mode/S-mode boundary
+- `struct thread_context`, stored in `th->thread_context`, is the kernel-side saved context used by `switch_to()`
+- `struct trap_context`, accessed through `th->tc`, saves the interrupted registers and CSR state for trap entry/return
 
 So a user process is represented as:
 
 - one schedulable `struct thread`
 - one kernel stack
-- one trapframe at the top of that kernel stack
+- one `trap_context` at the top of that kernel stack
 - one private user stack
 - one user entry PC in the shared user-code window
 
@@ -328,9 +328,9 @@ The current user-process path is:
 2. copy it to the fixed user-code window at `USER_CODE_BASE`
 3. execute `fence.i` so the CPU does not reuse stale instructions
 4. allocate a private user stack
-5. create a `THREAD_USER` task with its own kernel stack and trapframe
+5. create a `THREAD_USER` task with its own kernel stack and `trap_context`
 6. enqueue it on the run queue
-7. schedule it, prepare its trapframe, and return to U-mode with `sret`
+7. schedule it, prepare its `trap_context`, and return to U-mode with `sret`
 
 The system-call ABI follows the RISC-V `ecall` convention:
 
@@ -366,7 +366,7 @@ The implementation currently does:
 1. allocate a new child task
 2. allocate a new child kernel stack and a new child user stack
 3. copy the parent's user stack into the child stack
-4. copy the parent's trapframe into the child trapframe
+4. copy the parent's `trap_context` into the child's `trap_context`
 5. set child `a0 = 0`
 6. return child pid to the parent
 7. remap all saved values that still point into the parent's user stack so they
@@ -454,7 +454,7 @@ The root cause was that the compiler addressed the local variable through the
 frame pointer `s0`, and the saved child state still held a parent-stack frame
 base. The fix was to remap:
 
-- trapframe register values that fell inside the parent stack range
+- `trap_context` register values that fell inside the parent stack range
 - copied stack words that still pointed back into the parent stack
 
 This was validated by `demo fork`, where parent, child1, and child2 now all

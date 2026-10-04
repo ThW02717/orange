@@ -62,14 +62,14 @@
 #define USER_CODE_LIMIT        (USER_CODE_BASE + USER_CODE_SIZE)
 #define USER_STACK_BASE        (USER_STACK_TOP - USER_STACK_SIZE)
 
-/* Fixed trap save area shared by trap_entry.S and trap.c.
+/* Fixed trap context layout shared by trap_entry.S and trap.c.
  * General registers capture the interrupted CPU context.
  * sepc    : PC of the trapped instruction / return target for sret
  * sstatus : privilege and interrupt state restored by sret
  * scause  : trap reason reported by hardware
  * stval   : extra fault information supplied by hardware
  */
-struct trapframe {
+struct trap_context {
     uint64_t ra;
     uint64_t sp;
     uint64_t gp;
@@ -107,52 +107,52 @@ struct trapframe {
     uint64_t stval;
 };
 
-#define TF_RA                0UL
-#define TF_SP                8UL
-#define TF_GP                16UL
-#define TF_TP                24UL
-#define TF_T0                32UL
-#define TF_T1                40UL
-#define TF_T2                48UL
-#define TF_S0                56UL
-#define TF_S1                64UL
-#define TF_A0                72UL
-#define TF_A1                80UL
-#define TF_A2                88UL
-#define TF_A3                96UL
-#define TF_A4                104UL
-#define TF_A5                112UL
-#define TF_A6                120UL
-#define TF_A7                128UL
-#define TF_S2                136UL
-#define TF_S3                144UL
-#define TF_S4                152UL
-#define TF_S5                160UL
-#define TF_S6                168UL
-#define TF_S7                176UL
-#define TF_S8                184UL
-#define TF_S9                192UL
-#define TF_S10               200UL
-#define TF_S11               208UL
-#define TF_T3                216UL
-#define TF_T4                224UL
-#define TF_T5                232UL
-#define TF_T6                240UL
-#define TF_SEPC              248UL
-#define TF_SSTATUS           256UL
-#define TF_SCAUSE            264UL
-#define TF_STVAL             272UL
+#define TC_RA                0UL
+#define TC_SP                8UL
+#define TC_GP                16UL
+#define TC_TP                24UL
+#define TC_T0                32UL
+#define TC_T1                40UL
+#define TC_T2                48UL
+#define TC_S0                56UL
+#define TC_S1                64UL
+#define TC_A0                72UL
+#define TC_A1                80UL
+#define TC_A2                88UL
+#define TC_A3                96UL
+#define TC_A4                104UL
+#define TC_A5                112UL
+#define TC_A6                120UL
+#define TC_A7                128UL
+#define TC_S2                136UL
+#define TC_S3                144UL
+#define TC_S4                152UL
+#define TC_S5                160UL
+#define TC_S6                168UL
+#define TC_S7                176UL
+#define TC_S8                184UL
+#define TC_S9                192UL
+#define TC_S10               200UL
+#define TC_S11               208UL
+#define TC_T3                216UL
+#define TC_T4                224UL
+#define TC_T5                232UL
+#define TC_T6                240UL
+#define TC_SEPC              248UL
+#define TC_SSTATUS           256UL
+#define TC_SCAUSE            264UL
+#define TC_STVAL             272UL
 
-#define TRAPFRAME_SIZE         ((uint64_t)sizeof(struct trapframe))
-#define TRAPFRAME_ALLOC_SIZE   ((TRAPFRAME_SIZE + 15UL) & ~15UL)
+#define TRAP_CONTEXT_SIZE         ((uint64_t)sizeof(struct trap_context))
+#define TRAP_CONTEXT_ALLOC_SIZE   ((TRAP_CONTEXT_SIZE + 15UL) & ~15UL)
 
 extern void trap_entry(void);
-extern void trap_return(struct trapframe *tf);
+extern void trap_return(struct trap_context *tc);
 
 void trap_init(void);
-void trap_dispatch(struct trapframe *tf);
-void handle_user_ecall(struct trapframe *tf);
-void handle_user_fault(struct trapframe *tf);
+void trap_dispatch(struct trap_context *tc);
+void handle_user_ecall(struct trap_context *tc);
+void handle_user_fault(struct trap_context *tc);
 
 static inline uint64_t trap_scause_code(uint64_t scause)
 {

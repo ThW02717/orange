@@ -6,7 +6,7 @@
  * a0 = prev thread pointer
  * a1 = next thread pointer
  *
- * Because `struct thread_context` is the first field of `struct thread`,
+ * Because the `thread_context` field is first in `struct thread`,
  * each thread pointer can be used directly as the base address of the saved
  * context image:
  *
@@ -16,9 +16,9 @@
  *   ...
  *   104 -> s11
  *
- * This first version only saves/restores ra, sp, and s0-s11 because the
- * scheduler is cooperative. Caller-saved registers are not preserved across
- * switch_to(), just like an ordinary function call boundary.
+ * This kernel switch context saves/restores ra, sp, and s0-s11 at the
+ * function-call boundary. Caller-saved registers are not preserved across
+ * switch_to(); interrupted registers are saved separately in trap_context.
  */
 switch_to:
     sd ra,   0(a0)
