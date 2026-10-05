@@ -197,7 +197,7 @@ Caller-saved registers do not need a second copy at this function-call boundary.
 
 A trap can interrupt code between arbitrary instructions. Its context needs
 slots for caller-saved registers as well, plus the return PC and privilege
-state. The CPU supplies trap information in CSRs; assembly creates the memory
+state. The CPU records trap information in CSRs; assembly creates the memory
 snapshot. `trap_return()` restores `sepc`, `sstatus`, and the integer-register
 slots before executing `sret`. `scause` and `stval` are diagnostic fields, not
 restored execution state.
@@ -227,6 +227,58 @@ A privilege transition is not necessarily a task switch. If A is suspended
 inside the trap handler, its trap context remains on A's kernel stack while
 `thread_context` records where its kernel execution should resume.
 
+#### Trap entry: save the interrupted state
+
+After selecting the kernel stack and subtracting 288 from `sp`,
+[`trap_entry`](kernel/src/trap_entry.S) uses `sp` as the base of the new
+`trap_context`. Each `sd` stores one 64-bit register at a fixed byte offset.
+For example, `sd ra, TC_RA(sp)` stores `ra` at offset 0, while
+`sd gp, TC_GP(sp)` stores `gp` at offset 16. The `TC_*` offsets in
+[`trap.h`](kernel/include/trap.h) match the offsets in the assembly file.
+
+The interrupted `sp` needs special handling because the live `sp` now points
+to the new frame. For a U-mode trap, the earlier `csrrw sp, sscratch, sp` put
+the user `sp` in `sscratch`, so entry copies that value into `TC_SP`. For an
+S-mode trap, entry derives the old kernel `sp` as the frame base plus 288.
+
+```text
+Higher addresses
+
+frame base + 288   Previous kernel sp / kernel-stack top
+frame base + 280   +--------------------------------------+
+                   | 8 bytes of alignment padding        |
+frame base + 272   +--------------------------------------+
+                   | stval                                |
+frame base + 264   | scause                               |
+frame base + 256   | sstatus                              |
+frame base + 248   | sepc                                 |
+frame base + 240   | t6                                   |
+frame base + 216   | t3 ... t5                            |
+frame base + 136   | s2 ... s11                           |
+frame base + 72    | a0 ... a7                            |
+frame base + 56    | s0, s1                               |
+frame base + 32    | t0, t1, t2                           |
+frame base + 24    | tp                                   |
+frame base + 16    | gp                                   |
+frame base + 8     | interrupted sp                       |
+frame base + 0     | ra                     <-- tc == sp  |
+                   +--------------------------------------+
+
+Lower addresses
+```
+
+The hardware updates trap CSRs such as `sepc`, `scause`, and the relevant
+`sstatus` fields. The assembly reads those CSRs and copies their values into
+the frame; it saves general-purpose registers itself. It then passes the frame
+pointer in `a0` to `trap_dispatch(tc)`. `x0` has no slot because it always reads
+as zero.
+
+There is a register-preservation bug in the current entry/return code: entry
+uses `t0` to inspect `sstatus` before saving `t0`, and return reuses `t1` after
+restoring it. Those original values are not preserved across a trap. The frame
+format shows the intended slots; it does not imply that every value currently
+survives the round trip.
+
 #### First user entry and register convention
 
 [`thread_create_user()`](kernel/src/thread.c) builds both initial contexts:
@@ -247,9 +299,3 @@ S-mode; user TLS is not implemented. While a task runs in U-mode, `sp` points
 into its user stack and `sscratch` holds its kernel-stack top. On a user-origin
 trap, `csrrw sp, sscratch, sp` switches stacks and retains the interrupted user
 `sp` for the snapshot. A supervisor-origin trap keeps the current kernel stack.
-
-Current register-preservation limitation: in
-[`trap_entry.S`](kernel/src/trap_entry.S), the entry path uses `t0` before saving
-it, and the return path reuses `t1` after restoring it. The original `t0` and
-`t1` values therefore are not fully preserved across traps. The context layout
-above describes the storage format, not complete trap-register preservation.
