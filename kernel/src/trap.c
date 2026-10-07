@@ -83,15 +83,14 @@ static long sys_uart_write(const char *buf, long count)
     if (!user_range_ok(task, (uintptr_t)buf, (uint64_t)count, 0)) {
         return -1;
     }
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    asm volatile("csrc sstatus, %0" : : "r"(SSTATUS_SIE));
+    asm volatile("csrrc %0, sstatus, %1" : "=r"(sstatus) : "r"(SSTATUS_SIE) : "memory");
     for (i = 0; i < count; i++) {
         if (buf[i] == '\n') {
             uart_send('\r');
         }
         uart_send(buf[i]);
     }
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
+    asm volatile("csrw sstatus, %0" : : "r"(sstatus) : "memory");
     return count;
 }
 
@@ -119,6 +118,7 @@ static long sys_exec(const char *path, struct trap_context *tc)
     uintptr_t entry;
     unsigned long size;
     unsigned int i = 0;
+    int terminated = 0;
 
     if (task == 0 || tc == 0 || path == 0) {
         return -1;
@@ -132,12 +132,13 @@ static long sys_exec(const char *path, struct trap_context *tc)
         c = path[i];
         name[i] = c;
         if (c == '\0') {
+            terminated = 1;
             break;
         }
         i++;
     }
     name[sizeof(name) - 1U] = '\0';
-    if (name[0] == '\0') {
+    if (!terminated || name[0] == '\0') {
         return -1;
     }
     if (shell_load_user_program_named(name, &entry, &size) != 0) {
@@ -276,7 +277,7 @@ static long sys_fork(struct trap_context *parent_tc)
 
 static long sys_stop(long pid)
 {
-    if (pid < 0) {
+    if (pid <= 0 || pid > INT32_MAX) {
         return -1;
     }
     return thread_stop_pid((int32_t)pid, 0);
@@ -286,6 +287,7 @@ void trap_init(void)
 {
     /* All supervisor traps currently enter through one common assembly stub. */
     asm volatile("csrw stvec, %0" : : "r"(trap_entry));
+    asm volatile("csrw sscratch, zero");
 }
 
 void handle_user_ecall(struct trap_context *tc)
@@ -337,9 +339,7 @@ void handle_user_fault(struct trap_context *tc)
 {
     trap_print_tc(tc);
     uart_send_string("[trap] user fault, terminate\n");
-    /* Force trap_entry.S to abandon the current user context and re-enter
-     * the shell instead of restoring the faulting user state.
-     */
+    /* Abandon this user context; idle reclaims it after the scheduler switch. */
     user_mark_exit();
 }
 
@@ -353,7 +353,8 @@ void trap_dispatch(struct trap_context *tc)
     if (trap_is_interrupt(tc->scause)) {
         if (trap_scause_code(tc->scause) == SCAUSE_S_TIMER_INT) {
             timer_irq_top();
-            if (current_user_task() != 0 && thread_has_runnable_tasks()) {
+            if ((tc->sstatus & SSTATUS_SPP) == 0 &&
+                current_user_task() != 0 && thread_has_runnable_tasks()) {
                 thread_request_resched();
             }
             return;
@@ -386,5 +387,16 @@ void trap_dispatch(struct trap_context *tc)
         return;
     }
 
+    if ((tc->sstatus & SSTATUS_SPP) != 0) {
+        /* Retrying a faulting kernel instruction would trap forever. A
+         * kernel fault is not an ordinary user-task termination.
+         */
+        asm volatile("csrci sstatus, 2" ::: "memory");
+        uart_send_string("[trap] fatal kernel fault\n");
+        trap_print_tc(tc);
+        for (;;) {
+            asm volatile("wfi");
+        }
+    }
     handle_user_fault(tc);
 }

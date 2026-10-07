@@ -20,7 +20,7 @@ struct cpio_newc_header {
     char c_check[8];
 };
 // static: only this c file can use
-static unsigned int hex_to_u32(const char *s) {
+static int hex_to_u32(const char *s, unsigned int *out) {
     unsigned int v = 0;
     unsigned int i;
     for (i = 0; i < 8; i++) {
@@ -33,14 +33,15 @@ static unsigned int hex_to_u32(const char *s) {
         } else if (c >= 'A' && c <= 'F') {
             v |= (unsigned int)(c - 'A' + 10);
         } else {
-            return 0;
+            return -1;
         }
     }
-    return v;
+    *out = v;
+    return 0;
 }
 
-static unsigned int align4(unsigned int n) {
-    return (n + 3U) & ~3U;
+static uintptr_t align4(uintptr_t n) {
+    return (n + 3U) & ~(uintptr_t)3U;
 }
 
 static int str_eq(const char *a, const char *b) {
@@ -56,9 +57,9 @@ static int str_eq(const char *a, const char *b) {
 
 int cpio_iterate(const void *start, const void *end, cpio_iter_fn fn, void *ctx) {
     const uint8_t *cur = (const uint8_t *)start; // at start
-    const uint8_t *limit = end ? (const uint8_t *)end : 0; // set end
+    const uint8_t *limit = (const uint8_t *)end;
 
-    if (start == 0 || fn == 0) {
+    if (start == 0 || end == 0 || fn == 0 || (uintptr_t)end < (uintptr_t)start) {
         return -1;
     }
 
@@ -69,10 +70,12 @@ int cpio_iterate(const void *start, const void *end, cpio_iter_fn fn, void *ctx)
         unsigned int mode;
         const char *name;
         const uint8_t *data;
-        unsigned int name_pad;
-        unsigned int file_pad;
+        uintptr_t name_span;
+        uintptr_t file_span;
+        unsigned int i;
 
-        if (limit && (const uint8_t *)(cur + sizeof(*hdr)) > limit) {
+        if ((uintptr_t)cur > (uintptr_t)limit ||
+            (uintptr_t)limit - (uintptr_t)cur < sizeof(*hdr)) {
             return -1;
         }
 
@@ -82,39 +85,45 @@ int cpio_iterate(const void *start, const void *end, cpio_iter_fn fn, void *ctx)
             return -1;
         }
 
-        namesz = hex_to_u32(hdr->c_namesize);
-        filesz = hex_to_u32(hdr->c_filesize);
-        mode = hex_to_u32(hdr->c_mode);
+        if (hex_to_u32(hdr->c_namesize, &namesz) != 0 ||
+            hex_to_u32(hdr->c_filesize, &filesz) != 0 ||
+            hex_to_u32(hdr->c_mode, &mode) != 0) {
+            return -1;
+        }
         // after header is name
         name = (const char *)(cur + sizeof(*hdr));
-        if (limit && (const uint8_t *)(name + namesz) > limit) {
+        if (namesz == 0 || (uintptr_t)namesz > (uintptr_t)limit - (uintptr_t)name) {
             return -1;
         }
 
-        if (namesz == 0) {
+        if (name[namesz - 1U] != '\0') {
             return -1;
+        }
+        for (i = 0; i + 1U < namesz; i++) {
+            if (name[i] == '\0') {
+                return -1;
+            }
         }
 
         if (str_eq(name, "TRAILER!!!")) {
             return 0;
         }
         // The byte we skip
-        name_pad = align4(sizeof(*hdr) + namesz) - (unsigned int)(sizeof(*hdr) + namesz);
-
-        // data
-        data = (const uint8_t *)(name + namesz + name_pad);
-        if (limit && data > limit) {
+        name_span = align4(sizeof(*hdr) + (uintptr_t)namesz);
+        if (name_span > (uintptr_t)limit - (uintptr_t)cur) {
             return -1;
         }
 
-        if (limit && data + filesz > limit) {
+        // data
+        data = cur + name_span;
+        file_span = align4((uintptr_t)filesz);
+        if (file_span > (uintptr_t)limit - (uintptr_t)data) {
             return -1;
         }
 
         fn(name, data, filesz, mode, ctx);
 
-        file_pad = align4(filesz) - filesz;
-        cur = data + filesz + file_pad;
+        cur = data + file_span;
     }
 }
 
@@ -149,6 +158,7 @@ static void cpio_find_cb(const char *name, const void *data, unsigned long size,
 int cpio_find(const void *start, const void *end, const char *name,
               const void **data, unsigned long *size, unsigned int *mode) {
     struct cpio_find_ctx ctx;
+    if (name == 0) { return -1; }
     ctx.name = name;
     ctx.data = data;
     ctx.size = size;

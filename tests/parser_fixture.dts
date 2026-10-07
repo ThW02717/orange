@@ -1,0 +1,16 @@
+/dts-v1/;
+/memreserve/ 0x80000000 0x1000;
+/ {
+    #address-cells = <2>;
+    #size-cells = <2>;
+    parent {
+        child { child-only = "not a parent property"; compatible = "test,child"; };
+    };
+    memory@80000000 { device_type = "memory"; reg = <0 0x80000000 0 0x100000>; };
+    reserved-memory {
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+        area@80010000 { reg = <0 0x80010000 0 0x2000>; };
+    };
+};

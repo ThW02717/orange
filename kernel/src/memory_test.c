@@ -161,13 +161,14 @@ static int kmtest_boundary(void) {
         {33UL, 2}, {63UL, 2}, {64UL, 2}, {65UL, 3}, {127UL, 3}, {128UL, 3},
         {129UL, 4}, {255UL, 4}, {256UL, 4}, {257UL, 5}, {511UL, 5}, {512UL, 5},
         {513UL, 6}, {1023UL, 6}, {1024UL, 6}, {1025UL, 7}, {2047UL, 7}, {2048UL, 7},
-        {2049UL, 8}, {4095UL, 8}, {4096UL, 8}, {4097UL, 9}, {8191UL, 9}, {8192UL, 9},
-        {8193UL, -1}
+        {2049UL, -1}, {2050UL, -1}, {4095UL, -1}, {4096UL, -1},
+        {4097UL, -1}, {8191UL, -1}, {8192UL, -1}, {8193UL, -1}, {18000UL, -1}
     };
     const char *name = "boundary";
     struct memory_stats_snapshot before;
     struct memory_stats_snapshot after;
     unsigned int i;
+    unsigned int expected_small_count = 0;
 
     memory_get_stats(&before);
 
@@ -178,6 +179,9 @@ static int kmtest_boundary(void) {
         struct memory_stats_snapshot pre_case;
         struct memory_stats_snapshot post_case;
 
+        if (cases[i].expect_class >= 0) {
+            expected_small_count++;
+        }
         if (require(cls == cases[i].expect_class, name, "size-to-class mapping mismatch") != 0) {
             case_failed = 1;
             goto cleanup_case;
@@ -196,25 +200,62 @@ static int kmtest_boundary(void) {
                 case_failed = 1;
                 goto cleanup_case;
             }
-            if (cases[i].size == 8193UL) {
+            if (cases[i].expect_class < 0) {
                 struct memory_stats_snapshot pre_free;
                 struct memory_stats_snapshot post_free;
+                uint64_t pages = (cases[i].size + PAGE_SIZE - 1UL) / PAGE_SIZE;
+                uint64_t block_pages = 1U;
 
-                if (require(post_case.page_allocs == pre_case.page_allocs + 1U, name,
-                            "8193-byte large alloc did not hit page allocator once") != 0) {
+                while (block_pages < pages) {
+                    block_pages <<= 1;
+                }
+                if (require(((uintptr_t)ptr & (PAGE_SIZE - 1UL)) == 0U, name,
+                            "large allocation is not page-aligned") != 0) {
                     case_failed = 1;
                     goto cleanup_case;
                 }
+
+                if (require(post_case.page_allocs == pre_case.page_allocs + 1U, name,
+                            "large alloc did not hit page allocator once") != 0) {
+                    case_failed = 1;
+                    goto cleanup_case;
+                }
+                if (require(post_case.free_pages + block_pages == pre_case.free_pages, name,
+                            "large alloc consumed the wrong number of buddy pages") != 0) {
+                    case_failed = 1;
+                    goto cleanup_case;
+                }
+                if (require(post_case.object_allocs == pre_case.object_allocs, name,
+                            "large alloc unexpectedly used a slab object") != 0) {
+                    case_failed = 1;
+                    goto cleanup_case;
+                }
+
+                /* Exercise both ends of the requested byte range. */
+                ((uint8_t *)ptr)[0] = 0x5AU;
+                ((uint8_t *)ptr)[cases[i].size - 1UL] = 0xA5U;
                 memory_get_stats(&pre_free);
                 kfree(ptr);
                 ptr = 0;
                 memory_get_stats(&post_free);
                 if (require(post_free.page_frees == pre_free.page_frees + 1U, name,
-                            "8193-byte large free did not release one page allocation") != 0) {
+                            "large free did not release one page allocation") != 0) {
+                    case_failed = 1;
+                    goto cleanup_case;
+                }
+                if (require(post_free.free_pages == pre_case.free_pages, name,
+                            "large free did not restore the free-page count") != 0) {
                     case_failed = 1;
                     goto cleanup_case;
                 }
             } else {
+                if (post_case.page_allocs != pre_case.page_allocs &&
+                    require(post_case.page_allocs == pre_case.page_allocs + 1U &&
+                            post_case.free_pages + 1U == pre_case.free_pages, name,
+                            "slab refill did not use exactly one buddy page") != 0) {
+                    case_failed = 1;
+                    goto cleanup_case;
+                }
                 kfree(ptr);
                 ptr = 0;
             }
@@ -232,10 +273,10 @@ cleanup_case:
     }
 
     memory_get_stats(&after);
-    if (require(after.object_allocs == before.object_allocs + 29U, name, "unexpected small-object alloc count") != 0) {
+    if (require(after.object_allocs == before.object_allocs + expected_small_count, name, "unexpected small-object alloc count") != 0) {
         return -1;
     }
-    if (require(after.object_frees == before.object_frees + 29U, name, "unexpected small-object free count") != 0) {
+    if (require(after.object_frees == before.object_frees + expected_small_count, name, "unexpected small-object free count") != 0) {
         return -1;
     }
     if (require(memory_check_slabs_ok(), name, "slab invariant check failed") != 0) {
@@ -461,6 +502,20 @@ static int kmtest_large(void) {
     int ok = 0;
 
     memory_get_stats(&before);
+
+    /* On RV64 this used to truncate the page count to 1, returning a single
+     * page for a 16-TiB-plus request. Reject before narrowing/rounding.
+     */
+    {
+        void *oversized = kmalloc((1UL << 44) + PAGE_SIZE);
+        if (oversized != 0) {
+            kfree(oversized);
+            return test_fail(name, "oversized request truncated to small allocation");
+        }
+        if (kmalloc(UINT64_MAX) != 0) {
+            return test_fail(name, "overflow-sized request was accepted");
+        }
+    }
 
     a = kmalloc(8193U);
     b = kmalloc(12000U);

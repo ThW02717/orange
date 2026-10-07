@@ -7,6 +7,7 @@
  * Tasks are ordered by software priority rank. Lower rank runs first.
  */
 static struct irq_task *g_irq_task_head = 0;
+static int g_irq_task_running = 0;
 
 /* Queue operations only protect queue linkage and task state transitions.
  * The deferred task body itself must run outside this critical section.
@@ -15,14 +16,13 @@ static uint64_t irq_task_irq_save(void)
 {
     uint64_t sstatus;
 
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    asm volatile("csrc sstatus, %0" : : "r"(SSTATUS_SIE));
+    asm volatile("csrrc %0, sstatus, %1" : "=r"(sstatus) : "r"(SSTATUS_SIE) : "memory");
     return sstatus;
 }
 
 static void irq_task_irq_restore(uint64_t sstatus)
 {
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
+    asm volatile("csrw sstatus, %0" : : "r"(sstatus) : "memory");
 }
 
 /* Bottom-half work must run with global interrupts enabled so a later,
@@ -42,8 +42,7 @@ static uint64_t irq_task_enable_nested_interrupts(void)
 {
     uint64_t sstatus;
 
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    asm volatile("csrs sstatus, %0" : : "r"(SSTATUS_SIE));
+    asm volatile("csrrs %0, sstatus, %1" : "=r"(sstatus) : "r"(SSTATUS_SIE) : "memory");
     return sstatus;
 }
 
@@ -66,6 +65,7 @@ static void irq_task_insert_locked(struct irq_task *task)
 void irq_task_backend_init(void)
 {
     g_irq_task_head = 0;
+    g_irq_task_running = 0;
 }
 
 int irq_task_enqueue(struct irq_task *task)
@@ -77,6 +77,12 @@ int irq_task_enqueue(struct irq_task *task)
     }
 
     sstatus = irq_task_irq_save();
+
+    if (task->state == IRQ_TASK_RUNNING) {
+        task->rerun = 1;
+        irq_task_irq_restore(sstatus);
+        return 0;
+    }
 
     /* Do not queue the same persistent task object twice. */
     if (task->state != IRQ_TASK_IDLE) {
@@ -92,6 +98,20 @@ int irq_task_enqueue(struct irq_task *task)
     return 0;
 }
 
+void irq_task_cancel(struct irq_task *task)
+{
+    uint64_t status = irq_task_irq_save();
+    struct irq_task **link = &g_irq_task_head;
+    if (task != 0 && task->state == IRQ_TASK_QUEUED) {
+        while (*link != 0 && *link != task) { link = &(*link)->next; }
+        if (*link == task) { *link = task->next; }
+        task->next = 0;
+        task->state = IRQ_TASK_IDLE;
+        task->rerun = 0;
+    }
+    irq_task_irq_restore(status);
+}
+
 struct irq_task *irq_task_pop_head(void)
 {
     struct irq_task *task;
@@ -104,6 +124,7 @@ struct irq_task *irq_task_pop_head(void)
         g_irq_task_head = task->next;
         task->next = 0;
         task->state = IRQ_TASK_RUNNING;
+        task->rerun = 0;
     }
 
     irq_task_irq_restore(sstatus);
@@ -123,6 +144,14 @@ int irq_task_queue_empty(void)
 
 void irq_task_run_before_return(void)
 {
+    uint64_t entry_status = irq_task_irq_save();
+    if (g_irq_task_running) {
+        irq_task_irq_restore(entry_status);
+        return;
+    }
+    g_irq_task_running = 1;
+    irq_task_irq_restore(entry_status);
+
     while (1) {
         struct irq_task *task;
         uint64_t sstatus;
@@ -136,6 +165,7 @@ void irq_task_run_before_return(void)
         sstatus = irq_task_irq_save();
         task = g_irq_task_head;
         if (task == 0) {
+            g_irq_task_running = 0;
             irq_task_irq_restore(sstatus);
             break;
         }
@@ -143,6 +173,7 @@ void irq_task_run_before_return(void)
         g_irq_task_head = task->next;
         task->next = 0;
         task->state = IRQ_TASK_RUNNING;
+        task->rerun = 0;
         irq_task_irq_restore(sstatus);
 
         switch (task->type) {
@@ -169,7 +200,7 @@ void irq_task_run_before_return(void)
         irq_task_irq_restore(run_sstatus);
 
         sstatus = irq_task_irq_save();
-        if (action != 0) {
+        if (action != 0 || task->rerun) {
             task->state = IRQ_TASK_QUEUED;
             irq_task_insert_locked(task);
         } else {

@@ -5,12 +5,8 @@
 
 #define THREAD_STACK_SIZE 4096UL
 
-/* First cooperative-thread version:
- * - single hart only
- * - kernel threads only
- * - explicit thread_yield()/thread_exit()
- * - no timer preemption
- * - no trap-path scheduler integration
+/* Single-hart round-robin scheduling. Kernel workers yield cooperatively;
+ * user tasks may also be preempted at the outer user-trap boundary.
  */
 
 static struct thread *g_zombie_head = 0;
@@ -39,14 +35,13 @@ static uint64_t thread_irq_save(void)
 {
     uint64_t sstatus;
 
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    asm volatile("csrc sstatus, %0" : : "r"(0x2UL));
+    asm volatile("csrrc %0, sstatus, %1" : "=r"(sstatus) : "r"(SSTATUS_SIE) : "memory");
     return sstatus;
 }
 
 static void thread_irq_restore(uint64_t sstatus)
 {
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
+    asm volatile("csrw sstatus, %0" : : "r"(sstatus) : "memory");
 }
 
 static void thread_list_add(struct thread *t)
@@ -139,6 +134,32 @@ static struct thread *runq_pop(void)
     return t;
 }
 
+/* Caller holds the scheduler IRQ-off section. Stopped tasks must be removed
+ * before idle can free them; otherwise the run queue retains a dangling node.
+ */
+static void runq_remove(struct thread *target)
+{
+    struct thread *prev = 0;
+    struct thread *cur = g_rq.head;
+
+    while (cur != 0) {
+        if (cur == target) {
+            if (prev == 0) {
+                g_rq.head = cur->next;
+            } else {
+                prev->next = cur->next;
+            }
+            if (g_rq.tail == cur) {
+                g_rq.tail = prev;
+            }
+            cur->next = 0;
+            return;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+}
+
 static void kill_zombies(void)
 {
     for (;;) {
@@ -179,6 +200,11 @@ static void kill_zombies(void)
 static void thread_bootstrap(void)
 {
     struct thread *cur = thread_current();
+
+    /* switch_to runs with IRQs masked. A new task has no suspended schedule()
+     * call that could restore its interrupt state, so enable it here.
+     */
+    asm volatile("csrs sstatus, %0" : : "r"(SSTATUS_SIE) : "memory");
 
     if (cur == 0 || cur->entry == 0) {
         for (;;) {
@@ -364,10 +390,8 @@ int thread_create(void (*entry)(void *arg), void *arg, int is_idle)
     return th->pid;
 }
 
-/* First BE2 scaffolding: allocate a schedulable entity that will later own a
- * user trap_context and return to U-mode. This does not yet replace the old
- * singleton runu path; it only gives the scheduler a per-task container for
- * user-mode state.
+/* Allocate a user task and seed the top-of-stack trap context for its first
+ * return to U-mode. User and kernel tasks share the same scheduler.
  */
 int thread_create_user(uintptr_t user_entry, uintptr_t user_stack_base, uintptr_t user_stack_top)
 {
@@ -442,6 +466,7 @@ int thread_create_user(uintptr_t user_entry, uintptr_t user_stack_base, uintptr_
      */
     th->tc->tp = (uint64_t)(uintptr_t)th;
     th->tc->sepc = th->user_entry;
+    th->tc->sstatus = SSTATUS_SPIE;
 
     thread_list_add(th);
     runq_push(th);
@@ -463,6 +488,25 @@ struct thread *thread_find_by_pid(int32_t pid)
     }
     thread_irq_restore(sstatus);
     return cur;
+}
+
+/* This no-MMU kernel has one shared user-code window. Replacing that image
+ * is unsafe while another live user task can still execute from it.
+ */
+int thread_user_image_busy(const struct thread *except)
+{
+    uint64_t status = thread_irq_save();
+    struct thread *cur = g_all_threads;
+    int busy = 0;
+    while (cur != 0) {
+        if (cur != except && cur->kind == THREAD_USER && cur->state != THREAD_ZOMBIE) {
+            busy = 1;
+            break;
+        }
+        cur = cur->all_next;
+    }
+    thread_irq_restore(status);
+    return busy;
 }
 
 /* Cooperative round-robin scheduler.
@@ -487,6 +531,12 @@ void schedule(void)
         return;
     }
 
+    /* Keep current-thread state, queue membership and the actual stack/tp
+     * switch atomic. A timer must never see next as current while prev's
+     * stack and tp are still executing.
+     */
+    sstatus = thread_irq_save();
+
     /* RR policy is just FIFO: pop the head, and later push the yielding
      * previous worker to the tail.
      */
@@ -496,13 +546,13 @@ void schedule(void)
     }
     if (next == 0) {
         if (prev->is_idle != 0) {
+            thread_irq_restore(sstatus);
             return;
         }
         next = g_rq.idle;
     }
 
     if (prev == next) {
-        sstatus = thread_irq_save();
         prev->state = THREAD_RUNNING;
         g_thread_current = prev;
         g_rq.current = prev;
@@ -510,14 +560,12 @@ void schedule(void)
         return;
     }
 
-    sstatus = thread_irq_save();
     if (prev->state == THREAD_RUNNING) {
         prev->state = THREAD_RUNNABLE;
     }
     next->state = THREAD_RUNNING;
     g_thread_current = next;
     g_rq.current = next;
-    thread_irq_restore(sstatus);
 
     /* Only non-idle runnable workers go back to the run queue tail. */
     if (prev->state == THREAD_RUNNABLE && prev->is_idle == 0) {
@@ -526,6 +574,7 @@ void schedule(void)
     switch_to(prev, next);
     g_thread_current = thread_current();
     g_rq.current = g_thread_current;
+    thread_irq_restore(sstatus);
 }
 
 /* Yield explicitly from the current cooperative worker. The scheduler itself
@@ -547,6 +596,10 @@ void thread_mark_current_zombie(int exit_status)
     }
 
     sstatus = thread_irq_save();
+    if (cur->state == THREAD_ZOMBIE) {
+        thread_irq_restore(sstatus);
+        return;
+    }
     cur->state = THREAD_ZOMBIE;
     cur->exit_status = exit_status;
     cur->znext = g_zombie_head;
@@ -569,6 +622,11 @@ int thread_stop_pid(int32_t pid, int exit_status)
     }
 
     sstatus = thread_irq_save();
+    if (target->state == THREAD_ZOMBIE) {
+        thread_irq_restore(sstatus);
+        return 0;
+    }
+    runq_remove(target);
     target->state = THREAD_ZOMBIE;
     target->exit_status = exit_status;
     target->znext = g_zombie_head;

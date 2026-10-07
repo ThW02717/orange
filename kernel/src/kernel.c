@@ -129,8 +129,9 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
         }
     }
 
-    /* Keep bootloader UART state first to avoid serial regressions. */
+    /* Save boot context and resolve the initramfs range before memory init. */
     shell_set_context(hartid, dtb_addr, (uint64_t)initrd_start_hint, (uint64_t)initrd_end_hint);
+    /* Discover usable RAM, reserve occupied ranges, and build the allocators. */
     memory_init((const void *)dtb_addr, (uint64_t)initrd_start_hint, (uint64_t)initrd_end_hint);
     /* Timer interrupts are delivered while the shell is running in S-mode,
      * so stvec must already point at trap_entry before timeron can be used.

@@ -2,6 +2,25 @@
 
 An educational RV64 kernel for OrangePi RV2, written in C and RISC-V assembly.
 
+## Verification
+
+```sh
+make -C kernel all
+make -C bootloader all
+python3 -B scripts/run_allocator_tests.py
+python3 -B scripts/run_regression_tests.py
+python3 -B scripts/run_system_tests.py
+```
+
+The regression runner checks malformed CPIO/DTB inputs with host ASan/UBSan,
+then exercises integer-register trap round trips, scheduler reclamation,
+deferred IRQ work, timer cancellation, and masked UART polling in RV64 QEMU.
+The system runner boots the real QEMU kernel and its separately linked user
+images to test syscalls, faults, fork, preemption, timers, and allocator demos.
+These checks do not validate OrangePi UART/PLIC wiring or the board upload path.
+Dependencies: a RISC-V bare-metal toolchain, QEMU, Python 3, a host C compiler,
+`dtc`, `cpio`, and `mkimage` (for the board image).
+
 ## Core Design
 
 ### Memory Layout
@@ -26,6 +45,8 @@ RAM declared by the DTB (one or more regions)
 |   +-- Kernel image, including static storage and the boot stack
 |   +-- DTB
 |   +-- Initramfs archive
+|   +-- Fixed user-code execution window
+|   +-- DTB header memory-reservation entries
 |   +-- Board /reserved-memory ranges
 |   `-- Frame metadata array allocated by the startup allocator
 |
@@ -125,9 +146,10 @@ no user stack. All these allocations remain kernel-managed and are reclaimed
 after the thread exits, once it is no longer executing on its own stack.
 
 This is not an ELF process loader. It does not construct per-process text,
-data, BSS, heap, or TLS mappings. Loading another binary overwrites the shared
-image window. Also, `memory_init()` does not explicitly reserve that window;
-its fixed address alone does not protect it from allocator reuse.
+data, BSS, heap, or TLS mappings. The shared image window is reserved before
+buddy initialization. The loader rejects image replacement while another live
+user task uses the window; this prevents accidental overwrite, not unauthorized
+access or per-process isolation.
 
 ### Execution Contexts
 
@@ -233,7 +255,7 @@ inside the trap handler, its trap context remains on A's kernel stack while
 
 - `thread_context.ra = thread_bootstrap`; `thread_context.sp = kstack_top - 288`.
 - `tc->sp = user_stack_top`; `tc->tp = thread`; `tc->sepc = user_entry`.
-- The initial trap context is zeroed, so `sstatus.SPP = 0` selects U-mode.
+- `tc->sstatus = SSTATUS_SPIE`: `SPP = 0` selects U-mode and `SPIE = 1` enables interrupts on return.
 
 The first switch follows this path without requiring a previous user trap:
 
@@ -246,10 +268,11 @@ In this kernel, `tp` points to the current `struct thread` in both U-mode and
 S-mode; user TLS is not implemented. While a task runs in U-mode, `sp` points
 into its user stack and `sscratch` holds its kernel-stack top. On a user-origin
 trap, `csrrw sp, sscratch, sp` switches stacks and retains the interrupted user
-`sp` for the snapshot. A supervisor-origin trap keeps the current kernel stack.
+`sp` for the snapshot. In S-mode, `sscratch` is zero; a supervisor-origin trap
+recovers the interrupted kernel `sp` after the swap. No general-purpose register
+is borrowed until its original value has been saved.
 
-Current register-preservation limitation: in
-[`trap_entry.S`](kernel/src/trap_entry.S), the entry path uses `t0` before saving
-it, and the return path reuses `t1` after restoring it. The original `t0` and
-`t1` values therefore are not fully preserved across traps. The context layout
-above describes the storage format, not complete trap-register preservation.
+The return path keeps interrupts masked while restoring state. It sets
+`sscratch` to the kernel-stack top only for a U-mode return, or zero for an
+S-mode return, before restoring `t1`. Deferred work finishes before a user-task
+reschedule so the timer interrupt source is rearmed before the next task runs.

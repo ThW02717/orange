@@ -124,14 +124,13 @@ static inline uint64_t uart_irq_save(void)
 {
     uint64_t sstatus;
 
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    asm volatile("csrc sstatus, %0" : : "r"(SSTATUS_SIE));
+    asm volatile("csrrc %0, sstatus, %1" : "=r"(sstatus) : "r"(SSTATUS_SIE) : "memory");
     return sstatus;
 }
 
 static inline void uart_irq_restore(uint64_t sstatus)
 {
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
+    asm volatile("csrw sstatus, %0" : : "r"(sstatus) : "memory");
 }
 
 static inline int uart_global_irqs_enabled(void)
@@ -260,11 +259,17 @@ static int uart_tx_buf_is_empty(void)
     return ret;
 }
 
+static int uart_tx_try_drain_one(void);
+
 void uart_tx_wait_idle(void)
 {
     for (;;) {
         if (uart_tx_buf_is_empty() && (uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) != 0U) {
             return;
+        }
+        /* This synchronous flush also works inside IRQ-off/deferred paths. */
+        if (!uart_tx_buf_is_empty()) {
+            (void)uart_tx_try_drain_one();
         }
     }
 }
@@ -272,13 +277,16 @@ void uart_tx_wait_idle(void)
 static int uart_tx_try_drain_one(void)
 {
     char c;
+    uint64_t status = uart_irq_save();
 
     /* Only feed THR when the transmitter can accept a new byte. */
     if ((uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) == 0U) {
+        uart_irq_restore(status);
         return 0;
     }
 
     if (uart_tx_pop_char(&c) != 0) {
+        uart_irq_restore(status);
         return 0;
     }
 
@@ -286,6 +294,7 @@ static int uart_tx_try_drain_one(void)
      * piece of serial output.
      */
     uart_reg_write(UART_THR_REG, (uint32_t)(uint8_t)c);
+    uart_irq_restore(status);
     return 1;
 }
 
@@ -302,7 +311,7 @@ static unsigned int uart_tx_queue_chars(const char *s, unsigned int len)
 
 static unsigned int uart_tx_queue_stress_marker(void)
 {
-    char buf[24];
+    char buf[32];
     unsigned int len = 0;
     uint64_t value;
     char rev[24];
@@ -377,7 +386,7 @@ static int uart_queue_timer_marker(unsigned long id)
 
 static int uart_tx_queue_pending_timer_marker(void)
 {
-    char buf[16];
+    char buf[32];
     char rev[24];
     unsigned int len = 0;
     unsigned int rev_len = 0;
@@ -454,6 +463,7 @@ static void uart_tx_kick(void)
     (void)uart_tx_try_drain_one();
 }
 
+#ifndef QEMU
 static void uart_irq_ack_stale_status(void)
 {
     /* Boot ROM / firmware may leave old UART status pending. Read the common
@@ -495,6 +505,7 @@ static void uart_flush_hardware_rx_fifo(void)
         budget--;
     }
 }
+#endif
 
 void uart_init(void)
 {
@@ -507,7 +518,7 @@ void uart_init(void)
     uart_reg_write(UART_FCR_REG, 0x07);
     uart_reg_write(UART_MCR_REG, 0x03);
 #else
-    /* Keep bootloader UART settings for board bring-up stability. */
+    /* Preserve the UART configuration established by the bootloader. */
 #endif
 }
 
@@ -516,9 +527,6 @@ void uart_irq_init(void)
 #ifdef QEMU
     return;
 #else
-    uint64_t sie;
-    uint64_t sstatus;
-    
     /* Start from a clean console state every boot/load so an earlier stress
      * run cannot leave backlog in the software rings or deferred-task state.
      */
@@ -548,15 +556,9 @@ void uart_irq_init(void)
     uart_irq_ack_stale_status();
 
     /* Finally allow supervisor external interrupts to reach trap_entry. */
-    asm volatile("csrr %0, sie" : "=r"(sie));
-    sie |= SIE_SEIE;
-    asm volatile("csrw sie, %0" : : "r"(sie));
-
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    sstatus |= SSTATUS_SIE;
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
-
     g_uart_irq_enabled = 1;
+    asm volatile("csrs sie, %0" : : "r"(SIE_SEIE) : "memory");
+    asm volatile("csrs sstatus, %0" : : "r"(SSTATUS_SIE) : "memory");
 #endif
 }
 
@@ -568,16 +570,22 @@ void uart_send(char c)
     if (g_uart_async_ready) {
         if (uart_global_irqs_enabled()) {
             while (uart_tx_buf_is_full()) {
-                asm volatile("nop");
+                /* A deferred callback may be the current producer. It cannot
+                 * wait for its own runner to return and service TX work.
+                 */
+                (void)uart_tx_try_drain_one();
             }
             (void)uart_tx_push_char(c);
             uart_tx_kick();
             return;
         }
 
-        /* If global interrupts are masked, waiting for the deferred TX bottom
-         * half would deadlock. Fall back to direct polled output in that case.
+        /* Preserve FIFO order before IRQ-off direct output. Otherwise newer
+         * syscall/log bytes would overtake text already queued by the shell.
          */
+        while (!uart_tx_buf_is_empty()) {
+            (void)uart_tx_try_drain_one();
+        }
     }
 
     /* Early boot fallback: keep console output alive until the first real
@@ -594,7 +602,7 @@ char uart_recv(void)
     /* Once IRQ delivery is confirmed, input is consumed purely from the RX
      * ring buffer that the ISR fills.
      */
-    if (g_uart_async_ready) {
+    if (g_uart_async_ready && uart_global_irqs_enabled()) {
         char c;
 
         while (1) {
@@ -604,11 +612,21 @@ char uart_recv(void)
         }
     }
 
+    /* Syscalls enter with SIE clear. Consume buffered input first, then poll
+     * hardware instead of waiting for an RX bottom half that cannot run.
+     */
+    {
+        char c;
+        if (uart_rx_pop_char(&c) == 0) {
+            return c;
+        }
+    }
+
     /* Bring-up fallback: briefly wait for an RX IRQ before polling the UART
      * directly. This keeps the shell usable even if the interrupt route is
      * not live yet during early boot.
      */
-    if (g_uart_irq_enabled) {
+    if (g_uart_irq_enabled && uart_global_irqs_enabled()) {
         unsigned long wait = 500000UL;
         char c;
 
@@ -677,17 +695,13 @@ void uart_irq_top(void)
     if (uart_rx_ready_from_status(status)) {
         demo_trace_record(DEMO_TRACE_UART_TOP_RX, 0U);
         uart_rx_mask();
-        if (g_uart_rx_task.state == IRQ_TASK_IDLE) {
-            (void)irq_task_enqueue(&g_uart_rx_task);
-        }
+        (void)irq_task_enqueue(&g_uart_rx_task);
     }
 
     if (uart_tx_ready_from_status(status)) {
         demo_trace_record(DEMO_TRACE_UART_TOP_TX, (uint32_t)uart_stress_progress());
         uart_tx_mask();
-        if (g_uart_tx_task.state == IRQ_TASK_IDLE) {
-            (void)irq_task_enqueue(&g_uart_tx_task);
-        }
+        (void)irq_task_enqueue(&g_uart_tx_task);
     }
 }
 

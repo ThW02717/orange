@@ -40,6 +40,7 @@ struct irq_task {
     uint8_t prio;
     enum irq_task_state state;
     struct irq_task *next;
+    int rerun; /* work arrived while run() was still executing */
     int (*run)(struct irq_task *task); /* 0 = done, 1 = requeue */
 };
 
@@ -62,6 +63,7 @@ static inline uint8_t irq_task_prio_for_type(enum irq_task_type type)
 
 void irq_task_backend_init(void);
 int irq_task_enqueue(struct irq_task *task);
+void irq_task_cancel(struct irq_task *task);
 struct irq_task *irq_task_pop_head(void);
 int irq_task_queue_empty(void);
 void irq_task_run_before_return(void);

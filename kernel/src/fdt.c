@@ -68,16 +68,23 @@ static int name_starts_with(const char *name, const char *prefix) {
 static int prop_has_compatible(const void *prop, int len, const char *compatible)
 {
     const char *cur = (const char *)prop;
-    const char *end = cur + len;
+    const char *end;
     unsigned int want_len;
 
     if (prop == 0 || compatible == 0 || len <= 0) {
         return 0;
     }
+    end = cur + len;
 
     want_len = str_len(compatible);
     while (cur < end && *cur != '\0') {
-        unsigned int cur_len = str_len(cur);
+        unsigned int cur_len = 0;
+        while (cur + cur_len < end && cur[cur_len] != '\0') {
+            cur_len++;
+        }
+        if (cur + cur_len == end) {
+            return 0;
+        }
 
         if (cur_len == want_len && name_eq(cur, compatible, want_len)) {
             return 1;
@@ -92,12 +99,80 @@ static unsigned int align4(unsigned int n) {
 }
 // minimal sanity check (“is this really a DTB?”)
 
+/* Validate declared block bounds and the token stream before any walker uses
+ * strlen or property offsets. The boot interface must still supply a readable
+ * DTB: it does not provide a separate buffer length to validate totalsize.
+ */
 static int fdt_check_header(const void *fdt) {
     const struct fdt_header *hdr = (const struct fdt_header *)fdt;
+    uint32_t total, offset, size, string_offset, string_size, reserve_offset;
+    const uint8_t *cur, *end, *strings;
+    int depth = 0;
+    int root_seen = 0;
+    if (fdt == 0 || ((uintptr_t)fdt & 3U) != 0) {
+        return -1;
+    }
     if (fdt32_to_cpu(hdr->magic) != FDT_MAGIC) {
         return -1;
     }
-    return 0;
+    total = fdt32_to_cpu(hdr->totalsize);
+    offset = fdt32_to_cpu(hdr->off_dt_struct);
+    size = fdt32_to_cpu(hdr->size_dt_struct);
+    string_offset = fdt32_to_cpu(hdr->off_dt_strings);
+    string_size = fdt32_to_cpu(hdr->size_dt_strings);
+    reserve_offset = fdt32_to_cpu(hdr->off_mem_rsvmap);
+    if (total < sizeof(*hdr) || total > 0x7fffffffU ||
+        offset < sizeof(*hdr) || (offset & 3U) || offset > total || size > total - offset ||
+        string_offset < sizeof(*hdr) || string_offset > total || string_size > total - string_offset ||
+        reserve_offset < sizeof(*hdr) || (reserve_offset & 7U) || reserve_offset > total ||
+        total - reserve_offset < 16U) {
+        return -1;
+    }
+    cur = (const uint8_t *)fdt + offset;
+    end = cur + size;
+    strings = (const uint8_t *)fdt + string_offset;
+    while ((uintptr_t)(end - cur) >= 4U) {
+        uint32_t token = fdt32_to_cpu(*(const uint32_t *)cur);
+        cur += 4;
+        switch (token) {
+        case FDT_BEGIN_NODE: {
+            unsigned int n = 0;
+            if (depth == 0 && root_seen) { return -1; }
+            root_seen = 1;
+            if (++depth > FDT_MAX_DEPTH) { return -1; }
+            while (cur + n < end && cur[n] != 0) { n++; }
+            if (cur + n == end || align4(n + 1U) > (uintptr_t)(end - cur)) { return -1; }
+            cur += align4(n + 1U);
+            break;
+        }
+        case FDT_END_NODE:
+            if (depth == 0) { return -1; }
+            depth--;
+            break;
+        case FDT_PROP: {
+            uint32_t len, nameoff;
+            unsigned int n = 0;
+            if (depth == 0 || end - cur < 8) { return -1; }
+            len = fdt32_to_cpu(*(const uint32_t *)cur);
+            nameoff = fdt32_to_cpu(*(const uint32_t *)(cur + 4));
+            cur += 8;
+            if (len > 0x7fffffffU || align4(len) > (uintptr_t)(end - cur) || nameoff >= string_size) {
+                return -1;
+            }
+            while (n < string_size - nameoff && strings[nameoff + n] != 0) { n++; }
+            if (n == string_size - nameoff) { return -1; }
+            cur += align4(len);
+            break;
+        }
+        case FDT_NOP:
+            break;
+        case FDT_END:
+            return root_seen && depth == 0 ? 0 : -1;
+        default:
+            return -1;
+        }
+    }
+    return -1;
 }
 
 uint32_t fdt_totalsize(const void *fdt) {
@@ -212,7 +287,29 @@ int fdt_path_offset(const void *fdt, const char *path) {
 
     return -1;
 }
-// read a property inside a node subtree
+/* Called only after token validation. Reject offsets into property payloads,
+ * even when those bytes happen to look like a BEGIN_NODE token.
+ */
+static int fdt_is_node_offset(const uint8_t *base, unsigned int size, int offset) {
+    const uint8_t *cur = base;
+    const uint8_t *end = base + size;
+    while (cur < end) {
+        unsigned int pos = (unsigned int)(cur - base);
+        uint32_t token = fdt32_to_cpu(*(const uint32_t *)cur);
+        if (pos == (unsigned int)offset) { return token == FDT_BEGIN_NODE; }
+        if (pos > (unsigned int)offset) { return 0; }
+        cur += 4;
+        if (token == FDT_BEGIN_NODE) {
+            cur += align4(str_len((const char *)cur) + 1U);
+        } else if (token == FDT_PROP) {
+            uint32_t len = fdt32_to_cpu(*(const uint32_t *)cur);
+            cur += 8 + align4(len);
+        } else if (token == FDT_END) { return 0; }
+    }
+    return 0;
+}
+
+// Read a property owned by this node, not one owned by a descendant.
 const void *fdt_getprop(const void *fdt, int nodeoffset, const char *name, int *lenp) {
     const struct fdt_header *hdr;
     const uint8_t *struct_base;
@@ -233,6 +330,11 @@ const void *fdt_getprop(const void *fdt, int nodeoffset, const char *name, int *
     strings_base = (const uint8_t *)fdt + fdt32_to_cpu(hdr->off_dt_strings);
     end = struct_base + fdt32_to_cpu(hdr->size_dt_struct);
 
+    if (nodeoffset < 0 || (nodeoffset & 3) != 0 ||
+        (uint32_t)nodeoffset >= fdt32_to_cpu(hdr->size_dt_struct) ||
+        !fdt_is_node_offset(struct_base, fdt32_to_cpu(hdr->size_dt_struct), nodeoffset)) {
+        return 0;
+    }
     cur = struct_base + nodeoffset;
     if (cur + 4 > end) {
         return 0;
@@ -278,7 +380,7 @@ const void *fdt_getprop(const void *fdt, int nodeoffset, const char *name, int *
             prop_data = (const void *)cur;
             cur += align4(len);
 
-            if (name_eq(prop_name, name, str_len(name))) {
+            if (depth == 0 && name_eq(prop_name, name, str_len(name))) {
                 if (lenp != 0) {
                     *lenp = (int)len;
                 }
@@ -457,7 +559,7 @@ int fdt_get_memory_regions(const void *fdt, struct fdt_mem_region *regions, int 
                     is_memory_node = 1;
                 }
                 dtype = (const char *)fdt_getprop(fdt, node_offset, "device_type", &len);
-                if (dtype != 0 && len >= 6 && name_eq(dtype, "memory", 6U)) {
+                if (dtype != 0 && len >= 7 && name_eq(dtype, "memory", 6U)) {
                     is_memory_node = 1;
                 }
             }
@@ -467,7 +569,7 @@ int fdt_get_memory_regions(const void *fdt, struct fdt_mem_region *regions, int 
                 reg_cells = addr_cells + size_cells;
                 if (reg != 0 && reg_cells > 0 && len >= reg_cells * 4) {
                     tuples = len / (reg_cells * 4);
-                    for (t = 0; t < tuples && out_count < max_regions; t++) {
+                    for (t = 0; t < tuples; t++) {
                         uint64_t addr = 0;
                         uint64_t sz = 0;
                         int i;
@@ -480,6 +582,7 @@ int fdt_get_memory_regions(const void *fdt, struct fdt_mem_region *regions, int 
                             sz = (sz << 32) | (uint64_t)fdt32_to_cpu(entry[addr_cells + i]);
                         }
                         if (sz != 0) {
+                            if (out_count >= max_regions) { return -1; }
                             regions[out_count].base = addr;
                             regions[out_count].size = sz;
                             out_count++;
@@ -576,7 +679,7 @@ int fdt_get_reserved_memory_regions(const void *fdt, struct fdt_mem_region *regi
                 if (reg != 0 && reg_cells > 0 && len >= reg_cells * 4) {
                     int tuples = len / (reg_cells * 4);
                     int t;
-                    for (t = 0; t < tuples && out_count < max_regions; t++) {
+                    for (t = 0; t < tuples; t++) {
                         uint64_t addr = 0;
                         uint64_t sz = 0;
                         int i;
@@ -589,6 +692,7 @@ int fdt_get_reserved_memory_regions(const void *fdt, struct fdt_mem_region *regi
                             sz = (sz << 32) | (uint64_t)fdt32_to_cpu(entry[addr_cells + i]);
                         }
                         if (sz != 0) {
+                            if (out_count >= max_regions) { return -1; }
                             regions[out_count].base = addr;
                             regions[out_count].size = sz;
                             out_count++;
@@ -623,6 +727,31 @@ int fdt_get_reserved_memory_regions(const void *fdt, struct fdt_mem_region *regi
     }
 
     return out_count;
+}
+
+/* The header reserve map is separate from /reserved-memory nodes. Firmware
+ * may use either form; both must be excluded from allocator free lists.
+ */
+int fdt_get_memreserve_regions(const void *fdt, struct fdt_mem_region *regions, int max_regions) {
+    const struct fdt_header *hdr = (const struct fdt_header *)fdt;
+    const uint8_t *cur, *end;
+    int count = 0;
+    if (regions == 0 || max_regions <= 0 || fdt_check_header(fdt) != 0) { return -1; }
+    cur = (const uint8_t *)fdt + fdt32_to_cpu(hdr->off_mem_rsvmap);
+    end = (const uint8_t *)fdt + fdt32_to_cpu(hdr->totalsize);
+    while (end - cur >= 16) {
+        const uint32_t *words = (const uint32_t *)cur;
+        uint64_t base = ((uint64_t)fdt32_to_cpu(words[0]) << 32) | fdt32_to_cpu(words[1]);
+        uint64_t size = ((uint64_t)fdt32_to_cpu(words[2]) << 32) | fdt32_to_cpu(words[3]);
+        if (base == 0 && size == 0) { return count; }
+        if (size != 0) {
+            if (count >= max_regions) { return -1; }
+            regions[count].base = base;
+            regions[count++].size = size;
+        }
+        cur += 16;
+    }
+    return -1;
 }
 
 // deliver usable RAM base/size

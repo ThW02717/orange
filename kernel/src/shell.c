@@ -119,6 +119,9 @@ static int parse_seconds_to_ticks(const char *s, uint64_t *ticks_out, uint64_t *
         }
 
         if (!seen_dot) {
+            if (whole > (UINT64_MAX - (uint64_t)(c - '0')) / 10ULL) {
+                return -1;
+            }
             whole = (whole * 10ULL) + (uint64_t)(c - '0');
         } else {
             if (frac_scale >= 1000ULL) {
@@ -130,8 +133,13 @@ static int parse_seconds_to_ticks(const char *s, uint64_t *ticks_out, uint64_t *
         i++;
     }
 
-    *ticks_out = (whole * (uint64_t)g_timebase_freq) +
-                 ((frac * (uint64_t)g_timebase_freq) / frac_scale);
+    {
+        uint64_t fraction_ticks = (frac * (uint64_t)g_timebase_freq) / frac_scale;
+        if (whole > (UINT64_MAX - fraction_ticks) / (uint64_t)g_timebase_freq) {
+            return -1;
+        }
+        *ticks_out = whole * (uint64_t)g_timebase_freq + fraction_ticks;
+    }
     *whole_out = whole;
     return 0;
 }
@@ -209,6 +217,9 @@ int shell_load_user_program_named(const char *name, uintptr_t *entry_out, unsign
         return -1;
     }
     if (size == 0 || size > USER_CODE_SIZE) {
+        return -1;
+    }
+    if (thread_user_image_busy(thread_current())) {
         return -1;
     }
 
@@ -721,8 +732,9 @@ static int shell_launch_user_program_instances(const char *name,
     unsigned long size;
     uintptr_t entry;
     unsigned int i;
+    int created_pids[2];
 
-    if (name == 0 || label == 0 || instances == 0U) {
+    if (name == 0 || label == 0 || instances == 0U || instances > 2U) {
         return -1;
     }
 
@@ -774,7 +786,7 @@ static int shell_launch_user_program_instances(const char *name,
         if (user_stack_base == 0) {
             uart_send_string(label);
             uart_send_string(": failed to allocate user stack\n");
-            return -1;
+            goto launch_failed;
         }
         user_stack_top = (user_stack_base + USER_STACK_SIZE) & ~0xFUL;
 
@@ -785,11 +797,12 @@ static int shell_launch_user_program_instances(const char *name,
             uart_send_string("\n");
         }
 
-        if (thread_create_user(entry, user_stack_base, user_stack_top) < 0) {
+        created_pids[i] = thread_create_user(entry, user_stack_base, user_stack_top);
+        if (created_pids[i] < 0) {
             kfree((void *)(uintptr_t)user_stack_base);
             uart_send_string(label);
             uart_send_string(": failed to create user task\n");
-            return -1;
+            goto launch_failed;
         }
     }
 
@@ -807,6 +820,14 @@ static int shell_launch_user_program_instances(const char *name,
     uart_send_string(label);
     uart_send_string(": user task finished, back to shell\n");
     return 0;
+
+launch_failed:
+    /* Do not leave a partly created batch runnable after reporting failure. */
+    while (i > 0U) {
+        (void)thread_stop_pid(created_pids[--i], -1);
+    }
+    thread_run_until_idle();
+    return -1;
 }
 
 /* Load a raw user binary from initramfs into the reserved execution window. */

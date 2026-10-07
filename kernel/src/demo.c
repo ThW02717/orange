@@ -36,14 +36,13 @@ static uint64_t demo_trace_irq_save(void)
 {
     uint64_t sstatus;
 
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    asm volatile("csrc sstatus, %0" : : "r"(0x2UL));
+    asm volatile("csrrc %0, sstatus, %1" : "=r"(sstatus) : "r"(SSTATUS_SIE) : "memory");
     return sstatus;
 }
 
 static void demo_trace_irq_restore(uint64_t sstatus)
 {
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
+    asm volatile("csrw sstatus, %0" : : "r"(sstatus) : "memory");
 }
 
 static const char *demo_trace_kind_name(enum demo_trace_kind kind)
@@ -94,6 +93,7 @@ static int parse_u64_dec_local(const char *s, uint64_t *out)
         if (c < '0' || c > '9') {
             return -1;
         }
+        if (value > (UINT64_MAX - (uint64_t)(c - '0')) / 10ULL) { return -1; }
         value = (value * 10ULL) + (uint64_t)(c - '0');
         i++;
     }
@@ -242,6 +242,11 @@ static int demo_launch_user_program(const char *name,
     uintptr_t entry;
     unsigned long size;
     unsigned int i;
+    int created_pids[2];
+
+    if (instances == 0U || instances > 2U) {
+        return -1;
+    }
 
     if (shell_load_user_program_named(name, &entry, &size) != 0) {
         uart_send_string("demo ");
@@ -267,15 +272,16 @@ static int demo_launch_user_program(const char *name,
             uart_send_string("demo ");
             uart_send_string(name);
             uart_send_string(": failed to allocate user stack\n");
-            return -1;
+            goto launch_failed;
         }
         user_stack_top = (user_stack_base + USER_STACK_SIZE) & ~0xFUL;
-        if (thread_create_user(entry, user_stack_base, user_stack_top) < 0) {
+        created_pids[i] = thread_create_user(entry, user_stack_base, user_stack_top);
+        if (created_pids[i] < 0) {
             kfree((void *)(uintptr_t)user_stack_base);
             uart_send_string("demo ");
             uart_send_string(name);
             uart_send_string(": failed to create user task\n");
-            return -1;
+            goto launch_failed;
         }
     }
 
@@ -287,6 +293,13 @@ static int demo_launch_user_program(const char *name,
     uart_send_string(": done\n");
     (void)size;
     return 0;
+
+launch_failed:
+    while (i > 0U) {
+        (void)thread_stop_pid(created_pids[--i], -1);
+    }
+    thread_run_until_idle();
+    return -1;
 }
 
 /* =========================

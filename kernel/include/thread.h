@@ -5,12 +5,10 @@
 
 struct trap_context;
 
-/* First cooperative-thread version:
- * - single hart only
- * - kernel threads only
- * - cooperative yield/schedule
- * - no timer preemption
- * - no user process integration
+/* Single-active-hart scheduler:
+ * - cooperative kernel workers
+ * - user tasks with separate user/kernel stacks
+ * - timer-driven preemption at user trap-return boundaries
  */
 
 enum thread_kind {
@@ -81,12 +79,13 @@ struct thread {
     struct trap_context *tc; /* points into this thread's kernel stack */
 };
 
-/* Minimal API for the first cooperative-only scheduler milestone. */
+/* Shared scheduler API for kernel workers and user tasks. */
 void thread_init(void);
 void thread_system_bootstrap_init(void);
 int thread_system_active(void);
 struct thread *thread_current(void);
 struct thread *thread_find_by_pid(int32_t pid);
+int thread_user_image_busy(const struct thread *except);
 int thread_create(void (*entry)(void *arg), void *arg, int is_idle);
 int thread_create_user(uintptr_t user_entry, uintptr_t user_stack_base, uintptr_t user_stack_top);
 /* Save the current thread context into `prev`, restore `next`, then set

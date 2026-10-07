@@ -2,6 +2,7 @@
 #include "memory.h"
 #include "fdt.h"
 #include "uart.h"
+#include "trap.h"
 
 #define MEMORY_MAX_RESERVES 64
 /* Largest buddy block tracked by this allocator.
@@ -19,7 +20,7 @@
 #define FRAME_USED  ((int16_t)-2)
 #define FRAME_ALLOC_BASE ((int16_t)-100)
 #define SLAB_MAGIC       0x534C4142U /* "SLAB" */
-#define KMALLOC_MAX_SLAB_SIZE (PAGE_SIZE * 2U)
+#define KMALLOC_MAX_SLAB_SIZE (PAGE_SIZE / 2U)
 #define KMEM_CACHE_EMPTY_LIMIT 1U
 #define POISON_FREE_OBJECT 0xAAU
 #define POISON_RECLAIM_PAGE 0xCCU
@@ -108,7 +109,7 @@ struct slab_link {
     struct slab_header *next;
 };
 
-/* One cache manages one kmalloc size class, such as 64, 128, or 8192 bytes.
+/* One cache manages one kmalloc size class, such as 64, 128, or 2048 bytes.
  * It owns three lists of slab blocks:
  * - partial: at least one allocated object and at least one free object
  * - full: no free objects left
@@ -126,9 +127,9 @@ struct kmem_cache {
 };
 
 /* Metadata stored at the beginning of each slab block.
- * A slab block is allocated from the buddy allocator and may span one or more
- * pages. The remaining bytes after this header are split into fixed-size
- * objects owned by this slab's kmem_cache.
+ * Current size classes fit in one buddy page, including this header and object
+ * alignment padding. The remaining bytes are split into fixed-size objects
+ * owned by this slab's kmem_cache.
  */
 struct slab_header {
     struct slab_link link; // Node in one kmem_cache slab list.
@@ -172,11 +173,11 @@ static uint64_t g_object_free_count = 0;
 static uint64_t g_slab_reclaim_count = 0;
 static int g_allocator_log_enabled = 0;
 
-/* kmalloc size classes. Requests up to PAGE_SIZE * 2 use slab caches; larger
- * requests go straight to the buddy page allocator.
+/* One-page slab classes cover requests up to 2048 bytes. Larger requests go
+ * straight to buddy, avoiding extra pages just to fit an in-block slab header.
  */
 static const uint16_t g_kmalloc_classes[] = {
-    16U, 32U, 64U, 128U, 256U, 512U, 1024U, 2048U, 4096U, 8192U
+    16U, 32U, 64U, 128U, 256U, 512U, 1024U, 2048U
 };
 #define KMALLOC_CLASS_COUNT ((unsigned int)(sizeof(g_kmalloc_classes) / sizeof(g_kmalloc_classes[0])))
 static struct kmem_cache g_kmem_caches[KMALLOC_CLASS_COUNT];
@@ -506,7 +507,7 @@ static int slab_freelist_contains(struct slab_header *slab, void *obj) {
 }
 
 /* Map a requested kmalloc size to the smallest fitting cache class.
- * Example: 65 bytes maps to the 128-byte class; 8193 bytes returns -1 and
+ * Example: 65 bytes maps to the 128-byte class; 2049 bytes returns -1 and
  * takes the large-allocation path.
  */
 static int size_to_class(unsigned long size) {
@@ -565,9 +566,8 @@ static unsigned int order_for_pages(uint64_t pages) {
 }
 
 /* Slab helper: choose how many buddy pages one slab block needs for a cache.
- * The block must fit slab_header plus at least one object. Example: an 8192B
- * object needs more than two 4KB pages once the header is included, so it uses
- * order 2, i.e. four pages.
+ * All current classes fit in one page, including the header and alignment
+ * padding. The largest class places one 2048-byte object at offset 2048.
  */
 static unsigned int slab_order_for_cache(struct kmem_cache *cache) {
     uint64_t bytes;
@@ -780,6 +780,7 @@ static void *startup_alloc(uint64_t size, uint64_t align) {
     if ((align & (align - 1U)) != 0U) {
         return 0;
     }
+    if (g_startup_cur > UINT64_MAX - (align - 1U)) { return 0; }
     p = align_up_u64(g_startup_cur, align);
     for (;;) {
         moved = 0;
@@ -789,6 +790,7 @@ static void *startup_alloc(uint64_t size, uint64_t align) {
         }
         for (i = 0; i < g_reserve_count; i++) {
             if (ranges_overlap(p, end, g_reserves[i].start, g_reserves[i].end)) {
+                if (g_reserves[i].end > UINT64_MAX - (align - 1U)) { return 0; }
                 p = align_up_u64(g_reserves[i].end, align);
                 moved = 1;
                 break;
@@ -1148,7 +1150,7 @@ static void buddy_build_initial_state(void) {
     }
 }
 
-void *p_alloc(unsigned int pages) {
+static void *p_alloc_locked(unsigned int pages) {
     unsigned int need_order = 0;
     unsigned int cur_order;
     int32_t idx32;
@@ -1236,7 +1238,7 @@ void *p_alloc(unsigned int pages) {
     return (void *)(uintptr_t)pa;
 }
 
-void p_free(void *ptr) {
+static void p_free_locked(void *ptr) {
     uint64_t pa;
     uint64_t idx;
     int16_t tag;
@@ -1378,12 +1380,12 @@ static int kmalloc_refill_class(unsigned int class_idx) {
     return 0;
 }
 
-void *kmalloc(unsigned long size) {
+static void *kmalloc_locked(unsigned long size) {
     if (!g_memory_ready || size == 0UL) {
         return 0;
     }
 
-    /* Small/medium allocations use slab caches to avoid wasting whole pages.
+    /* Requests up to 2048 bytes use the one-page slab caches.
      * Example: kmalloc(64) returns one object from the 64-byte cache.
      */
     if (size <= KMALLOC_MAX_SLAB_SIZE) {
@@ -1412,14 +1414,12 @@ void *kmalloc(unsigned long size) {
             uart_send_string("\n");
             return 0;
         }
-        /* Find the first partial slab that still has a free object. */
+        /* Partial list entries must have free objects and valid counts. */
         slab = cache->slabs_partial;
-        while (slab != 0 && slab->freelist == 0) {
-            slab = slab->link.next;
-        }
-        if (slab == 0) {
+        if (slab->state != SLAB_PARTIAL || slab->freelist == 0 ||
+            slab->inuse >= slab->capacity) {
             log_prefix();
-            uart_send_string("[Error] kmalloc partial list exhausted for class ");
+            uart_send_string("[Error] kmalloc partial slab invariant broken for class ");
             uart_send_dec((unsigned long)cls);
             uart_send_string("\n");
             return 0;
@@ -1457,16 +1457,20 @@ void *kmalloc(unsigned long size) {
         }
         g_object_alloc_count++;
         return obj;
-    }
-
-    /* Large allocations bypass slab and reserve whole buddy pages.
-     * Example: kmalloc(9000) rounds up to 3 pages, then p_alloc() returns an
-     * order-2 block because buddy sizes are powers of two.
-     */
-    {
+    } else {
+        /* Large allocations bypass slab and reserve whole buddy pages.
+         * Example: kmalloc(9000) rounds up to 3 pages, then p_alloc() returns an
+         * order-2 block because buddy sizes are powers of two.
+         */
         void *base;
         uint64_t base_idx;
-        unsigned long pages = (size + PAGE_SIZE - 1UL) / PAGE_SIZE;
+        unsigned long pages;
+
+        /* Bound the request before rounding or narrowing to unsigned int. */
+        if (size > (PAGE_SIZE << MEMORY_BUDDY_MAX_ORDER)) {
+            return 0;
+        }
+        pages = (size + PAGE_SIZE - 1UL) / PAGE_SIZE;
 
         base = p_alloc((unsigned int)pages);
         if (base == 0) {
@@ -1481,7 +1485,7 @@ void *kmalloc(unsigned long size) {
     }
 }
 
-void kfree(void *ptr) {
+static void kfree_locked(void *ptr) {
     uint64_t page_base;
     uint64_t page_idx;
     uint64_t ptr_addr;
@@ -1694,24 +1698,72 @@ void kfree(void *ptr) {
     uart_send_string("\n");
 }
 
+/* Deferred callbacks also allocate/free memory. On this single active hart,
+ * IRQ masking prevents reentrant mutation of buddy and slab metadata. Nested
+ * allocator calls restore the already-masked state rather than enabling IRQs.
+ */
+static uint64_t memory_irq_save(void) {
+    uint64_t status;
+    asm volatile("csrrc %0, sstatus, %1" : "=r"(status) : "r"(SSTATUS_SIE) : "memory");
+    return status;
+}
+
+static void memory_irq_restore(uint64_t status) {
+    asm volatile("csrw sstatus, %0" : : "r"(status) : "memory");
+}
+
+void *p_alloc(unsigned int pages) {
+    uint64_t status = memory_irq_save();
+    void *ptr = p_alloc_locked(pages);
+    memory_irq_restore(status);
+    return ptr;
+}
+
+void p_free(void *ptr) {
+    uint64_t status = memory_irq_save();
+    p_free_locked(ptr);
+    memory_irq_restore(status);
+}
+
+void *kmalloc(unsigned long size) {
+    uint64_t status = memory_irq_save();
+    void *ptr = kmalloc_locked(size);
+    memory_irq_restore(status);
+    return ptr;
+}
+
+void kfree(void *ptr) {
+    uint64_t status = memory_irq_save();
+    kfree_locked(ptr);
+    memory_irq_restore(status);
+}
+
 /* Shell/debug dump of slab cache list sizes. */
 void memory_print_slabinfo(void) {
     unsigned int i;
+    struct memory_slab_class_snapshot snapshot[KMALLOC_CLASS_COUNT];
+    uint64_t status = memory_irq_save();
+
+    /* Copy list counts while stable; do not hold IRQs off during UART output. */
+    for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
+        (void)memory_get_slab_class_snapshot(i, &snapshot[i]);
+    }
+    memory_irq_restore(status);
 
     uart_send_string("Slab caches:\n");
     uart_send_string("class size stride partial full empty\n");
     for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
         uart_send_dec(i);
         uart_send_string(" ");
-        uart_send_dec(g_kmem_caches[i].obj_size);
+        uart_send_dec(snapshot[i].obj_size);
         uart_send_string(" ");
-        uart_send_dec(g_kmem_caches[i].obj_stride);
+        uart_send_dec(snapshot[i].obj_stride);
         uart_send_string(" ");
-        uart_send_dec(slab_list_count(g_kmem_caches[i].slabs_partial));
+        uart_send_dec(snapshot[i].partial_count);
         uart_send_string(" ");
-        uart_send_dec(slab_list_count(g_kmem_caches[i].slabs_full));
+        uart_send_dec(snapshot[i].full_count);
         uart_send_string(" ");
-        uart_send_dec(slab_list_count(g_kmem_caches[i].slabs_empty));
+        uart_send_dec(snapshot[i].empty_count);
         uart_send_string("\n");
     }
 }
@@ -1720,11 +1772,18 @@ void memory_print_slabinfo(void) {
 void memory_print_buddyinfo(void) {
     unsigned int order;
     uint64_t total_free_pages = 0;
+    unsigned int block_counts[MEMORY_BUDDY_MAX_ORDER + 1U];
+    uint64_t status = memory_irq_save();
+
+    for (order = 0; order <= MEMORY_BUDDY_MAX_ORDER; order++) {
+        block_counts[order] = freelist_count_order(order);
+    }
+    memory_irq_restore(status);
 
     uart_send_string("Buddy free lists:\n");
     uart_send_string("order blocks pages\n");
     for (order = 0; order <= MEMORY_BUDDY_MAX_ORDER; order++) {
-        unsigned int blocks = freelist_count_order(order);
+        unsigned int blocks = block_counts[order];
         uint64_t pages = (uint64_t)blocks << order;
 
         if (blocks == 0) {
@@ -1747,6 +1806,7 @@ void memory_print_buddyinfo(void) {
 int memory_check_slabs_ok(void) {
     unsigned int i;
     int ok = 1;
+    uint64_t status = memory_irq_save();
 
     for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
         if (!slab_check_list_invariants(i, "partial", g_kmem_caches[i].slabs_partial, SLAB_PARTIAL)) {
@@ -1760,14 +1820,17 @@ int memory_check_slabs_ok(void) {
         }
     }
 
+    memory_irq_restore(status);
     return ok;
 }
 
 /* Copy allocator counters into a test-friendly snapshot struct. */
 void memory_get_stats(struct memory_stats_snapshot *out) {
+    uint64_t status;
     if (out == 0) {
         return;
     }
+    status = memory_irq_save();
 
     out->page_allocs = g_page_alloc_count;
     out->page_frees = g_page_free_count;
@@ -1777,15 +1840,18 @@ void memory_get_stats(struct memory_stats_snapshot *out) {
     out->total_pages = g_total_pages;
     out->free_pages = total_free_pages_count();
     out->empty_slab_limit = KMEM_CACHE_EMPTY_LIMIT;
+    memory_irq_restore(status);
 }
 
 /* Copy one kmalloc cache's state into a test-friendly snapshot struct. */
 int memory_get_slab_class_snapshot(unsigned int class_idx, struct memory_slab_class_snapshot *out) {
     struct kmem_cache *cache;
+    uint64_t status;
 
     if (out == 0 || class_idx >= KMALLOC_CLASS_COUNT) {
         return -1;
     }
+    status = memory_irq_save();
 
     cache = &g_kmem_caches[class_idx];
     out->class_idx = class_idx;
@@ -1795,6 +1861,7 @@ int memory_get_slab_class_snapshot(unsigned int class_idx, struct memory_slab_cl
     out->full_count = slab_list_count(cache->slabs_full);
     out->empty_count = slab_list_count(cache->slabs_empty);
     out->cached_empty_count = cache->empty_count;
+    memory_irq_restore(status);
     return 0;
 }
 
@@ -1811,24 +1878,27 @@ void memory_set_allocator_log_enabled(int enabled)
 
 /* Shell/debug dump of allocator counters and debug settings. */
 void memory_print_memstat(void) {
+    struct memory_stats_snapshot snapshot;
+    memory_get_stats(&snapshot);
+
     uart_send_string("Allocator stats:\n");
     uart_send_string("page_allocs: ");
-    uart_send_dec((unsigned long)g_page_alloc_count);
+    uart_send_dec((unsigned long)snapshot.page_allocs);
     uart_send_string("\n");
     uart_send_string("page_frees: ");
-    uart_send_dec((unsigned long)g_page_free_count);
+    uart_send_dec((unsigned long)snapshot.page_frees);
     uart_send_string("\n");
     uart_send_string("object_allocs: ");
-    uart_send_dec((unsigned long)g_object_alloc_count);
+    uart_send_dec((unsigned long)snapshot.object_allocs);
     uart_send_string("\n");
     uart_send_string("object_frees: ");
-    uart_send_dec((unsigned long)g_object_free_count);
+    uart_send_dec((unsigned long)snapshot.object_frees);
     uart_send_string("\n");
     uart_send_string("slab_reclaims: ");
-    uart_send_dec((unsigned long)g_slab_reclaim_count);
+    uart_send_dec((unsigned long)snapshot.slab_reclaims);
     uart_send_string("\n");
     uart_send_string("total_pages: ");
-    uart_send_dec((unsigned long)g_total_pages);
+    uart_send_dec((unsigned long)snapshot.total_pages);
     uart_send_string("\n");
     uart_send_string("empty_slab_limit: ");
     uart_send_dec((unsigned long)KMEM_CACHE_EMPTY_LIMIT);
@@ -1850,10 +1920,9 @@ void memory_debug_check_slabs(void) {
     }
 }
 
-/* Initialize the physical memory allocator.
- * Flow:
+/* Initialize the memory allocator.
  * 1. Read RAM and reserved-memory information from the devicetree.
- * 2. Reserve page 0, the DTB, kernel image, initrd, and reserved-memory nodes.
+ * 2. Reserve page 0, DTB, kernel, initrd, user image, and DTB reservations.
  * 3. Allocate frame metadata with the early bump allocator.
  * 4. Initialize kmalloc slab caches.
  * 5. Build buddy free lists from remaining usable pages.
@@ -1893,6 +1962,7 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
 
     g_region_count = 0;
     for (i = 0; i < dt_count && g_region_count < FDT_MAX_MEM_REGIONS; i++) {
+        if (dt_regions[i].base > UINT64_MAX - (PAGE_SIZE - 1U)) { return; }
         uint64_t start = align_up_u64(dt_regions[i].base, PAGE_SIZE);
         uint64_t raw_end = dt_regions[i].base + dt_regions[i].size;
         uint64_t end;
@@ -1909,6 +1979,14 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
         pages = (end - start) / PAGE_SIZE;
         if (pages == 0) {
             continue;
+        }
+        if (pages > INT32_MAX - total_pages) {
+            log_prefix(); uart_send_string("too many pages for frame indices\n"); return;
+        }
+        for (unsigned int r = 0; r < g_region_count; r++) {
+            if (ranges_overlap(start, end, g_regions[r].base, g_regions[r].base + g_regions[r].size)) {
+                log_prefix(); uart_send_string("overlapping RAM regions\n"); return;
+            }
         }
 
         g_regions[g_region_count].base = start;
@@ -1955,6 +2033,11 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
     k_size = (uint64_t)((uintptr_t)&_phys_end - (uintptr_t)&_phys_start);
     memory_reserve(k_start, k_size);
 
+    /* Raw user binaries execute here even though no page tables are active.
+     * This window must not also be returned as buddy pages or allocator data.
+     */
+    memory_reserve(USER_CODE_BASE, USER_CODE_SIZE);
+
     /* Reserve initrd either from /chosen linux,initrd-* or from bootloader hints. */
     if (fdt_get_initrd_range(fdt, &initrd_start, &initrd_end) != 0 || initrd_end <= initrd_start) {
         initrd_start = 0;
@@ -1969,8 +2052,19 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
         memory_reserve(initrd_start, initrd_end - initrd_start);
     }
 
+    reserved_count = fdt_get_memreserve_regions(fdt, dt_reserved, FDT_MAX_MEM_REGIONS);
+    if (reserved_count < 0) {
+        log_prefix(); uart_send_string("invalid or oversized FDT reserve map\n"); return;
+    }
+    for (i = 0; i < reserved_count; i++) {
+        memory_reserve(dt_reserved[i].base, dt_reserved[i].size);
+    }
+
     /* Honor /reserved-memory nodes from the board DTB. */
     reserved_count = fdt_get_reserved_memory_regions(fdt, dt_reserved, FDT_MAX_MEM_REGIONS);
+    if (reserved_count < 0) {
+        log_prefix(); uart_send_string("invalid or oversized reserved-memory list\n"); return;
+    }
     if (reserved_count > 0) {
         for (i = 0; i < reserved_count; i++) {
             memory_reserve(dt_reserved[i].base, dt_reserved[i].size);

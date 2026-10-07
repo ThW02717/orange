@@ -43,7 +43,8 @@ void *p_alloc(unsigned int pages);
 void p_free(void *ptr);
 
 /* General kernel allocator API.
- * Small allocations use slab caches; large allocations use whole buddy pages.
+ * Requests of 1..2048 bytes use one-page slab caches; larger requests use whole
+ * buddy page blocks. Both paths return pointers that must be freed with kfree().
  */
 void *kmalloc(unsigned long size);
 void kfree(void *ptr);

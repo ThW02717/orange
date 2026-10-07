@@ -28,7 +28,7 @@ void user_reset_trap_context(struct thread *task)
     }
 
     asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    sstatus &= ~SSTATUS_SPP;
+    sstatus &= ~(SSTATUS_SPP | SSTATUS_SIE);
     sstatus |= SSTATUS_SPIE;
 
     task->tc->sp = task->user_stack_top;
@@ -103,11 +103,7 @@ int user_has_exited(void)
  */
 void user_schedule_after_exit(void)
 {
-    uint64_t sstatus;
-
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    sstatus |= SSTATUS_SIE;
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
+    asm volatile("csrs sstatus, %0" : : "r"(SSTATUS_SIE) : "memory");
 
     schedule();
 

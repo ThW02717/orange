@@ -44,41 +44,25 @@
 /* Supervisor trap entry.
  * - Trap from U-mode: sscratch holds the kernel stack top, so swap sp and
  *   sscratch to land on the kernel stack and preserve the user sp.
- * - Trap from S-mode: we are already on a kernel stack, so keep sp as-is and
- *   save the interrupted kernel sp into the trap_context directly.
+ * - In S-mode sscratch is zero. The swap produces a zero sp, so recover the
+ *   interrupted kernel sp from sscratch without borrowing any other GPR.
  */
 trap_entry:
-    csrr t0, sstatus
-    andi t0, t0, 0x100
-    bnez t0, 1f
-
-    /* U-mode trap path: switch from user sp to the task's kernel stack. */
     csrrw sp, sscratch, sp
-    addi sp, sp, -TRAP_CONTEXT_ALLOC_SIZE
-    j 2f
-
+    bnez sp, 1f
+    csrr sp, sscratch
 1:
-    /* S-mode trap path: keep the current kernel stack and allocate the
-     * trap_context on it directly.
-     */
     addi sp, sp, -TRAP_CONTEXT_ALLOC_SIZE
-
-2:
 
     /* Save the interrupted CPU context into trap_context. TC_SP always stores
      * the interrupted stack pointer, whether that was a user sp or a kernel sp.
      */
     sd ra, TC_RA(sp)
     sd t0, TC_T0(sp)
-    csrr t0, sstatus
-    andi t0, t0, 0x100
-    bnez t0, 3f
     csrr t0, sscratch
-    j 4f
-3:
-    addi t0, sp, TRAP_CONTEXT_ALLOC_SIZE
-4:
     sd t0, TC_SP(sp)
+    /* Nested supervisor traps must stay on the current kernel stack. */
+    csrw sscratch, zero
     sd gp, TC_GP(sp)
     sd tp, TC_TP(sp)
     sd t1, TC_T1(sp)
@@ -121,6 +105,19 @@ trap_entry:
     mv a0, sp
     call trap_dispatch
 
+    /* Finish deferred work before switching tasks. In particular, the timer
+     * top half masks STIE and its bottom half must rearm it before another
+     * user task starts running, or that task would never be preempted.
+     */
+    call irq_task_run_before_return
+
+    /* A nested S-mode trap must resume its interrupted kernel work, not
+     * schedule away or abandon an outer user trap's still-live call chain.
+     */
+    ld t0, TC_SSTATUS(sp)
+    andi t0, t0, 0x100
+    bnez t0, 2f
+
     /* trap_dispatch() may classify the trap as SYS_exit and mark the current
      * user context as finished. In that case we must not restore the user
      * registers and execute another sret back to U-mode.
@@ -132,23 +129,11 @@ trap_entry:
     beqz a0, 1f
     call schedule
 1:
-
-    /* Normal trap path:
-     * 1. trap_dispatch() has already finished the short top half.
-     * 2. Run deferred bottom-half work before trap_return -> sret.
-     * 3. Bottom halves may be preempted because the runner re-enables SIE.
-     * 4. Any interrupt that arrives during a bottom half only performs its
-     *    own top half and queues work; bottom-half scheduling still returns
-     *    here and is chosen by software priority rank.
-     */
-    call irq_task_run_before_return
+2:
     mv a0, sp
     call trap_return
 
-/* Resume the shell after SYS_exit or a fatal user fault.
- * This toy kernel does not have a scheduler, so once a user program is done
- * we stay on the current kernel stack and re-enter the shell loop directly.
- */
+/* A finished user task must switch away; idle reclaims its stack later. */
 trap_exit_stop:
     call user_schedule_after_exit
 1:
@@ -159,13 +144,28 @@ trap_exit_stop:
  * a0 must point to struct trap_context on the current kernel stack.
  */
 trap_return:
+    /* Initial user entry may call us with SIE set. Keep the entire restore
+     * atomic, including the interval where sscratch changes its meaning.
+     */
+    csrci sstatus, 2
     mv t0, a0
 
     /* Restore CSR state first so sret returns to the correct PC and mode. */
     ld t1, TC_SEPC(t0)
     csrw sepc, t1
     ld t1, TC_SSTATUS(t0)
+    andi t1, t1, -3
     csrw sstatus, t1
+
+    /* Only a return to U-mode needs a kernel-stack address in sscratch. */
+    andi t1, t1, 0x100
+    bnez t1, 1f
+    addi t1, t0, TRAP_CONTEXT_ALLOC_SIZE
+    csrw sscratch, t1
+    j 2f
+1:
+    csrw sscratch, zero
+2:
 
     /* Restore the general-purpose registers from the trap_context image. */
     ld ra, TC_RA(t0)
@@ -198,8 +198,6 @@ trap_return:
     ld t5, TC_T5(t0)
     ld t6, TC_T6(t0)
 
-    addi t1, t0, TRAP_CONTEXT_ALLOC_SIZE
-    csrw sscratch, t1
     ld sp, TC_SP(t0)
     ld t0, TC_T0(t0)
 

@@ -46,14 +46,13 @@ static inline uint64_t timer_irq_save(void)
 {
     uint64_t sstatus;
 
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    asm volatile("csrc sstatus, %0" : : "r"(SSTATUS_SIE));
+    asm volatile("csrrc %0, sstatus, %1" : "=r"(sstatus) : "r"(SSTATUS_SIE) : "memory");
     return sstatus;
 }
 
 static inline void timer_irq_restore(uint64_t sstatus)
 {
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
+    asm volatile("csrw sstatus, %0" : : "r"(sstatus) : "memory");
 }
 
 /* Enable/disable only the hardware timer interrupt source. The software queue
@@ -61,25 +60,13 @@ static inline void timer_irq_restore(uint64_t sstatus)
  */
 void timer_source_mask(void)
 {
-    uint64_t sie;
-
-    asm volatile("csrr %0, sie" : "=r"(sie));
-    sie &= ~SIE_STIE;
-    asm volatile("csrw sie, %0" : : "r"(sie));
+    asm volatile("csrc sie, %0" : : "r"(SIE_STIE) : "memory");
 }
 
 void timer_source_unmask(void)
 {
-    uint64_t sie;
-    uint64_t sstatus;
-
-    asm volatile("csrr %0, sie" : "=r"(sie));
-    sie |= SIE_STIE;
-    asm volatile("csrw sie, %0" : : "r"(sie));
-
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    sstatus |= SSTATUS_SIE;
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus));
+    asm volatile("csrs sie, %0" : : "r"(SIE_STIE) : "memory");
+    asm volatile("csrs sstatus, %0" : : "r"(SSTATUS_SIE) : "memory");
 }
 
 static void timer_sync_uptime(uint64_t now)
@@ -187,7 +174,12 @@ int add_timer(timer_callback_t callback, void *arg, uint64_t duration_ticks)
         return -1;
     }
 
-    expire = timer_read() + duration_ticks;
+    expire = timer_read();
+    if (duration_ticks > UINT64_MAX - expire) {
+        kfree(event);
+        return -1;
+    }
+    expire += duration_ticks;
     event->expire = expire;
     event->callback = callback;
     event->arg = arg;
@@ -239,9 +231,7 @@ void timer_irq_top(void)
     demo_trace_record(DEMO_TRACE_TIMER_TOP, timer_pending_count());
     timer_source_mask();
 
-    if (g_timer_task.state == IRQ_TASK_IDLE) {
-        (void)irq_task_enqueue(&g_timer_task);
-    }
+    (void)irq_task_enqueue(&g_timer_task);
 }
 
 int timer_task_run(struct irq_task *task)
@@ -250,6 +240,7 @@ int timer_task_run(struct irq_task *task)
     int fired_any = 0;
 
     (void)task;
+    if (!g_timer_enabled) { return 0; }
     demo_trace_record(DEMO_TRACE_TIMER_BOTTOM, timer_pending_count());
 
     if (g_timebase_freq == 0) {
@@ -299,7 +290,7 @@ int timer_task_run(struct irq_task *task)
         shell_redraw_prompt_delayed();
     }
 
-    timer_source_unmask();
+    if (g_timer_enabled) { timer_source_unmask(); }
     return 0;
 }
 
@@ -316,8 +307,7 @@ void timer_stop(void)
 
     sstatus = timer_irq_save();
     g_timer_enabled = 0;
-    g_timer_task.state = IRQ_TASK_IDLE;
-    g_timer_task.next = 0;
+    irq_task_cancel(&g_timer_task);
     /* Stop means "drop the whole pending queue" in this first version. */
     while (g_timer_head != 0) {
         struct timer_event *event = g_timer_head;

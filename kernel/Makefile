@@ -46,6 +46,10 @@ QEMU_CFLAGS  := $(COMMON_CFLAGS) -DQEMU
 BOARD_LDFLAGS := --defsym=KERNEL_LOAD_ADDR=0x20000000
 QEMU_LDFLAGS  := --defsym=KERNEL_LOAD_ADDR=0x82000000
 USER_LINK_ADDR := 0x32000000
+QEMU_USER_LINK_ADDR := 0x83000000
+QEMU_USER_BINS := $(addprefix $(USER_BUILD_DIR)/qemu_,$(addsuffix .bin,test badinst fork preempt))
+QEMU_ROOTFS_DIR := $(BUILD_DIR)/rootfs_qemu
+QEMU_INITRAMFS := $(BUILD_DIR)/initramfs_qemu.cpio
 
 .PHONY: all qemu clean
 
@@ -108,6 +112,26 @@ $(USER_PREEMPT_ELF): $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC) | $(USER_BUIL
 $(USER_PREEMPT_BIN): $(USER_PREEMPT_ELF) | $(USER_ROOTFS_DIR)
 	$(OBJCOPY) -O binary -S $< $@
 
+# Board binaries contain absolute references to 0x32000000. QEMU loads user
+# code at 0x83000000, so it needs separately linked binaries and an archive.
+$(USER_BUILD_DIR)/qemu_%.elf: $(USER_DIR)/%.S | $(USER_BUILD_DIR)
+	$(CC) $(QEMU_CFLAGS) -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $<
+
+$(USER_BUILD_DIR)/qemu_fork.elf: $(USER_FORK_START_SRC) $(USER_FORK_SRC) | $(USER_BUILD_DIR)
+	$(CC) $(QEMU_CFLAGS) -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $^
+
+$(USER_BUILD_DIR)/qemu_preempt.elf: $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC) | $(USER_BUILD_DIR)
+	$(CC) $(QEMU_CFLAGS) -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $^
+
+$(USER_BUILD_DIR)/qemu_%.bin: $(USER_BUILD_DIR)/qemu_%.elf
+	$(OBJCOPY) -O binary -S $< $@
+
+$(QEMU_INITRAMFS): $(ROOTFS_FILES) $(QEMU_USER_BINS)
+	mkdir -p $(QEMU_ROOTFS_DIR)/bin
+	cp -a $(ROOTFS_DIR)/. $(QEMU_ROOTFS_DIR)/
+	$(foreach name,test badinst fork preempt,cp $(USER_BUILD_DIR)/qemu_$(name).bin $(QEMU_ROOTFS_DIR)/bin/$(name).bin;)
+	cd $(QEMU_ROOTFS_DIR) && find . -print0 | LC_ALL=C sort -z | cpio --null -o -H newc --owner=0:0 > ../initramfs_qemu.cpio
+
 $(INITRAMFS): $(ROOTFS_FILES) $(USER_TEST_BIN) $(USER_BADINST_BIN) $(USER_FORK_BIN) $(USER_PREEMPT_BIN)
 	@if [ ! -d "$(ROOTFS_DIR)" ]; then \
 		echo "Missing $(ROOTFS_DIR)/ directory"; \
@@ -118,8 +142,8 @@ $(INITRAMFS): $(ROOTFS_FILES) $(USER_TEST_BIN) $(USER_BADINST_BIN) $(USER_FORK_B
 kernel.fit: kernel.bin $(ITS_FILE) $(DTB_FILE) $(INITRAMFS)
 	$(MKIMAGE) -f $(ITS_FILE) $@
 
-qemu: $(BUILD_DIR)/kernel_qemu.elf $(INITRAMFS)
-	$(QEMU) -M virt -smp 1 -m 256M -nographic -bios default -kernel $(BUILD_DIR)/kernel_qemu.elf -initrd $(INITRAMFS)
+qemu: $(BUILD_DIR)/kernel_qemu.elf $(QEMU_INITRAMFS)
+	$(QEMU) -M virt -smp 1 -m 256M -nographic -bios default -kernel $(BUILD_DIR)/kernel_qemu.elf -initrd $(QEMU_INITRAMFS)
 
 qemu-bin: $(BUILD_DIR)/kernel_qemu.elf
 	$(OBJCOPY) -O binary -S $< build/kernel_qemu.bin
