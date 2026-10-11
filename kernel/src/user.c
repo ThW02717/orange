@@ -66,7 +66,7 @@ void enter_user_mode(void)
     user_enter_current_task();
 }
 
-/* New schedulable user task entry used by thread_create_user(). */
+/* Common bootstrap for a new user process or a same-process user thread. */
 void user_task_entry(void *arg)
 {
     (void)arg;

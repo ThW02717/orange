@@ -52,7 +52,8 @@ struct thread_context {
  */
 struct thread {
     struct thread_context thread_context; /* first field: assembly context base */
-    int32_t pid;
+    int32_t tid;  /* unique scheduler identity */
+    int32_t tgid; /* process ID; the first thread has tid == tgid */
     enum thread_kind kind;
     enum thread_state state;
 
@@ -84,10 +85,25 @@ void thread_init(void);
 void thread_system_bootstrap_init(void);
 int thread_system_active(void);
 struct thread *thread_current(void);
-struct thread *thread_find_by_pid(int32_t pid);
+struct thread *thread_find_by_tid(int32_t tid);
 int thread_user_image_busy(const struct thread *except);
-int thread_create(void (*entry)(void *arg), void *arg, int is_idle);
-int thread_create_user(uintptr_t user_entry, uintptr_t user_stack_base, uintptr_t user_stack_top);
+int thread_create_kernel(void (*entry)(void *arg), void *arg, int is_idle);
+/* Start the first thread of a new process in the already-loaded image.
+ * The caller keeps its user stack on failure; the task owns it on success.
+ */
+int user_process_create(uintptr_t entry, uintptr_t stack_base, uintptr_t stack_top);
+/* Start a sibling in the current user process, with a fresh stack, not a copy.
+ * return_pc is a user-space stub that exits only this thread.
+ */
+int thread_create_user(uintptr_t entry, uintptr_t arg, uintptr_t return_pc);
+int thread_user_group_size(const struct thread *task);
+int thread_user_stack_contains(const struct thread *task, uintptr_t start, uintptr_t end);
+/* Internal construction helpers. Fork finishes its copied context before
+ * publication. A prepared task owns the supplied stack; publish it exactly
+ * once, after every field needed by its first run has been set.
+ */
+struct thread *thread_prepare_user(uintptr_t entry, uintptr_t stack_base, uintptr_t stack_top);
+void thread_publish_user(struct thread *task);
 /* Save the current thread context into `prev`, restore `next`, then set
  * tp to the new current-thread pointer before returning into `next`.
  */
@@ -97,7 +113,8 @@ void thread_run_until_idle(void);
 void thread_yield(void);
 void thread_exit(void);
 void thread_mark_current_zombie(int exit_status);
-int thread_stop_pid(int32_t pid, int exit_status);
+int thread_stop_tid(int32_t tid, int exit_status);
+int thread_stop_process(int32_t tgid, int exit_status);
 int thread_has_runnable_tasks(void);
 void thread_request_resched(void);
 int thread_consume_resched_request(void);

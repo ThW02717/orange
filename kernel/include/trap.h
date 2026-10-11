@@ -2,6 +2,7 @@
 #define TRAP_H
 
 #include <stdint.h>
+#include "syscall.h"
 
 /* sstatus bits used by the minimal S-mode <-> U-mode path.
  * SPP  : privilege level restored by sret (0 = U-mode, 1 = S-mode)
@@ -31,15 +32,6 @@
 /* Supervisor timer interrupt cause code used by Exercise 2. */
 #define SCAUSE_S_TIMER_INT     5UL
 #define SCAUSE_S_EXT_INT       9UL
-
-/* Minimal BE2 syscall ids carried in a7 across the ecall boundary. */
-#define SYS_getpid             0UL
-#define SYS_uart_read          1UL
-#define SYS_uart_write         2UL
-#define SYS_exec               3UL
-#define SYS_fork               4UL
-#define SYS_exit               5UL
-#define SYS_stop               6UL
 
 /* User memory layout.
  * Keep board addresses aligned with the OrangePi RV2 plan.

@@ -13,7 +13,7 @@ static struct thread *g_zombie_head = 0;
 static struct thread *g_all_threads = 0;
 static struct thread g_boot_idle_thread;
 static struct thread *g_thread_current = 0;
-static int32_t g_next_tid = 1;
+static uint32_t g_next_tid = 1;
 static int g_threading_started = 0;
 static int g_need_resched = 0;
 
@@ -42,6 +42,19 @@ static uint64_t thread_irq_save(void)
 static void thread_irq_restore(uint64_t sstatus)
 {
     asm volatile("csrw sstatus, %0" : : "r"(sstatus) : "memory");
+}
+
+static int32_t thread_next_tid(void)
+{
+    uint64_t status = thread_irq_save();
+    int32_t tid = -1;
+
+    /* Do not wrap an ID into an existing task or a negative error value. */
+    if (g_next_tid <= INT32_MAX) {
+        tid = (int32_t)g_next_tid++;
+    }
+    thread_irq_restore(status);
+    return tid;
 }
 
 static void thread_list_add(struct thread *t)
@@ -193,9 +206,9 @@ static void kill_zombies(void)
 
 /* First entry point for a brand-new thread.
  *
- * thread_create() prepares the initial saved context so the first switch_to()
- * into a fresh worker returns here. This bootstrap helper then calls the real
- * thread entry function and finishes with thread_exit().
+ * Both kernel and user constructors seed thread_context.ra with this address.
+ * The first switch_to() returns here, then calls the task's kernel-side entry.
+ * A user task proceeds to sret; a returning kernel worker calls thread_exit().
  */
 static void thread_bootstrap(void)
 {
@@ -267,7 +280,8 @@ void thread_init(void)
     g_boot_idle_thread.thread_context.s9 = 0;
     g_boot_idle_thread.thread_context.s10 = 0;
     g_boot_idle_thread.thread_context.s11 = 0;
-    g_boot_idle_thread.pid = 0;
+    g_boot_idle_thread.tid = 0;
+    g_boot_idle_thread.tgid = 0;
     g_boot_idle_thread.kind = THREAD_KERNEL;
     g_boot_idle_thread.state = THREAD_RUNNING;
     g_boot_idle_thread.entry = 0;
@@ -320,21 +334,25 @@ void thread_system_bootstrap_init(void)
 
 /* Allocate a runnable worker thread and seed its initial context.
  *
- * A brand-new thread has never executed before, so thread_create() must build
- * the first saved context image by hand:
+ * A brand-new thread has never executed before, so build its first saved
+ * context by hand:
  * - thread_context.sp starts at the top of the new kernel stack
  * - thread_context.ra starts at thread_bootstrap()
  *
  * After that, the scheduler can switch to the worker exactly like any other
  * saved context.
  */
-int thread_create(void (*entry)(void *arg), void *arg, int is_idle)
+int thread_create_kernel(void (*entry)(void *arg), void *arg, int is_idle)
 {
     struct thread *th;
     uint64_t top;
-    uint64_t sstatus;
+    int32_t tid;
 
     if (entry == 0 || is_idle != 0) {
+        return -1;
+    }
+    tid = thread_next_tid();
+    if (tid < 0) {
         return -1;
     }
 
@@ -367,9 +385,8 @@ int thread_create(void (*entry)(void *arg), void *arg, int is_idle)
     th->thread_context.s10 = 0;
     th->thread_context.s11 = 0;
 
-    sstatus = thread_irq_save();
-    th->pid = g_next_tid++;
-    thread_irq_restore(sstatus);
+    th->tid = tid;
+    th->tgid = tid;
     th->kind = THREAD_KERNEL;
     th->state = THREAD_RUNNABLE;
     th->entry = entry;
@@ -387,33 +404,39 @@ int thread_create(void (*entry)(void *arg), void *arg, int is_idle)
 
     thread_list_add(th);
     runq_push(th);
-    return th->pid;
+    return th->tid;
 }
 
-/* Allocate a user task and seed the top-of-stack trap context for its first
- * return to U-mode. User and kernel tasks share the same scheduler.
+/* Build the common user task, but keep it off every scheduler list for now.
+ * The caller still needs to choose its process and finish the trap context.
  */
-int thread_create_user(uintptr_t user_entry, uintptr_t user_stack_base, uintptr_t user_stack_top)
+struct thread *thread_prepare_user(uintptr_t user_entry, uintptr_t user_stack_base, uintptr_t user_stack_top)
 {
     struct thread *th;
     uint64_t top;
-    uint64_t sstatus;
+    int32_t tid;
     unsigned int i;
     uint64_t *raw;
 
-    if (user_entry == 0 || user_stack_top <= user_stack_base) {
-        return -1;
+    if (user_entry < USER_CODE_BASE || user_entry >= USER_CODE_LIMIT ||
+        (user_entry & 1U) != 0 || user_stack_base == 0 ||
+        user_stack_top <= user_stack_base || (user_stack_top & 15U) != 0) {
+        return 0;
+    }
+    tid = thread_next_tid();
+    if (tid < 0) {
+        return 0;
     }
 
     th = (struct thread *)kmalloc(sizeof(*th));
     if (th == 0) {
-        return -1;
+        return 0;
     }
 
     th->kstack_base = kmalloc(THREAD_STACK_SIZE);
     if (th->kstack_base == 0) {
         kfree(th);
-        return -1;
+        return 0;
     }
 
     top = (uint64_t)(uintptr_t)th->kstack_base + THREAD_STACK_SIZE;
@@ -437,11 +460,10 @@ int thread_create_user(uintptr_t user_entry, uintptr_t user_stack_base, uintptr_
     th->thread_context.s10 = 0;
     th->thread_context.s11 = 0;
 
-    sstatus = thread_irq_save();
-    th->pid = g_next_tid++;
-    thread_irq_restore(sstatus);
+    th->tid = tid;
+    th->tgid = tid;
     th->kind = THREAD_USER;
-    th->state = THREAD_RUNNABLE;
+    th->state = THREAD_BLOCKED;
     th->entry = user_task_entry;
     th->arg = 0;
     th->kstack_top = top;
@@ -468,12 +490,103 @@ int thread_create_user(uintptr_t user_entry, uintptr_t user_stack_base, uintptr_
     th->tc->sepc = th->user_entry;
     th->tc->sstatus = SSTATUS_SPIE;
 
-    thread_list_add(th);
-    runq_push(th);
-    return th->pid;
+    return th;
 }
 
-struct thread *thread_find_by_pid(int32_t pid)
+void thread_publish_user(struct thread *task)
+{
+    uint64_t status = thread_irq_save();
+
+    task->state = THREAD_RUNNABLE;
+    thread_list_add(task);
+    runq_push(task);
+    thread_irq_restore(status);
+}
+
+int user_process_create(uintptr_t entry, uintptr_t stack_base, uintptr_t stack_top)
+{
+    struct thread *task = thread_prepare_user(entry, stack_base, stack_top);
+
+    if (task == 0) {
+        return -1;
+    }
+    /* This is a new process, so keep the default tgid == tid. */
+    thread_publish_user(task);
+    return task->tid;
+}
+
+int thread_create_user(uintptr_t entry, uintptr_t arg, uintptr_t return_pc)
+{
+    struct thread *parent = thread_current();
+    struct thread *child;
+    uintptr_t stack;
+
+    if (parent == 0 || parent->kind != THREAD_USER || parent->tc == 0 ||
+        parent->state == THREAD_ZOMBIE ||
+        entry < USER_CODE_BASE || entry >= USER_CODE_LIMIT || (entry & 1U) != 0 ||
+        return_pc < USER_CODE_BASE || return_pc >= USER_CODE_LIMIT || (return_pc & 1U) != 0) {
+        return -1;
+    }
+    stack = (uintptr_t)kmalloc(USER_STACK_SIZE);
+    if (stack == 0) {
+        return -1;
+    }
+    child = thread_prepare_user(entry, stack, stack + USER_STACK_SIZE);
+    if (child == 0) {
+        kfree((void *)stack);
+        return -1;
+    }
+    /* Same process, new stack. Only fork copies the parent's stack/context. */
+    child->tgid = parent->tgid;
+    child->tc->a0 = arg;
+    child->tc->ra = return_pc;
+    child->tc->gp = parent->tc->gp;
+    thread_publish_user(child);
+    return child->tid;
+}
+
+int thread_user_group_size(const struct thread *task)
+{
+    uint64_t status = thread_irq_save();
+    struct thread *cur;
+    int count = 0;
+
+    if (task != 0 && task->kind == THREAD_USER) {
+        for (cur = g_all_threads; cur != 0; cur = cur->all_next) {
+            if (cur->kind == THREAD_USER && cur->tgid == task->tgid &&
+                cur->state != THREAD_ZOMBIE) {
+                count++;
+            }
+        }
+    }
+    thread_irq_restore(status);
+    return count;
+}
+
+int thread_user_stack_contains(const struct thread *task, uintptr_t start, uintptr_t end)
+{
+    uint64_t status = thread_irq_save();
+    struct thread *cur;
+    int found = 0;
+
+    /* A sibling may pass a pointer into a live thread's stack. Its lifetime
+     * still ends with the owner: detached thread stacks are not shared heaps.
+     */
+    if (task != 0 && task->kind == THREAD_USER && end > start) {
+        for (cur = g_all_threads; cur != 0; cur = cur->all_next) {
+            if (cur->kind == THREAD_USER && cur->tgid == task->tgid &&
+                cur->state != THREAD_ZOMBIE && start >= cur->user_stack_base &&
+                end <= cur->user_stack_top) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    thread_irq_restore(status);
+    return found;
+}
+
+struct thread *thread_find_by_tid(int32_t tid)
 {
     struct thread *cur;
     uint64_t sstatus;
@@ -481,7 +594,7 @@ struct thread *thread_find_by_pid(int32_t pid)
     sstatus = thread_irq_save();
     cur = g_all_threads;
     while (cur != 0) {
-        if (cur->pid == pid) {
+        if (cur->tid == tid) {
             break;
         }
         cur = cur->all_next;
@@ -607,12 +720,12 @@ void thread_mark_current_zombie(int exit_status)
     thread_irq_restore(sstatus);
 }
 
-int thread_stop_pid(int32_t pid, int exit_status)
+int thread_stop_tid(int32_t tid, int exit_status)
 {
     struct thread *target;
     uint64_t sstatus;
 
-    target = thread_find_by_pid(pid);
+    target = thread_find_by_tid(tid);
     if (target == 0 || target->is_idle != 0) {
         return -1;
     }
@@ -633,6 +746,23 @@ int thread_stop_pid(int32_t pid, int exit_status)
     g_zombie_head = target;
     thread_irq_restore(sstatus);
     return 0;
+}
+
+int thread_stop_process(int32_t tgid, int exit_status)
+{
+    uint64_t status = thread_irq_save();
+    struct thread *cur;
+    int found = 0;
+
+    /* Search by group, not by its first thread: the leader may have exited. */
+    for (cur = g_all_threads; cur != 0; cur = cur->all_next) {
+        if (cur->kind == THREAD_USER && cur->tgid == tgid) {
+            (void)thread_stop_tid(cur->tid, exit_status);
+            found = 1;
+        }
+    }
+    thread_irq_restore(status);
+    return found ? 0 : -1;
 }
 
 int thread_has_runnable_tasks(void)

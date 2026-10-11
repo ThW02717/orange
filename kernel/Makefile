@@ -31,6 +31,10 @@ USER_PREEMPT_START_SRC := $(USER_DIR)/preempt_start.S
 USER_PREEMPT_SRC := $(USER_DIR)/preempt.c
 USER_PREEMPT_ELF := $(USER_BUILD_DIR)/preempt.elf
 USER_PREEMPT_BIN := $(USER_ROOTFS_DIR)/preempt.bin
+USER_THREADS_SRCS := $(USER_DIR)/threads_start.S $(USER_DIR)/threads.c
+USER_THREADS_ELF := $(USER_BUILD_DIR)/threads.elf
+USER_THREADS_BIN := $(USER_ROOTFS_DIR)/threads.bin
+USER_THREADS_HEADERS := $(USER_DIR)/user_api.h $(INC_DIR)/syscall.h
 
 C_SRCS    := $(wildcard $(SRC_DIR)/*.c)
 ASM_SRCS  := $(wildcard $(SRC_DIR)/*.S)
@@ -47,7 +51,7 @@ BOARD_LDFLAGS := --defsym=KERNEL_LOAD_ADDR=0x20000000
 QEMU_LDFLAGS  := --defsym=KERNEL_LOAD_ADDR=0x82000000
 USER_LINK_ADDR := 0x32000000
 QEMU_USER_LINK_ADDR := 0x83000000
-QEMU_USER_BINS := $(addprefix $(USER_BUILD_DIR)/qemu_,$(addsuffix .bin,test badinst fork preempt))
+QEMU_USER_BINS := $(addprefix $(USER_BUILD_DIR)/qemu_,$(addsuffix .bin,test badinst fork preempt threads))
 QEMU_ROOTFS_DIR := $(BUILD_DIR)/rootfs_qemu
 QEMU_INITRAMFS := $(BUILD_DIR)/initramfs_qemu.cpio
 
@@ -88,7 +92,7 @@ kernel.elf: $(BUILD_DIR)/kernel_board.elf
 kernel.bin: $(BUILD_DIR)/kernel_board.elf
 	$(OBJCOPY) -O binary -S $< $@
 
-$(USER_TEST_ELF): $(USER_TEST_SRC) | $(USER_BUILD_DIR)
+$(USER_TEST_ELF): $(USER_TEST_SRC) $(INC_DIR)/syscall.h | $(USER_BUILD_DIR)
 	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $<
 
 $(USER_TEST_BIN): $(USER_TEST_ELF) | $(USER_ROOTFS_DIR)
@@ -100,28 +104,39 @@ $(USER_BADINST_ELF): $(USER_BADINST_SRC) | $(USER_BUILD_DIR)
 $(USER_BADINST_BIN): $(USER_BADINST_ELF) | $(USER_ROOTFS_DIR)
 	$(OBJCOPY) -O binary -S $< $@
 
-$(USER_FORK_ELF): $(USER_FORK_START_SRC) $(USER_FORK_SRC) | $(USER_BUILD_DIR)
+$(USER_FORK_ELF): $(USER_FORK_START_SRC) $(USER_FORK_SRC) $(INC_DIR)/syscall.h | $(USER_BUILD_DIR)
 	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_FORK_START_SRC) $(USER_FORK_SRC)
 
 $(USER_FORK_BIN): $(USER_FORK_ELF) | $(USER_ROOTFS_DIR)
 	$(OBJCOPY) -O binary -S $< $@
 
-$(USER_PREEMPT_ELF): $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC) | $(USER_BUILD_DIR)
+$(USER_PREEMPT_ELF): $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC) $(INC_DIR)/syscall.h | $(USER_BUILD_DIR)
 	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC)
 
 $(USER_PREEMPT_BIN): $(USER_PREEMPT_ELF) | $(USER_ROOTFS_DIR)
 	$(OBJCOPY) -O binary -S $< $@
 
+# User tp belongs to the scheduler, not TLS. Avoid gp-relative relaxation;
+# the minimal raw-image entry has no C runtime to initialize gp.
+$(USER_THREADS_ELF): $(USER_THREADS_SRCS) $(USER_THREADS_HEADERS) | $(USER_BUILD_DIR)
+	$(CC) $(BOARD_CFLAGS) -msmall-data-limit=0 -mno-relax -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_THREADS_SRCS)
+
+$(USER_THREADS_BIN): $(USER_THREADS_ELF) | $(USER_ROOTFS_DIR)
+	$(OBJCOPY) -O binary -S $< $@
+
 # Board binaries contain absolute references to 0x32000000. QEMU loads user
 # code at 0x83000000, so it needs separately linked binaries and an archive.
-$(USER_BUILD_DIR)/qemu_%.elf: $(USER_DIR)/%.S | $(USER_BUILD_DIR)
+$(USER_BUILD_DIR)/qemu_%.elf: $(USER_DIR)/%.S $(INC_DIR)/syscall.h | $(USER_BUILD_DIR)
 	$(CC) $(QEMU_CFLAGS) -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $<
 
-$(USER_BUILD_DIR)/qemu_fork.elf: $(USER_FORK_START_SRC) $(USER_FORK_SRC) | $(USER_BUILD_DIR)
-	$(CC) $(QEMU_CFLAGS) -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $^
+$(USER_BUILD_DIR)/qemu_fork.elf: $(USER_FORK_START_SRC) $(USER_FORK_SRC) $(INC_DIR)/syscall.h | $(USER_BUILD_DIR)
+	$(CC) $(QEMU_CFLAGS) -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_FORK_START_SRC) $(USER_FORK_SRC)
 
-$(USER_BUILD_DIR)/qemu_preempt.elf: $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC) | $(USER_BUILD_DIR)
-	$(CC) $(QEMU_CFLAGS) -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $^
+$(USER_BUILD_DIR)/qemu_preempt.elf: $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC) $(INC_DIR)/syscall.h | $(USER_BUILD_DIR)
+	$(CC) $(QEMU_CFLAGS) -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC)
+
+$(USER_BUILD_DIR)/qemu_threads.elf: $(USER_THREADS_SRCS) $(USER_THREADS_HEADERS) | $(USER_BUILD_DIR)
+	$(CC) $(QEMU_CFLAGS) -msmall-data-limit=0 -mno-relax -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_THREADS_SRCS)
 
 $(USER_BUILD_DIR)/qemu_%.bin: $(USER_BUILD_DIR)/qemu_%.elf
 	$(OBJCOPY) -O binary -S $< $@
@@ -129,10 +144,10 @@ $(USER_BUILD_DIR)/qemu_%.bin: $(USER_BUILD_DIR)/qemu_%.elf
 $(QEMU_INITRAMFS): $(ROOTFS_FILES) $(QEMU_USER_BINS)
 	mkdir -p $(QEMU_ROOTFS_DIR)/bin
 	cp -a $(ROOTFS_DIR)/. $(QEMU_ROOTFS_DIR)/
-	$(foreach name,test badinst fork preempt,cp $(USER_BUILD_DIR)/qemu_$(name).bin $(QEMU_ROOTFS_DIR)/bin/$(name).bin;)
+	$(foreach name,test badinst fork preempt threads,cp $(USER_BUILD_DIR)/qemu_$(name).bin $(QEMU_ROOTFS_DIR)/bin/$(name).bin;)
 	cd $(QEMU_ROOTFS_DIR) && find . -print0 | LC_ALL=C sort -z | cpio --null -o -H newc --owner=0:0 > ../initramfs_qemu.cpio
 
-$(INITRAMFS): $(ROOTFS_FILES) $(USER_TEST_BIN) $(USER_BADINST_BIN) $(USER_FORK_BIN) $(USER_PREEMPT_BIN)
+$(INITRAMFS): $(ROOTFS_FILES) $(USER_TEST_BIN) $(USER_BADINST_BIN) $(USER_FORK_BIN) $(USER_PREEMPT_BIN) $(USER_THREADS_BIN)
 	@if [ ! -d "$(ROOTFS_DIR)" ]; then \
 		echo "Missing $(ROOTFS_DIR)/ directory"; \
 		exit 1; \

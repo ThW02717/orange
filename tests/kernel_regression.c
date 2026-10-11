@@ -11,6 +11,12 @@
 #include "../kernel/src/uart.c"
 #include "../kernel/src/timer.c"
 #include "../kernel/src/demo.c"
+/* Keep the custom register-roundtrip dispatcher below, but test the real
+ * fork implementation and its rejection/rollback paths directly as well.
+ */
+#define trap_dispatch production_trap_dispatch
+#include "../kernel/src/trap.c"
+#undef trap_dispatch
 
 static unsigned char heap[524288] __attribute__((aligned(4096)));
 static unsigned int heap_used;
@@ -160,6 +166,154 @@ static void stop_from_callback(void *arg)
     timer_stop();
 }
 
+static void test_user_groups(void)
+{
+    struct thread *idle = thread_current();
+    struct thread *parent;
+    struct thread *other;
+    struct thread *sibling;
+    struct thread *child;
+    uintptr_t stack;
+    uintptr_t parent_stack;
+    int parent_tid;
+    int other_tid;
+    int tid;
+    unsigned int before;
+
+    check(g_rq.head == 0 && g_zombie_head == 0, "fixture heap still in use");
+    heap_used = 0;
+    stack = (uintptr_t)kmalloc(USER_STACK_SIZE);
+    child = thread_prepare_user(USER_CODE_BASE, stack, stack + USER_STACK_SIZE);
+    check(child && child->state == THREAD_BLOCKED && !thread_user_image_busy(0) &&
+          thread_find_by_tid(child->tid) == 0 && g_rq.head == 0,
+          "prepared child visible before publication");
+    thread_publish_user(child);
+    check(thread_find_by_tid(child->tid) == child && g_rq.head == child,
+          "published child missing from scheduler");
+    check(thread_stop_tid(child->tid, 0) == 0, "stop prepared child");
+    thread_run_until_idle();
+    heap_used = 0;
+    stack = (uintptr_t)kmalloc(USER_STACK_SIZE);
+    parent_tid = user_process_create(USER_CODE_BASE, stack, stack + USER_STACK_SIZE);
+    stack = (uintptr_t)kmalloc(USER_STACK_SIZE);
+    other_tid = user_process_create(USER_CODE_BASE, stack, stack + USER_STACK_SIZE);
+    parent = thread_find_by_tid(parent_tid);
+    other = thread_find_by_tid(other_tid);
+    check(parent && other && parent->tid != other->tid, "new process IDs");
+    parent_stack = parent->user_stack_base;
+    check(parent->tid == parent->tgid && other->tid == other->tgid, "leader IDs");
+    check(thread_create_user(USER_CODE_BASE, 0, USER_CODE_BASE + 4) == -1,
+          "kernel caller cannot create a same-process user thread");
+
+    /* Run constructor/syscall code as parent, without entering the fixture's
+     * fake user image. Restore idle before any real scheduler switch.
+     */
+    runq_remove(parent);
+    parent->state = THREAD_RUNNING;
+    thread_set_tp(parent);
+    parent->tc->gp = 0x12345678;
+    before = heap_used;
+    check(thread_create_user(0, 0, USER_CODE_BASE + 4) == -1 &&
+          thread_create_user(USER_CODE_BASE + 1, 0, USER_CODE_BASE + 4) == -1 &&
+          thread_create_user(USER_CODE_BASE, 0, USER_CODE_LIMIT) == -1 &&
+          thread_create_user(USER_CODE_BASE, 0, USER_CODE_BASE + 1) == -1,
+          "invalid thread entry/return");
+    check(heap_used == before, "invalid entry allocated memory");
+
+    for (int budget = 0; budget < 3; budget++) {
+        unsigned int heap_before = heap_used;
+        before = frees;
+        allocations_before_failure = budget;
+        check(thread_create_user(USER_CODE_BASE, 0, USER_CODE_BASE + 4) == -1,
+              "sibling OOM must fail");
+        allocations_before_failure = -1;
+        check(frees - before == (unsigned int)budget && thread_user_group_size(parent) == 1,
+              "sibling OOM leaked or published a task");
+        heap_used = heap_before;
+    }
+    tid = thread_create_user(USER_CODE_BASE + 8, parent->user_stack_base + 64, USER_CODE_BASE + 4);
+    sibling = thread_find_by_tid(tid);
+    check(sibling && sibling->tid != parent->tid && sibling->tgid == parent->tgid,
+          "same process, different TID");
+    check(sibling->kstack_base != parent->kstack_base &&
+          sibling->user_stack_base != parent->user_stack_base && sibling->tc != parent->tc,
+          "sibling has private stacks and context");
+    check(sibling->tc->a0 == parent->user_stack_base + 64 &&
+          sibling->tc->ra == USER_CODE_BASE + 4 && sibling->tc->sepc == USER_CODE_BASE + 8 &&
+          sibling->tc->gp == parent->tc->gp && sibling->tc->tp == (uintptr_t)sibling &&
+          sibling->tc->sp == sibling->user_stack_top && sibling->tc->sstatus == SSTATUS_SPIE,
+          "sibling initial registers");
+    check(thread_user_group_size(parent) == 2 && sys_fork(parent->tc) == -1,
+          "multithreaded fork must fail");
+    check(thread_user_stack_contains(sibling, parent->user_stack_base, parent->user_stack_top) &&
+          !thread_user_stack_contains(other, parent->user_stack_base, parent->user_stack_top) &&
+          !thread_user_stack_contains(parent, parent->user_stack_base, parent->user_stack_top + 1),
+          "group stack buffer boundaries");
+    check(thread_stop_tid(tid, 0) == 0 && thread_user_group_size(parent) == 1,
+          "thread exit kept group alive");
+    kill_zombies();
+
+    parent->tc->sepc = USER_CODE_BASE + 20;
+    parent->tc->sp = parent->user_stack_base - 1;
+    before = heap_used;
+    check(sys_fork(parent->tc) == -1 && heap_used == before, "invalid fork sp allocated child");
+    parent->tc->sp = parent->user_stack_top - 64;
+    parent->tc->s0 = parent->user_stack_top - 32;
+    *(uint64_t *)(parent->user_stack_base + 64) = parent->user_stack_base + 128;
+    *(uint64_t *)(parent->user_stack_base + 72) = 0x1234;
+    for (int budget = 0; budget < 3; budget++) {
+        unsigned int heap_before = heap_used;
+        before = frees;
+        allocations_before_failure = budget;
+        check(sys_fork(parent->tc) == -1, "fork OOM must fail");
+        allocations_before_failure = -1;
+        check(frees - before == (unsigned int)budget && g_rq.head == other && g_rq.tail == other,
+              "fork OOM leaked or published a child");
+        heap_used = heap_before;
+    }
+    tid = (int)sys_fork(parent->tc);
+    child = thread_find_by_tid(tid);
+    check(child && child->tid == child->tgid && child->tgid != parent->tgid, "fork new process");
+    check(child->tc->a0 == 0 && child->tc->sepc == parent->tc->sepc + 4 &&
+          child->tc->tp == (uintptr_t)child && child->tc->sp == child->user_stack_top - 64 &&
+          child->tc->s0 == child->user_stack_top - 32 && child->state == THREAD_RUNNABLE,
+          "fork published incomplete context");
+    check(*(uint64_t *)(child->user_stack_base + 64) == child->user_stack_base + 128 &&
+          *(uint64_t *)(child->user_stack_base + 72) == 0x1234,
+          "fork stack copy/rebase");
+
+    tid = thread_create_user(USER_CODE_BASE, 0, USER_CODE_BASE + 4);
+    sibling = thread_find_by_tid(tid);
+    check(sibling != 0, "create survivor");
+    thread_mark_current_zombie(0);
+    thread_set_tp(idle);
+    kill_zombies();
+    check(thread_find_by_tid(parent_tid) == 0 && sibling->tgid == parent_tid,
+          "reaping leader changed process ID");
+    check(!thread_user_stack_contains(sibling, parent_stack, parent_stack + 1),
+          "exited leader stack still accepted");
+    check(!thread_user_stack_contains(sibling, stack, stack + 1), "other process stack accepted");
+    check(thread_user_image_busy(sibling), "other process still uses image");
+    before = frees;
+    check(thread_stop_process(parent_tid, 0) == 0 && thread_stop_process(parent_tid, 0) == 0,
+          "stop group without leader");
+    kill_zombies();
+    check(frees - before == 3 && other->state == THREAD_RUNNABLE && child->state == THREAD_RUNNABLE,
+          "group stop affected another process or double-freed");
+    check(thread_stop_process(other->tgid, 0) == 0 && thread_stop_process(child->tgid, 0) == 0,
+          "stop remaining groups");
+    thread_run_until_idle();
+    check(g_rq.head == 0 && g_rq.tail == 0 && !thread_user_image_busy(0), "group cleanup");
+
+    g_next_tid = INT32_MAX;
+    check(thread_create_kernel(worker, 0, 0) == INT32_MAX &&
+          thread_create_kernel(worker, 0, 0) == -1, "TID overflow");
+    check(thread_stop_tid(INT32_MAX, 0) == 0, "stop last representable TID");
+    thread_run_until_idle();
+    puts_raw("[REGRESSION] user groups, register seeds, fork copy, leader exit, ID overflow: PASS\n");
+    puts_raw("[REGRESSION] sibling/fork allocation-failure rollback (3 + 3 positions): PASS\n");
+}
+
 void regression_main(void)
 {
     int pid;
@@ -170,14 +324,14 @@ void regression_main(void)
     asm volatile("csrw stvec, %0" : : "r"(trap_entry));
 
     thread_system_bootstrap_init();
-    pid = thread_create(worker, 0, 0);
+    pid = thread_create_kernel(worker, 0, 0);
     check(pid > 0, "create stopped worker");
-    check(thread_stop_pid(pid, 0) == 0, "stop runnable worker");
-    check(thread_stop_pid(pid, 0) == 0, "repeat stop");
+    check(thread_stop_tid(pid, 0) == 0, "stop runnable worker");
+    check(thread_stop_tid(pid, 0) == 0, "repeat stop");
     thread_run_until_idle();
     check(workers == 0 && frees == 2, "zombie removed/freed exactly once");
     check(g_rq.head == 0 && g_rq.tail == 0 && g_zombie_head == 0, "stale scheduler links");
-    check(thread_create(worker, 0, 0) > 0 && thread_create(worker, 0, 0) > 0, "create workers");
+    check(thread_create_kernel(worker, 0, 0) > 0 && thread_create_kernel(worker, 0, 0) > 0, "create workers");
     thread_run_until_idle();
     check(workers == 8 && frees == 6, "cooperative scheduling and reclamation");
     puts_raw("[REGRESSION] scheduler stop/repeat-stop/yield/reclaim: PASS\n");
@@ -195,6 +349,7 @@ void regression_main(void)
               "launch failure left live user task");
     }
     puts_raw("[REGRESSION] user launch allocation-failure rollback (6 positions): PASS\n");
+    test_user_groups();
 
     supervisor_roundtrip();
     irq_task_backend_init();

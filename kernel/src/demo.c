@@ -126,9 +126,10 @@ void demo_print_usage(void)
 {
     uart_send_string("demo usage:\n");
     uart_send_string("  demo badinst     - run the illegal-instruction user test and return to shell\n");
-    uart_send_string("  demo foo         - create threads with thread_create(foo, ...)\n");
+    uart_send_string("  demo foo         - create threads with thread_create_kernel(foo, ...)\n");
     uart_send_string("  demo fork        - run the user-space fork demo and return to shell\n");
     uart_send_string("  demo preempt     - run two busy user tasks to test timer preemption\n");
+    uart_send_string("  demo threads     - test same-process user threads and group exit\n");
     uart_send_string("  demo nested      - print the recommended manual nested-interrupt test flow\n");
     uart_send_string("  demo thread      - run a cooperative RR kernel-thread demo and enter idle\n");
     uart_send_string("  demo test        - run the user-space syscall smoke test and return to shell\n");
@@ -275,7 +276,7 @@ static int demo_launch_user_program(const char *name,
             goto launch_failed;
         }
         user_stack_top = (user_stack_base + USER_STACK_SIZE) & ~0xFUL;
-        created_pids[i] = thread_create_user(entry, user_stack_base, user_stack_top);
+        created_pids[i] = user_process_create(entry, user_stack_base, user_stack_top);
         if (created_pids[i] < 0) {
             kfree((void *)(uintptr_t)user_stack_base);
             uart_send_string("demo ");
@@ -296,7 +297,7 @@ static int demo_launch_user_program(const char *name,
 
 launch_failed:
     while (i > 0U) {
-        (void)thread_stop_pid(created_pids[--i], -1);
+        (void)thread_stop_tid(created_pids[--i], -1);
     }
     thread_run_until_idle();
     return -1;
@@ -306,7 +307,7 @@ launch_failed:
  * demo foo
  *
  * Minimal thread-create example that mirrors the spec most directly:
- * thread_create(foo, ...). The goal is only to show that a plain function
+ * thread_create_kernel(foo, ...). The goal is only to show that a plain function
  * name can be passed as the thread entry.
  * ========================= */
 static void foo(void *arg)
@@ -347,23 +348,23 @@ static int demo_foo(void)
     uart_send_string("[foo] bootstrap shell -> idle\n");
     thread_system_bootstrap_init();
 
-    tid = thread_create(foo, &ids[0], 0);
+    tid = thread_create_kernel(foo, &ids[0], 0);
     if (tid < 0) {
         uart_send_string("demo foo: failed to create foo #1\n");
         return -1;
     }
-    tid = thread_create(foo, &ids[1], 0);
+    tid = thread_create_kernel(foo, &ids[1], 0);
     if (tid < 0) {
         uart_send_string("demo foo: failed to create foo #2\n");
         return -1;
     }
-    tid = thread_create(foo, &ids[2], 0);
+    tid = thread_create_kernel(foo, &ids[2], 0);
     if (tid < 0) {
         uart_send_string("demo foo: failed to create foo #3\n");
         return -1;
     }
 
-    uart_send_string("[foo] using thread_create(foo, ...)\n");
+    uart_send_string("[foo] using thread_create_kernel(foo, ...)\n");
     uart_send_string("[foo] expect [foo 1:0] [foo 2:0] [foo 3:0] ...\n");
     thread_enter_idle();
     return -1;
@@ -418,17 +419,17 @@ static int demo_thread(void)
     uart_send_string("[thread] bootstrap shell -> idle\n");
     thread_system_bootstrap_init();
 
-    tid = thread_create(demo_thread_worker, &args[0], 0);
+    tid = thread_create_kernel(demo_thread_worker, &args[0], 0);
     if (tid < 0) {
         uart_send_string("thread demo: failed to create worker A\n");
         return -1;
     }
-    tid = thread_create(demo_thread_worker, &args[1], 0);
+    tid = thread_create_kernel(demo_thread_worker, &args[1], 0);
     if (tid < 0) {
         uart_send_string("thread demo: failed to create worker B\n");
         return -1;
     }
-    tid = thread_create(demo_thread_worker, &args[2], 0);
+    tid = thread_create_kernel(demo_thread_worker, &args[2], 0);
     if (tid < 0) {
         uart_send_string("thread demo: failed to create worker C\n");
         return -1;
@@ -585,6 +586,9 @@ int demo_run(const char *name)
     }
     if (streq_local(cmd, "preempt")) {
         return demo_preempt();
+    }
+    if (streq_local(cmd, "threads")) {
+        return demo_launch_user_program("threads", "[threads]", 1U);
     }
     if (streq_local(cmd, "uart")) {
         return demo_uart();

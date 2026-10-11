@@ -24,6 +24,9 @@ def main() -> int:
             ("demo badinst", b"[badinst]: done", b"[trap] user fault, terminate"),
             ("demo fork", b"[fork]: done", b"child2:"),
             ("demo preempt", b"[preempt]: done", b"busy: pid="),
+            ("demo threads", b"[threads]: done", b"[threads] stop group by original PID"),
+            ("runu threads", b"user task finished, back to shell", b"[threads] stop group by original PID"),
+            ("demo test", b"[test]: done", b"pid="),
             ("addtimer 18446744073709551617", b"> ", b"usage: addtimer"),
             ("demo stress 18446744073709551617", b"> ", b"usage:"),
             ("addtimer 0.01", b"[T1]", b"[T1]"),
@@ -45,6 +48,20 @@ def main() -> int:
             if command == "demo preempt":
                 pids = re.findall(rb"busy: pid=(\d+)", output)
                 assert len(pids) == 8 and len(set(pids[:4])) == 2, output.decode(errors="replace")
+            if command == "demo test":
+                assert re.search(rb"pid=\d+\r?\n", output), output.decode(errors="replace")
+            if command in ("demo threads", "runu threads"):
+                for marker in (
+                    b"invalid entry/return: PASS", b"shared stack buffer: PASS",
+                    b"same PID, different TID, shared global: PASS",
+                    b"multithreaded fork/exec rejection: PASS",
+                    b"fork gets a new PID/TID: PASS",
+                    b"cross-process image replacement rejected: PASS",
+                    b"exit_group with a live sibling",
+                    b"returning worker and single-thread fork: PASS",
+                    b"leader exit and nonleader create: PASS",
+                ):
+                    assert marker in output, output.decode(errors="replace")
             print(f"[SYSTEM] {command}: PASS")
         print("[SYSTEM] SUMMARY: PASS")
         return 0

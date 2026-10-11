@@ -52,7 +52,7 @@ static int user_range_ok(const struct thread *task, uintptr_t addr, uint64_t cou
         return 0;
     }
 
-    if (addr >= task->user_stack_base && end <= task->user_stack_top) {
+    if (thread_user_stack_contains(task, addr, end)) {
         return 1;
     }
     if (!writable && addr >= USER_CODE_BASE && end <= USER_CODE_LIMIT) {
@@ -68,7 +68,14 @@ static long sys_getpid(void)
     if (task == 0) {
         return -1;
     }
-    return task->pid;
+    return task->tgid;
+}
+
+static long sys_gettid(void)
+{
+    struct thread *task = current_user_task();
+
+    return task != 0 ? task->tid : -1;
 }
 
 static long sys_uart_write(const char *buf, long count)
@@ -123,6 +130,12 @@ static long sys_exec(const char *path, struct trap_context *tc)
     if (task == 0 || tc == 0 || path == 0) {
         return -1;
     }
+    /* We do not replace a group's image while its siblings are running.
+     * The loader also rejects any other process using the fixed window.
+     */
+    if (thread_user_group_size(task) != 1) {
+        return -1;
+    }
     while (i + 1U < sizeof(name)) {
         char c;
 
@@ -164,9 +177,19 @@ static long sys_fork(struct trap_context *parent_tc)
     unsigned int i;
     uint64_t *dst_tc_words;
     const uint64_t *src_tc_words;
-    int child_pid;
 
     if (parent == 0 || parent_tc == 0) {
+        return -1;
+    }
+    /* Fork is still the single-threaded, no-MMU stack-copy demo. Do not copy
+     * a multithreaded process while leaving sibling stack pointers behind.
+     */
+    if (thread_user_group_size(parent) != 1) {
+        return -1;
+    }
+    parent_sp = (uintptr_t)parent_tc->sp;
+    if (parent_sp < parent->user_stack_base || parent_sp > parent->user_stack_top ||
+        parent->user_stack_top - parent->user_stack_base != USER_STACK_SIZE) {
         return -1;
     }
 
@@ -186,6 +209,8 @@ static long sys_fork(struct trap_context *parent_tc)
      * stack-local addresses that point back into the parent's stack image.
      * For this minimal no-MMU process model, remap any 64-bit word that falls
      * inside the parent stack range to the corresponding child stack address.
+     * This is a heuristic: a matching integer is indistinguishable from a
+     * pointer. It is not a replacement for virtual-memory fork semantics.
      */
     for (i = 0; i + sizeof(uint64_t) <= USER_STACK_SIZE; i += sizeof(uint64_t)) {
         uint64_t *slot = (uint64_t *)(uintptr_t)(child_stack_base + i);
@@ -197,15 +222,9 @@ static long sys_fork(struct trap_context *parent_tc)
         }
     }
 
-    child_pid = thread_create_user(parent->user_entry, child_stack_base, child_stack_top);
-    if (child_pid < 0) {
+    child = thread_prepare_user(parent->user_entry, child_stack_base, child_stack_top);
+    if (child == 0) {
         kfree((void *)child_stack_base);
-        return -1;
-    }
-
-    child = thread_find_by_pid(child_pid);
-    if (child == 0 || child->tc == 0) {
-        thread_stop_pid(child_pid, -1);
         return -1;
     }
 
@@ -217,12 +236,6 @@ static long sys_fork(struct trap_context *parent_tc)
     child->tc->tp = (uint64_t)(uintptr_t)child;
     child->tc->a0 = 0;
     child->tc->sepc += 4;
-
-    parent_sp = (uintptr_t)parent_tc->sp;
-    if (parent_sp < parent->user_stack_base || parent_sp > parent->user_stack_top) {
-        thread_stop_pid(child_pid, -1);
-        return -1;
-    }
 
     stack_off = (uint64_t)(parent_sp - parent->user_stack_base);
     child_sp = child->user_stack_base + stack_off;
@@ -272,7 +285,9 @@ static long sys_fork(struct trap_context *parent_tc)
     REMAP_STACK_FIELD(t6);
 #undef REMAP_STACK_FIELD
 
-    return child_pid;
+    /* New process: keep child->tgid == child->tid. Only now can it run. */
+    thread_publish_user(child);
+    return child->tgid;
 }
 
 static long sys_stop(long pid)
@@ -280,7 +295,7 @@ static long sys_stop(long pid)
     if (pid <= 0 || pid > INT32_MAX) {
         return -1;
     }
-    return thread_stop_pid((int32_t)pid, 0);
+    return thread_stop_process((int32_t)pid, 0);
 }
 
 void trap_init(void)
@@ -298,6 +313,12 @@ void handle_user_ecall(struct trap_context *tc)
     switch (tc->a7) {
     case SYS_getpid:
         ret = sys_getpid();
+        break;
+    case SYS_gettid:
+        ret = sys_gettid();
+        break;
+    case SYS_thread_create:
+        ret = thread_create_user((uintptr_t)tc->a0, (uintptr_t)tc->a1, (uintptr_t)tc->a2);
         break;
     case SYS_uart_read:
         ret = sys_uart_read((char *)(uintptr_t)tc->a0, (long)tc->a1);
@@ -318,6 +339,12 @@ void handle_user_ecall(struct trap_context *tc)
     case SYS_exit:
         thread_mark_current_zombie((int)tc->a0);
         return;
+    case SYS_exit_group:
+        ret = thread_stop_process((int32_t)sys_getpid(), (int)tc->a0);
+        if (ret == 0) {
+            return;
+        }
+        break;
     case SYS_stop:
         ret = sys_stop((long)tc->a0);
         if (ret == 0 && (long)tc->a0 == (long)sys_getpid()) {

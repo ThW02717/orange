@@ -797,7 +797,7 @@ static int shell_launch_user_program_instances(const char *name,
             uart_send_string("\n");
         }
 
-        created_pids[i] = thread_create_user(entry, user_stack_base, user_stack_top);
+        created_pids[i] = user_process_create(entry, user_stack_base, user_stack_top);
         if (created_pids[i] < 0) {
             kfree((void *)(uintptr_t)user_stack_base);
             uart_send_string(label);
@@ -824,7 +824,7 @@ static int shell_launch_user_program_instances(const char *name,
 launch_failed:
     /* Do not leave a partly created batch runnable after reporting failure. */
     while (i > 0U) {
-        (void)thread_stop_pid(created_pids[--i], -1);
+        (void)thread_stop_tid(created_pids[--i], -1);
     }
     thread_run_until_idle();
     return -1;

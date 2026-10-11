@@ -14,9 +14,11 @@ python3 -B scripts/run_system_tests.py
 
 The regression runner checks malformed CPIO/DTB inputs with host ASan/UBSan,
 then exercises integer-register trap round trips, scheduler reclamation,
-deferred IRQ work, timer cancellation, and masked UART polling in RV64 QEMU.
+thread groups, allocation-failure rollback, deferred IRQ work, timer
+cancellation, and masked UART polling in RV64 QEMU.
 The system runner boots the real QEMU kernel and its separately linked user
-images to test syscalls, faults, fork, preemption, timers, and allocator demos.
+images to test syscalls, faults, fork, same-process user threads, preemption,
+timers, and allocator demos.
 These checks do not validate OrangePi UART/PLIC wiring or the board upload path.
 Dependencies: a RISC-V bare-metal toolchain, QEMU, Python 3, a host C compiler,
 `dtc`, `cpio`, and `mkimage` (for the board image).
@@ -136,7 +138,7 @@ Task B                                     +--------------------------+
 +-- struct thread B                        0x32100000 (exclusive end)
 +-- Kernel stack B: 4 KiB
 +-- User stack B: 64 KiB
-`-- user_entry ---------------------------> same image entry
+`-- user_entry ---------------------------> function in the same image
 
 Resource relationships, not physical address order or separate address spaces.
 ```
@@ -176,7 +178,7 @@ struct thread (kernel allocation)
 | thread_context                         |  Inline; not on the kernel stack
 |   ra, sp, s0 ... s11                   |
 +----------------------------------------+
-| pid, kind, state, entry, queue links   |
+| tid, tgid, kind, state, queue links    |
 | kstack_base, kstack_top                | --> Kernel stack allocation
 | user_stack_base, user_stack_top        | --> User stack allocation
 | tc                                     | --> Top-of-stack trap-context slot
@@ -251,11 +253,17 @@ inside the trap handler, its trap context remains on A's kernel stack while
 
 #### First user entry and register convention
 
-[`thread_create_user()`](kernel/src/thread.c) builds both initial contexts:
+[`thread_prepare_user()`](kernel/src/thread.c) builds both initial contexts.
+It is shared by process launch, same-process thread creation, and fork:
 
 - `thread_context.ra = thread_bootstrap`; `thread_context.sp = kstack_top - 288`.
 - `tc->sp = user_stack_top`; `tc->tp = thread`; `tc->sepc = user_entry`.
 - `tc->sstatus = SSTATUS_SPIE`: `SPP = 0` selects U-mode and `SPIE = 1` enables interrupts on return.
+
+The caller finishes any operation-specific fields before
+`thread_publish_user()` makes the task runnable. A new user thread also gets
+its argument in `a0` and a user-space return-to-exit stub in `ra`. Fork instead
+copies the parent's interrupted context and adjusts it to resume after `ecall`.
 
 The first switch follows this path without requiring a previous user trap:
 
@@ -276,3 +284,211 @@ The return path keeps interrupts masked while restoring state. It sets
 `sscratch` to the kernel-stack top only for a U-mode return, or zero for an
 S-mode return, before restoring `t1`. Deferred work finishes before a user-task
 reschedule so the timer interrupt source is rearmed before the next task runs.
+
+### Processes and Threads
+
+The scheduler still schedules `struct thread`, not a separate process object.
+Each task has a unique `tid`. User threads in one process have the same `tgid`;
+`getpid()` returns that group ID and `gettid()` returns the calling thread's ID.
+The first thread has `tid == tgid`. Its exit does not change its siblings' TGID.
+
+There is no `struct process` or `mm_struct` yet. Group membership is recorded in
+each task and checked by scanning the task list. The one user-image window is
+global reserved storage, not an allocation owned by a group. Adding a group ID
+does not turn it into a private address space.
+
+Group counting and stack-range checks are O(number of tasks). This keeps the
+small single-hart scheduler's ownership model simple; it is not a scalable
+process-resource or address-space manager.
+
+```text
+Example identities, not fixed boot-time IDs
+
+Process ID 10                         Process ID 13 (fork child)
++-- Thread: TID 10, TGID 10            +-- Thread: TID 13, TGID 13
+|   +-- user stack                    |   +-- copied/rebased user stack
+|   +-- kernel stack + trap_context   |   +-- new kernel stack + trap_context
+|   `-- thread_context               |   `-- thread_context
+|
+`-- Thread: TID 11, TGID 10
+    +-- new user stack                Both groups still point into ONE
+    +-- kernel stack + trap_context   physical user-image window.
+    `-- thread_context                There is no process memory isolation.
+```
+
+Threads in a group share the loaded code and globals and can pass pointers
+into each other's live user stacks. Each thread keeps its own stacks,
+register contexts, and scheduler state. There is no user heap, TLS runtime,
+file-descriptor table, or pthread implementation.
+
+#### Four different creation paths
+
+| Entry point | Identity | Initial execution | User stack |
+| --- | --- | --- | --- |
+| `thread_create_kernel(fn, arg, 0)` | New TID, TGID = TID | Calls `fn(arg)` in S-mode | None |
+| `user_process_create(entry, base, top)` | New TID, TGID = TID | Starts at the loaded image entry in U-mode | Supplied by the kernel caller |
+| `thread_create_user(entry, arg, return_pc)` | New TID, current user's TGID | Starts a new function in U-mode | Newly allocated; not copied |
+| User `fork()` -> `sys_fork(tc)` | New TID, TGID = TID | Continues after the parent's `ecall` | Copied and heuristically rebased |
+
+The first three names are kernel-side functions in
+[`thread.c`](kernel/src/thread.c); fork is handled in
+[`trap.c`](kernel/src/trap.c). The user-side `thread_create_user(fn, arg)`
+wrapper has two arguments. It supplies the return stub as the syscall's third
+argument; it does not call the kernel C function directly.
+
+A kernel worker is independent scheduled S-mode work. Entering a syscall or
+handling a trap does not create one: the interrupted user thread executes the
+kernel path using its own kernel stack.
+
+#### Loading the first user process
+
+```text
+Boot -> kernel shell
+          |
+          | runu threads
+          v
+shell_load_user_program_named("threads")
+          | find bin/threads.bin in initramfs
+          | reject replacement if another live user task uses the window
+          | copy the image and synchronize instruction fetch
+          v
+allocate user stack
+          v
+user_process_create(entry, stack_base, stack_top)
+          | thread_prepare_user(): allocate task + kernel stack, seed contexts
+          | keep TGID = new TID
+          | thread_publish_user(): add the finished task to the run queue
+          v
+schedule -> switch_to -> user_task_entry -> trap_return -> sret
+          v
+_start in the loaded user program
+```
+
+`user_process_create()` does not load a binary. The shell performs the load
+first and supplies its entry address and a user stack. This separates
+launching the first process from creating a sibling thread. There is no
+permanent user-space init process or user shell at boot.
+
+`demo preempt` launches two process groups using the same loaded image.
+`demo threads` launches one process, which then creates sibling threads.
+These demonstrate different identity relationships even though both use the
+same run queue and the same physical image window.
+
+#### Creating a thread from U-mode
+
+The small wrapper in [`user_api.h`](kernel/user/user_api.h) is enough for the
+demo; it is not a libc or pthread API.
+
+```c
+static void worker(void *arg)
+{
+    /* Use arg while the object it points to is still alive. */
+    /* Returning exits this thread, not its siblings. */
+}
+
+long tid = thread_create_user(worker, arg);
+/* tid < 0 means creation failed. This is not a join handle. */
+```
+
+```text
+User wrapper                           Kernel
+thread_create_user(fn, arg)
+  a0 = fn
+  a1 = arg
+  a2 = user_thread_return
+  a7 = SYS_thread_create
+         |
+         `-- ecall ------------------> thread_create_user(...)
+                                        | validate entry and return addresses
+                                        | allocate fresh user/kernel stacks
+                                        | new TID, parent's TGID
+                                        | tc: sepc=fn, a0=arg, ra=return stub
+                                        | tc: sp=new stack top, tp=new task
+                                        `-- publish, return new TID to caller
+
+When the new thread is scheduled:
+  sret -> fn(arg) -> ret -> user_thread_return -> SYS_exit
+```
+
+The entry and return stub must be two-byte-aligned addresses inside the fixed
+user-image window. This is a range check, not validation of executable ELF
+segments or a security boundary. `gp` is inherited; `tp` remains the new
+current-thread pointer rather than a TLS pointer.
+
+#### Fork is not thread creation
+
+```text
+Parent: one live user thread
+  fork()
+    |
+    +-- reject invalid stack state or a multithreaded group
+    +-- allocate and copy the user stack
+    +-- rebase stack-looking values in the copy
+    +-- prepare an unpublished child with a new TID/TGID
+    +-- copy trap_context; fix sp, stack pointers and tp
+    +-- child a0 = 0; child sepc = parent's sepc + 4
+    `-- publish the completed child
+
+Parent resumes after ecall with a0 = child PID
+Child resumes after ecall with a0 = 0
+```
+
+This fork copies the user stack and the interrupted register state. It does
+not copy the kernel call stack, create page tables, implement copy-on-write,
+or isolate globals. A copied integer that happens to look like a stack address
+can be rebased incorrectly. The existing demo works within that limitation;
+this is not general-purpose fork semantics.
+
+Fork from a multithreaded group returns `-1`. Exec also rejects a multithreaded
+group, and the loader rejects replacement while any other live user task uses
+the image, even one in a different process. A successful exec keeps the
+caller's TID/TGID and resets its user entry/context; it does not create a task.
+
+#### Exit, ownership, and cleanup
+
+- `SYS_exit` / user `thread_exit(status)`: end only the calling thread.
+- Returning from a user worker: the return stub issues `SYS_exit(0)`.
+- `SYS_exit_group` / `exit_group(status)`: end every user thread with the
+  caller's TGID.
+- `SYS_stop` / `stop(pid)`: stop that user process group, even if its original
+  leader has already exited.
+- Kernel `thread_stop_tid()`: stop one specific task; used for launch rollback.
+
+Threads are detached: there is no join/wait syscall or retained exit-status
+record after reclamation. Passing a pointer to a sibling does not extend the
+pointed-to object's lifetime. In particular, do not use a thread's stack after
+that thread exits. Syscall buffer checks accept live same-group stacks and
+reject other groups' stacks; direct memory accesses remain unisolated.
+
+```text
+running/runnable
+      |
+      | exit or stop; unlink from run queue if queued
+      v
+    zombie
+      |
+      | switch away; idle collects it
+      v
+free user stack (if any) + kernel stack + struct thread
+```
+
+The shared image window is never freed through `kfree()`. It stays reserved
+and can be reused by the loader once no other live user task needs it.
+Allocation failures free everything allocated by that failed operation and
+leave no partial child runnable.
+
+#### Try it
+
+```text
+demo threads
+runu threads
+demo fork
+demo preempt
+```
+
+The threads demo checks same-PID/different-TID identities, shared globals and
+a sibling's stack buffer, invalid entry addresses, multithreaded fork/exec
+rejection, worker return, single-thread fork, cross-process image replacement
+rejection, and both group-exit paths. It also stops a group after its leader
+exits. The system runner repeats the launch and then loads another image to
+check that cleanup releases the loader's busy condition.

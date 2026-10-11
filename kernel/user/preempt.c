@@ -1,12 +1,6 @@
 #include <stdint.h>
 
-#define SYS_getpid     0UL
-#define SYS_uart_read  1UL
-#define SYS_uart_write 2UL
-#define SYS_exec       3UL
-#define SYS_fork       4UL
-#define SYS_exit       5UL
-#define SYS_stop       6UL
+#include "syscall.h"
 
 #define DO_SYSCALL0(nr)                                                       \
     ({                                                                        \
