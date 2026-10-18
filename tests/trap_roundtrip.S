@@ -2,6 +2,7 @@
 .option norelax
 .option norvc
 .global _start
+/* Keep interrupt sources masked until the C fixture installs its handlers. */
 _start:
     la sp, boot_stack_top
     csrw sscratch, zero
@@ -11,6 +12,7 @@ _start:
     j 1b
 
 .section .text
+/* Seed each non-sp GPR distinctly; the dispatcher checks sp separately. */
 .macro seed_regs
     li ra, 0x101
     li gp, 0x103
@@ -45,6 +47,10 @@ _start:
 .endm
 
 .global supervisor_roundtrip
+/*
+ * Consecutive traps check both the saved GPRs and the state restored by sret.
+ * Preserve the C caller's ABI state around the deliberately overwritten GPRs.
+ */
 supervisor_roundtrip:
     addi sp, sp, -128
     sd ra, 0(sp)
@@ -84,6 +90,7 @@ supervisor_roundtrip:
     ret
 
 .global user_roundtrip
+/* The second ecall checks the registers restored after the first user trap. */
 user_roundtrip:
     seed_regs
     ecall

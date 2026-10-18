@@ -192,10 +192,7 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
 
     irq_task_backend_init();
 
-    /* The multiplexed timer subsystem no longer depends on a fixed periodic
-     * heartbeat, so it is safe to arm the timer path during boot. The single
-     * hardware timer stays idle until software timers are queued.
-     */
+    /* One SBI timer serves scheduler ticks and queued timeout events. */
     timer_init();
     /* Arm the UART external-interrupt route during boot so shell I/O can
      * transition to the asynchronous path without a manual enable command.

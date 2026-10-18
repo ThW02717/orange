@@ -1,24 +1,13 @@
     .section .text
     .globl switch_to
 
-/* Cooperative thread context switch.
+/*
+ * Switch the kernel call context: a0 = prev thread, a1 = next thread.
  *
- * a0 = prev thread pointer
- * a1 = next thread pointer
- *
- * Because the `thread_context` field is first in `struct thread`,
- * each thread pointer can be used directly as the base address of the saved
- * context image:
- *
- *   0   -> ra
- *   8   -> sp
- *   16  -> s0
- *   ...
- *   104 -> s11
- *
- * This kernel switch context saves/restores ra, sp, and s0-s11 at the
- * function-call boundary. Caller-saved registers are not preserved across
- * switch_to(); interrupted registers are saved separately in trap_context.
+ * thread_context must remain the first member of struct thread so both
+ * pointers also address the saved ra, sp and s0-s11 directly.
+ * This is a C-call boundary, not a full trap snapshot; interrupted registers
+ * are saved separately in trap_context.
  */
 switch_to:
     sd ra,   0(a0)
@@ -51,8 +40,6 @@ switch_to:
     ld s10, 96(a1)
     ld s11, 104(a1)
 
-    /* Keep the current-thread pointer in tp so later code can fetch the
-     * running thread without going through a global variable.
-     */
+    /* Both user and kernel code reserve tp for the running thread. */
     mv tp, a1
     ret

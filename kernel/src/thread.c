@@ -3,7 +3,10 @@
 #include "trap.h"
 #include "user.h"
 
-#define THREAD_STACK_SIZE 4096UL
+/* Kernel calls and deferred callbacks share this stack with trap contexts.
+ * Hardware IRQs may still nest while a callback is running.
+ */
+#define THREAD_STACK_SIZE 16384UL
 
 /* Single-hart round-robin scheduling. Kernel workers yield cooperatively;
  * user tasks may also be preempted at the outer user-trap boundary.

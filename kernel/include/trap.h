@@ -54,7 +54,7 @@
 #define USER_CODE_LIMIT        (USER_CODE_BASE + USER_CODE_SIZE)
 #define USER_STACK_BASE        (USER_STACK_TOP - USER_STACK_SIZE)
 
-/* Fixed trap context layout shared by trap_entry.S and trap.c.
+/* Fixed trap context layout shared by trap_entry.S and the C handlers.
  * General registers capture the interrupted CPU context.
  * sepc    : PC of the trapped instruction / return target for sret
  * sstatus : privilege and interrupt state restored by sret
@@ -142,8 +142,9 @@ extern void trap_entry(void);
 extern void trap_return(struct trap_context *tc);
 
 void trap_init(void);
+int trap_trace_ecalls(int enabled);
+void trap_set_ecall_demo(int32_t tid);
 void trap_dispatch(struct trap_context *tc);
-void handle_user_ecall(struct trap_context *tc);
 void handle_user_fault(struct trap_context *tc);
 
 static inline uint64_t trap_scause_code(uint64_t scause)

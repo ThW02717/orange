@@ -4,6 +4,9 @@
 .global trap_entry
 .global trap_return
 
+.equ SSTATUS_SPP, (1 << 8)
+
+/* Match struct trap_context in trap.h; reserve 16-byte-aligned stack space. */
 .equ TC_RA, 0
 .equ TC_SP, 8
 .equ TC_GP, 16
@@ -41,27 +44,26 @@
 .equ TC_STVAL, 272
 .equ TRAP_CONTEXT_ALLOC_SIZE, 288
 
-/* Supervisor trap entry.
- * - Trap from U-mode: sscratch holds the kernel stack top, so swap sp and
- *   sscratch to land on the kernel stack and preserve the user sp.
- * - In S-mode sscratch is zero. The swap produces a zero sp, so recover the
- *   interrupted kernel sp from sscratch without borrowing any other GPR.
+/*
+ * Enter an S-mode trap without clobbering the interrupted registers.
+ *
+ * U-origin: sscratch holds the kernel stack top; the swap selects that stack.
+ * S-origin: sscratch is zero; recover the interrupted kernel sp after the swap.
+ * Both paths leave the interrupted sp in sscratch until TC_SP is saved.
  */
 trap_entry:
     csrrw sp, sscratch, sp
-    bnez sp, 1f
+    bnez sp, trap_save_context
     csrr sp, sscratch
-1:
+trap_save_context:
     addi sp, sp, -TRAP_CONTEXT_ALLOC_SIZE
 
-    /* Save the interrupted CPU context into trap_context. TC_SP always stores
-     * the interrupted stack pointer, whether that was a user sp or a kernel sp.
-     */
+    /* Preserve t0 before borrowing it to save the interrupted sp. */
     sd ra, TC_RA(sp)
     sd t0, TC_T0(sp)
     csrr t0, sscratch
     sd t0, TC_SP(sp)
-    /* Nested supervisor traps must stay on the current kernel stack. */
+    /* Keep sscratch zero in kernel code so nested traps stay on this stack. */
     csrw sscratch, zero
     sd gp, TC_GP(sp)
     sd tp, TC_TP(sp)
@@ -92,6 +94,7 @@ trap_entry:
     sd t5, TC_T5(sp)
     sd t6, TC_T6(sp)
 
+    /* Snapshot the trap CSRs before C code can take another trap. */
     csrr t0, sepc
     sd t0, TC_SEPC(sp)
     csrr t0, sstatus
@@ -101,73 +104,80 @@ trap_entry:
     csrr t0, stval
     sd t0, TC_STVAL(sp)
 
-    /* Hand the completed trap_context to the C-side trap dispatcher. */
-    mv a0, sp
+    /*
+     * Handle the event, then run bottom halves with SIE enabled.
+     * If a callback is already running, nested traps leave new work queued
+     * and resume it. The outer runner drains work before user scheduling.
+     */
+    mv a0, sp /* trap_context */
     call trap_dispatch
 
-    /* Finish deferred work before switching tasks. In particular, the timer
-     * top half masks STIE and its bottom half must rearm it before another
-     * user task starts running, or that task would never be preempted.
-     */
-    call irq_task_run_before_return
+    call irq_run_bottom_halves
 
-    /* A nested S-mode trap must resume its interrupted kernel work, not
-     * schedule away or abandon an outer user trap's still-live call chain.
+    /*
+     * Saved SPP: 0 = U-mode, 1 = S-mode.
+     * Resume S-origin kernel work directly. Only U-origin returns check user
+     * exit and rescheduling below.
      */
     ld t0, TC_SSTATUS(sp)
-    andi t0, t0, 0x100
-    bnez t0, 2f
+    andi t0, t0, SSTATUS_SPP /* t0: 0 = U-origin, 0x100 = S-origin */
+    bnez t0, trap_restore_context
 
-    /* trap_dispatch() may classify the trap as SYS_exit and mark the current
-     * user context as finished. In that case we must not restore the user
-     * registers and execute another sret back to U-mode.
-     */
-    call user_has_exited
-    bnez a0, trap_exit_stop
+    call user_has_exited /* a0: 0 = alive, 1 = exited */
+    bnez a0, trap_switch_from_exited_user
 
-    call thread_consume_resched_request
-    beqz a0, 1f
+    call thread_consume_resched_request /* a0: 0 = resume, 1 = schedule */
+    beqz a0, trap_restore_context
     call schedule
-1:
-2:
+trap_restore_context:
+    /* A switched-out thread reaches here only after it is scheduled again. */
     mv a0, sp
     call trap_return
 
-/* A finished user task must switch away; idle reclaims its stack later. */
-trap_exit_stop:
+/*
+ * Never restore an exited user context. Switch away before idle reclaims
+ * the current stack.
+ */
+trap_switch_from_exited_user:
     call user_schedule_after_exit
-1:
+trap_exit_fallback:
     wfi
-    j 1b
+    j trap_exit_fallback
 
-/* Common trap return path.
- * a0 must point to struct trap_context on the current kernel stack.
+/*
+ * Restore a trap_context on the current kernel stack; a0 = context address.
+ * Also used for a new thread's first entry into U-mode. scause and stval are
+ * diagnostic snapshots, not inputs to the return path.
  */
 trap_return:
-    /* Initial user entry may call us with SIE set. Keep the entire restore
-     * atomic, including the interval where sscratch changes its meaning.
+    /*
+     * Initial user entry may arrive with SIE set. Keep it clear until sret;
+     * an interrupt must not see a half-restored context or sscratch.
      */
     csrci sstatus, 2
     mv t0, a0
 
-    /* Restore CSR state first so sret returns to the correct PC and mode. */
     ld t1, TC_SEPC(t0)
     csrw sepc, t1
     ld t1, TC_SSTATUS(t0)
-    andi t1, t1, -3
+    andi t1, t1, -3 /* Clear SIE; sret restores it from SPIE. */
     csrw sstatus, t1
 
-    /* Only a return to U-mode needs a kernel-stack address in sscratch. */
-    andi t1, t1, 0x100
-    bnez t1, 1f
+    /*
+     * Return SPP: 0 = U-mode, 1 = S-mode.
+     * Only U-mode needs a kernel stack top in sscratch for its next trap;
+     * S-mode keeps sscratch zero to continue on the current kernel stack.
+     */
+    andi t1, t1, SSTATUS_SPP
+    bnez t1, trap_return_to_supervisor
     addi t1, t0, TRAP_CONTEXT_ALLOC_SIZE
     csrw sscratch, t1
-    j 2f
-1:
+    j trap_restore_registers
+trap_return_to_supervisor:
     csrw sscratch, zero
-2:
+trap_restore_registers:
 
-    /* Restore the general-purpose registers from the trap_context image. */
+    /* Keep t0 as the context base until the final register load. */
     ld ra, TC_RA(t0)
     ld gp, TC_GP(t0)
     ld tp, TC_TP(t0)
@@ -201,5 +211,4 @@ trap_return:
     ld sp, TC_SP(t0)
     ld t0, TC_T0(t0)
 
-    /* Return to the PC recorded in sepc, using the privilege encoded in sstatus. */
     sret

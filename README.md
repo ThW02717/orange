@@ -14,11 +14,14 @@ python3 -B scripts/run_system_tests.py
 
 The regression runner checks malformed CPIO/DTB inputs with host ASan/UBSan,
 then exercises integer-register trap round trips, scheduler reclamation,
-thread groups, allocation-failure rollback, deferred IRQ work, timer
-cancellation, and masked UART polling in RV64 QEMU.
+thread groups, allocation-failure rollback, priority/FIFO ordering, callback
+non-reentrancy during nested traps, callback-pool exhaustion/reuse, timer payload cleanup, and
+masked UART polling in RV64 QEMU.
 The system runner boots the real QEMU kernel and its separately linked user
 images to test syscalls, faults, fork, same-process user threads, preemption,
-timers, and allocator demos.
+timers, and allocator demos. It also checks real QEMU UART/PLIC interrupts,
+nonblocking timeouts, the two-second timer demo, and all five ecalls in the
+supplied Lab 4 program.
 These checks do not validate OrangePi UART/PLIC wiring or the board upload path.
 Dependencies: a RISC-V bare-metal toolchain, QEMU, Python 3, a host C compiler,
 `dtc`, `cpio`, and `mkimage` (for the board image).
@@ -130,20 +133,20 @@ Kernel-owned task resources                Shared user-image window
 
 Task A                                     0x32000000
 +-- struct thread A                        +--------------------------+
-+-- Kernel stack A: 4 KiB                  | One loaded raw image     |
++-- Kernel stack A: 16 KiB                 | One loaded raw image     |
 +-- User stack A: 64 KiB                   | Entry at the window base |
 `-- user_entry --------------------------->|                          |
                                            | Unused window capacity   |
 Task B                                     +--------------------------+
 +-- struct thread B                        0x32100000 (exclusive end)
-+-- Kernel stack B: 4 KiB
++-- Kernel stack B: 16 KiB
 +-- User stack B: 64 KiB
 `-- user_entry ---------------------------> function in the same image
 
 Resource relationships, not physical address order or separate address spaces.
 ```
 
-Kernel-only worker threads have a control block and a 4 KiB kernel stack, but
+Kernel-only worker threads have a control block and a 16 KiB kernel stack, but
 no user stack. All these allocations remain kernel-managed and are reclaimed
 after the thread exits, once it is no longer executing on its own stack.
 
@@ -186,18 +189,20 @@ struct thread (kernel allocation)
 ```
 
 For a newly created user task, let `K` be its kernel-stack base. The stack is
-4 KiB, and the 280-byte context occupies a 288-byte slot to preserve 16-byte
-stack alignment.
+16 KiB, and the 280-byte context occupies a 288-byte slot to preserve 16-byte
+stack alignment. Kernel calls and deferred callbacks share this stack with
+nested hardware-interrupt contexts. Callbacks need bounded stack use; there is no MMU
+guard page.
 
 ```text
 Higher addresses
 
-K + 4096  +-----------------------------------------+  kstack_top
+K + 16384 +-----------------------------------------+  kstack_top
           | Alignment padding: 8 bytes              |
-K + 4088  +-----------------------------------------+
+K + 16376 +-----------------------------------------+
           | trap_context: 280 bytes                 |
           | Integer register slots + four CSRs      |
-K + 3808  +-----------------------------------------+  tc
+K + 16096 +-----------------------------------------+  tc
           | Initial thread_context.sp points here   |
           |                                         |
           | Kernel call frames and local variables  |
@@ -331,10 +336,12 @@ file-descriptor table, or pthread implementation.
 | User `fork()` -> `sys_fork(tc)` | New TID, TGID = TID | Continues after the parent's `ecall` | Copied and heuristically rebased |
 
 The first three names are kernel-side functions in
-[`thread.c`](kernel/src/thread.c); fork is handled in
-[`trap.c`](kernel/src/trap.c). The user-side `thread_create_user(fn, arg)`
-wrapper has two arguments. It supplies the return stub as the syscall's third
-argument; it does not call the kernel C function directly.
+[`thread.c`](kernel/src/thread.c). Syscall dispatch, user-buffer checks, and
+fork are in [`syscall.c`](kernel/src/syscall.c).
+[`trap.c`](kernel/src/trap.c) classifies traps and forwards user ecalls to
+`handle_user_ecall(tc)`. The user-side `thread_create_user(fn, arg)` wrapper
+has two arguments. It supplies the return stub as the syscall's third argument;
+it does not call the kernel C function directly.
 
 A kernel worker is independent scheduled S-mode work. Entering a syscall or
 handling a trap does not create one: the interrupted user thread executes the
@@ -492,3 +499,129 @@ rejection, worker return, single-thread fork, cross-process image replacement
 rejection, and both group-exit paths. It also stops a group after its leader
 exits. The system runner repeats the launch and then loads another image to
 check that cleanup releases the loader's busy condition.
+
+### Interrupts and Deferred Work
+
+The primary hart handles timer and UART interrupts. `trap_dispatch()` runs
+the top half, then `trap_entry.S` calls `irq_run_bottom_halves()` before the
+return path checks user exit and rescheduling. Deferred callbacks use the
+interrupted thread's kernel stack; no worker thread is created.
+
+The runner enables `sstatus.SIE` while executing a callback. A nested IRQ can
+run its top half and enqueue more work, but it resumes the paused callback
+without running another bottom half. Once that callback returns, the existing
+runner selects the highest-priority queued task. Priorities are 0 through 7,
+with 0 highest; equal priorities keep FIFO order. Priority chooses the next
+callback, not whether to preempt the current one. PLIC source priorities and
+these software task priorities are separate.
+
+```text
+Low-priority callback (rank 5)
+    |
+    +-- Timer IRQ: save context, mask STIE, queue timer work (rank 1)
+    |       |
+    |       +-- Nested runner sees that a callback is already running
+    |       +-- Leave timer work queued
+    |       +-- Restore context and sret to the paused callback
+    |
+Low-priority callback resumes and returns
+    |
+Outer runner selects timer work (rank 1), then the next queued task by priority
+```
+
+`g_irq_task_running` prevents both explicit and trap-driven recursive runner
+calls. Persistent timer/UART tasks stay `RUNNING` while paused; another enqueue
+sets `rerun` instead of inserting the same object twice. Queue links and
+task-state transitions are changed with local interrupts disabled. This is a
+single-hart design, not SMP synchronization.
+
+This follows the same-CPU non-reentrancy rule of ordinary non-PREEMPT_RT Linux
+softirqs. P1 still uses its own callback queue; it has no Linux softirq bitmask,
+execution budget, or `ksoftirqd` worker. The Lab 4 extension requiring a newly
+queued high-priority bottom half to preempt the current callback is deliberately
+not provided by this policy.
+
+```c
+int add_task(task_callback_t callback, void *arg, int priority);
+
+/* Queue two kernel callbacks. The first one has higher priority. */
+add_task(handle_urgent, urgent_request, 1);
+add_task(handle_background, background_request, 6);
+```
+
+`add_task()` uses a static pool of 32 callback slots. It returns 0 on success
+and -1 for an invalid callback/priority or a full pool. The slot is released
+after the callback returns. The argument is borrowed: its owner must keep it
+alive until completion. Callbacks must not sleep, call the thread scheduler,
+or wait for any other deferred callback, even one with higher priority. Keep
+callbacks bounded: a long callback delays all queued work. Strict priority does
+not guarantee fairness under an endless stream of higher-priority work.
+
+#### Timer and UART split
+
+The timer top half masks STIE and queues the persistent timer task. Its bottom
+half updates scheduling deadlines, detaches expired events, invokes callbacks,
+and programs the next SBI deadline before re-enabling STIE. A single hardware
+timer serves the 20 Hz scheduler tick, one-shot events, and the optional
+two-second uptime demo. Conversion uses the DT `timebase-frequency`, not the
+CPU instruction clock.
+
+Timer-list changes are protected while callbacks run outside the critical
+section. `add_timer()` borrows its argument. `add_timer_with_cleanup()` also
+accepts a cleanup function: after successful registration, cleanup runs once
+after firing or when `timer_stop()` discards the event. Failed registration
+leaves the argument with the caller.
+
+The UART RX top half masks its source and copies up to 16 bytes from hardware
+into the RX ring before queuing the remaining work. The RX bottom half drains
+bounded batches and re-enables RX when finished. TX work drains the software
+ring and leaves TX interrupts disabled when there is nothing to send. Ring
+updates, IER read/modify/write, and stress-marker batches are protected against
+nested producers. IRQ-off/early-boot console paths retain polling fallbacks.
+QEMU now uses its real PLIC/UART IRQ route as well; the board still discovers
+its UART and PLIC addresses from the supplied DTB.
+
+#### Lab commands
+
+```text
+demo tasks
+setTimeout 3 later message
+setTimeout 1 earlier message
+timer periodic on
+timer periodic off
+exec test
+exec prog
+```
+
+`demo tasks` runs a bounded busy interval in a low-priority callback and checks
+the trace for a real timer top half. It does not wait for a deferred callback,
+yield, or call the runner from that callback. The timer bottom half and all
+newly queued callbacks must wait until the low-priority callback returns:
+
+```text
+low:start -> timer:top -> low:resume -> timer:bottom -> high -> equal -> lower
+[tasks] PASS
+```
+
+`setTimeout` returns to the shell after registering an event. It copies the
+message out of the reusable shell input buffer and prints the submission and
+firing times in seconds since timer initialization. Multiple events are ordered
+by absolute deadline, with FIFO insertion for equal deadlines. Zero delay is
+accepted; decimal input supports up to three fractional digits.
+
+`timer periodic on` enables uptime output every two seconds without replacing
+the scheduler tick or queued timeouts. `off` disables only this demonstration.
+
+`exec test` runs the normal P1 syscall image with CSR diagnostics. `exec prog`
+(also the default for bare `exec`) selects the Lab 4 diagnostic handler for
+that task. The supplied image uses `a7 = 5, 4, 3, 2, 1` as an ecall counter;
+treating those values as P1 syscall numbers would exit at the first call.
+The diagnostic handler prints `scause`, `sepc`, and `stval`, advances `sepc`
+past `ecall`, and restores the user registers. Other tasks keep the P1 ABI.
+
+[`prog.S`](kernel/user/prog.S) reproduces the supplied 14-byte
+[OSC2026 program](https://github.com/nycu-caslab/OSC2026/blob/main/uploads/prog.bin).
+The system test checks the exact bytes and the five ecall returns. The image
+then loops forever in U-mode, as the original does; reset the board to leave
+that demo. Timer interrupts continue during the loop. Use `runu` or `exec test`
+for programs that exit back to the shell.

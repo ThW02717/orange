@@ -16,7 +16,12 @@ static uintptr_t g_uart_mmio_base =
 #else
     0UL;
 #endif
-static uintptr_t g_plic_mmio_base = 0UL;
+static uintptr_t g_plic_mmio_base =
+#ifdef QEMU
+    0x0c000000UL;
+#else
+    0UL;
+#endif
 static uint32_t g_uart_irq_id = 0U;
 static int g_uart_irq_enabled = 0;
 static int g_uart_async_ready = 0;
@@ -50,12 +55,6 @@ static struct irq_task g_uart_tx_task = {
 
 int uart_platform_init_from_fdt(const void *fdt)
 {
-#ifdef QEMU
-    (void)fdt;
-    g_plic_mmio_base = 0UL;
-    g_uart_irq_id = 10U;
-    return 0;
-#else
     int uart_node;
     int plic_node;
     uint64_t uart_base;
@@ -66,7 +65,11 @@ int uart_platform_init_from_fdt(const void *fdt)
         return -1;
     }
 
+#ifdef QEMU
+    uart_node = fdt_find_compatible(fdt, "ns16550a");
+#else
     uart_node = fdt_find_compatible(fdt, "ky,pxa-uart");
+#endif
     plic_node = fdt_find_compatible(fdt, "riscv,plic0");
     if (uart_node < 0 || plic_node < 0) {
         return -1;
@@ -81,7 +84,6 @@ int uart_platform_init_from_fdt(const void *fdt)
     g_uart_irq_id = irq;
     g_plic_mmio_base = (uintptr_t)plic_base;
     return 0;
-#endif
 }
 
 uintptr_t uart_mmio_base(void)
@@ -143,12 +145,16 @@ static inline int uart_global_irqs_enabled(void)
 
 static void uart_ier_set_bits(uint32_t bits)
 {
+    uint64_t status = uart_irq_save();
     uart_reg_write(UART_IER_REG, uart_reg_read(UART_IER_REG) | bits);
+    uart_irq_restore(status);
 }
 
 static void uart_ier_clear_bits(uint32_t bits)
 {
+    uint64_t status = uart_irq_save();
     uart_reg_write(UART_IER_REG, uart_reg_read(UART_IER_REG) & ~bits);
+    uart_irq_restore(status);
 }
 
 void uart_rx_mask(void)
@@ -436,6 +442,10 @@ static int uart_tx_queue_pending_timer_marker(void)
 
 static void uart_tx_fill_stress_markers(unsigned int budget_markers)
 {
+    /* A timer callback may also fill this queue while TX work is paused.
+     * Reserve space, append the marker, and advance its ID together.
+     */
+    uint64_t status = uart_irq_save();
     while (budget_markers > 0U) {
         if (uart_timer_marker_pending()) {
             if (uart_tx_queue_pending_timer_marker() == 0U) {
@@ -451,6 +461,7 @@ static void uart_tx_fill_stress_markers(unsigned int budget_markers)
         }
         budget_markers--;
     }
+    uart_irq_restore(status);
 }
 
 static void uart_tx_kick(void)
@@ -463,7 +474,6 @@ static void uart_tx_kick(void)
     (void)uart_tx_try_drain_one();
 }
 
-#ifndef QEMU
 static void uart_irq_ack_stale_status(void)
 {
     /* Boot ROM / firmware may leave old UART status pending. Read the common
@@ -505,7 +515,6 @@ static void uart_flush_hardware_rx_fifo(void)
         budget--;
     }
 }
-#endif
 
 void uart_init(void)
 {
@@ -524,9 +533,6 @@ void uart_init(void)
 
 void uart_irq_init(void)
 {
-#ifdef QEMU
-    return;
-#else
     /* Start from a clean console state every boot/load so an earlier stress
      * run cannot leave backlog in the software rings or deferred-task state.
      */
@@ -548,10 +554,14 @@ void uart_irq_init(void)
     uart_reg_write(UART_MCR_REG, uart_reg_read(UART_MCR_REG) | UART_MCR_OUT2);
     uart_flush_hardware_rx_fifo();
     uart_irq_ack_stale_status();
+#ifdef QEMU
+    uart_ier_set_bits(UART_IER_RX_ENABLE | UART_IER_LINE_ENABLE);
+#else
     uart_ier_set_bits(UART_IER_UUE |
                       UART_IER_RX_ENABLE |
                       UART_IER_LINE_ENABLE |
                       UART_IER_RTO_ENABLE);
+#endif
     uart_ier_clear_bits(UART_IER_TX_ENABLE);
     uart_irq_ack_stale_status();
 
@@ -559,7 +569,6 @@ void uart_irq_init(void)
     g_uart_irq_enabled = 1;
     asm volatile("csrs sie, %0" : : "r"(SIE_SEIE) : "memory");
     asm volatile("csrs sstatus, %0" : : "r"(SSTATUS_SIE) : "memory");
-#endif
 }
 
 void uart_send(char c)
@@ -569,13 +578,12 @@ void uart_send(char c)
      */
     if (g_uart_async_ready) {
         if (uart_global_irqs_enabled()) {
-            while (uart_tx_buf_is_full()) {
+            while (uart_tx_push_char(c) != 0) {
                 /* A deferred callback may be the current producer. It cannot
                  * wait for its own runner to return and service TX work.
                  */
                 (void)uart_tx_try_drain_one();
             }
-            (void)uart_tx_push_char(c);
             uart_tx_kick();
             return;
         }
@@ -683,6 +691,16 @@ void uart_send_dec(unsigned long value)
     }
 }
 
+static void uart_rx_drain(unsigned int budget)
+{
+    while (budget > 0U && (uart_reg_read(UART_LSR_REG) & LSR_RX_READY) != 0U) {
+        char c = (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
+        (void)uart_rx_push_char(c);
+        g_uart_rx_irq_count++;
+        budget--;
+    }
+}
+
 void uart_irq_top(void)
 {
     uint32_t status;
@@ -695,6 +713,8 @@ void uart_irq_top(void)
     if (uart_rx_ready_from_status(status)) {
         demo_trace_record(DEMO_TRACE_UART_TOP_RX, 0U);
         uart_rx_mask();
+        /* Preserve a bounded batch before deferring the remaining RX work. */
+        uart_rx_drain(UART_IRQ_TASK_BUDGET);
         (void)irq_task_enqueue(&g_uart_rx_task);
     }
 
@@ -712,12 +732,7 @@ int uart_rx_task_run(struct irq_task *task)
     (void)task;
     demo_trace_record(DEMO_TRACE_UART_RX_BOTTOM, budget);
 
-    while (budget > 0U && (uart_reg_read(UART_LSR_REG) & LSR_RX_READY) != 0U) {
-        char c = (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
-        (void)uart_rx_push_char(c);
-        g_uart_rx_irq_count++;
-        budget--;
-    }
+    uart_rx_drain(budget);
 
     if ((uart_reg_read(UART_LSR_REG) & LSR_RX_READY) != 0U) {
         return 1;

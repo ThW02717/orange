@@ -7,6 +7,7 @@
 #include "thread.h"
 #include "timer.h"
 #include "uart.h"
+#include "irq_task.h"
 
 #define DEMO_TRACE_CAPACITY 128U
 
@@ -131,6 +132,7 @@ void demo_print_usage(void)
     uart_send_string("  demo preempt     - run two busy user tasks to test timer preemption\n");
     uart_send_string("  demo threads     - test same-process user threads and group exit\n");
     uart_send_string("  demo nested      - print the recommended manual nested-interrupt test flow\n");
+    uart_send_string("  demo tasks       - verify IRQ delivery and deferred callback order\n");
     uart_send_string("  demo thread      - run a cooperative RR kernel-thread demo and enter idle\n");
     uart_send_string("  demo test        - run the user-space syscall smoke test and return to shell\n");
     uart_send_string("  demo uart        - run the one-shot interrupt-driven UART demo\n");
@@ -228,6 +230,150 @@ static int demo_nested(void)
     uart_send_string("  addtimer 3\n");
     uart_send_string("  uartstress\n");
     uart_send_string("expected: [T1]/[T2]/[T3] should appear between [U...] markers\n");
+    return 0;
+}
+
+/* Keep the fixture alive even if a broken timer path misses the test timeout.
+ * A generation token makes a late timer from an earlier run harmless.
+ */
+static struct {
+    unsigned long generation;
+    volatile int active;
+    volatile int high_done;
+    int failed;
+    unsigned int count;
+    unsigned int events[8];
+} g_task_demo;
+
+static void demo_task_event(unsigned int event)
+{
+    uint64_t status = demo_trace_irq_save();
+
+    if (g_task_demo.count < 8U) {
+        g_task_demo.events[g_task_demo.count++] = event;
+    } else {
+        g_task_demo.failed = 1;
+    }
+    demo_trace_irq_restore(status);
+}
+
+static void demo_task_high(void *arg)
+{
+    (void)arg;
+    demo_task_event(5);
+    g_task_demo.high_done = 1;
+}
+
+static void demo_task_equal(void *arg)
+{
+    (void)arg;
+    demo_task_event(6);
+}
+
+static void demo_task_lower(void *arg)
+{
+    (void)arg;
+    demo_task_event(7);
+}
+
+static void demo_task_timer(void *arg)
+{
+    if (!g_task_demo.active ||
+        (unsigned long)(uintptr_t)arg != g_task_demo.generation) {
+        return;
+    }
+    demo_task_event(4);
+    if (add_task(demo_task_high, 0, 0) != 0 ||
+        add_task(demo_task_equal, 0, 5) != 0 ||
+        add_task(demo_task_lower, 0, 7) != 0) {
+        g_task_demo.failed = 1;
+    }
+}
+
+static int demo_task_timer_top_seen(uint64_t since)
+{
+    uint64_t status = demo_trace_irq_save();
+    unsigned int start = (g_demo_trace_head + DEMO_TRACE_CAPACITY -
+                          g_demo_trace_count) % DEMO_TRACE_CAPACITY;
+    int found = 0;
+
+    for (unsigned int i = 0; i < g_demo_trace_count; i++) {
+        const struct demo_trace_event *event =
+            &g_demo_trace[(start + i) % DEMO_TRACE_CAPACITY];
+        if (event->kind == DEMO_TRACE_TIMER_TOP && event->now >= since) {
+            found = 1;
+            break;
+        }
+    }
+    demo_trace_irq_restore(status);
+    return found;
+}
+
+static void demo_task_low(void *arg)
+{
+    uint64_t start = timer_read();
+    uint64_t delay = g_timebase_freq / 100U;
+
+    demo_task_event(1);
+    if (add_timer(demo_task_timer, arg, 0) != 0) {
+        g_task_demo.failed = 1;
+        return;
+    }
+    /* Spend a bounded interval doing work with IRQs enabled. The timer top
+     * half must arrive, but its callback cannot run until we return.
+     */
+    while (timer_read() - start < (delay ? delay : 1U)) {
+        asm volatile("" ::: "memory");
+    }
+    if (demo_task_timer_top_seen(start)) {
+        demo_task_event(2);
+    } else {
+        g_task_demo.failed = 1;
+    }
+    if (g_task_demo.high_done) {
+        g_task_demo.failed = 1;
+    }
+    demo_task_event(3);
+}
+
+static int demo_tasks(void)
+{
+    static const char *const names[] = {
+        "?", "low:start", "timer:top", "low:resume", "timer:bottom",
+        "high", "equal", "lower"
+    };
+
+    if (g_timebase_freq == 0) {
+        uart_send_string("[tasks] timer unavailable\n");
+        return -1;
+    }
+    g_task_demo.generation++;
+    g_task_demo.active = 1;
+    g_task_demo.high_done = 0;
+    g_task_demo.failed = 0;
+    g_task_demo.count = 0;
+    demo_trace_reset();
+    if (add_task(demo_task_low, (void *)(uintptr_t)g_task_demo.generation, 5) != 0) {
+        g_task_demo.active = 0;
+        uart_send_string("[tasks] callback queue full\n");
+        return -1;
+    }
+    irq_run_bottom_halves();
+    g_task_demo.active = 0;
+
+    uart_send_string("[tasks] ");
+    for (unsigned int i = 0; i < g_task_demo.count; i++) {
+        unsigned int event = g_task_demo.events[i];
+        if (i != 0) { uart_send_string(" -> "); }
+        uart_send_string(event < 8U ? names[event] : "?");
+        if (event != i + 1U) { g_task_demo.failed = 1; }
+    }
+    uart_send_string("\n");
+    if (g_task_demo.failed || g_task_demo.count != 7U || !g_task_demo.high_done) {
+        uart_send_string("[tasks] FAIL\n");
+        return -1;
+    }
+    uart_send_string("[tasks] PASS\n");
     return 0;
 }
 
@@ -571,6 +717,9 @@ int demo_run(const char *name)
 
     if (streq_local(cmd, "nested")) {
         return demo_nested();
+    }
+    if (streq_local(cmd, "tasks")) {
+        return demo_tasks();
     }
     if (streq_local(cmd, "foo")) {
         return demo_foo();

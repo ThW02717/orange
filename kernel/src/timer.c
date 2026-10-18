@@ -7,7 +7,7 @@
 #include "irq_task.h"
 
 /* Shared timer subsystem state.
- * - g_next_deadline follows the head of the pending software-timer list
+ * - g_next_deadline is the earliest scheduler tick or software-timer deadline
  * - g_uptime_seconds is updated from the hardware time counter on each IRQ
  */
 uint32_t g_timebase_freq;
@@ -20,6 +20,7 @@ static struct timer_event *g_timer_head = 0;
 static int g_timer_enabled = 0;
 static uint64_t g_sched_tick_interval = 0;
 static uint64_t g_sched_tick_deadline = 0;
+static uint64_t g_periodic_demo_deadline = 0;
 static struct irq_task g_timer_task = {
     .type = IRQ_TASK_TIMER,
     .prio = 0,
@@ -29,8 +30,7 @@ static struct irq_task g_timer_task = {
 };
 /* Invariants for the software-timer queue:
  * 1. g_timer_head points to a list sorted by expire, smallest first.
- * 2. The programmed hardware deadline always matches g_timer_head->expire
- *    whenever the list is non-empty.
+ * 2. The hardware deadline is the earliest tick, demo, or pending event.
  */
 
 /* rdtime returns the monotonically increasing platform time counter. */
@@ -92,9 +92,8 @@ struct sbiret timer_program_rel(uint64_t delta_ticks)
     return timer_program_abs(timer_read() + delta_ticks);
 }
 
-/* Reprogram the single hardware timer so it always tracks the earliest
- * pending software timer event. If the queue is empty, park the deadline far
- * away and clear g_next_deadline for observability.
+/* One SBI timer serves the scheduler and all software events. Caller holds
+ * the IRQ lock so queue changes and the programmed deadline stay consistent.
  */
 static void timer_reprogram_locked(void)
 {
@@ -105,6 +104,10 @@ static void timer_reprogram_locked(void)
     }
     if (g_timer_head != 0 && (deadline == 0 || g_timer_head->expire < deadline)) {
         deadline = g_timer_head->expire;
+    }
+    if (g_periodic_demo_deadline != 0 &&
+        (deadline == 0 || g_periodic_demo_deadline < deadline)) {
+        deadline = g_periodic_demo_deadline;
     }
 
     if (deadline != 0) {
@@ -126,6 +129,7 @@ void timer_init_state(uint32_t timebase_freq)
     g_timer_irq_count = 0;
     g_sched_tick_interval = 0;
     g_sched_tick_deadline = 0;
+    g_periodic_demo_deadline = 0;
 }
 
 void timer_init(void)
@@ -136,10 +140,7 @@ void timer_init(void)
         return;
     }
 
-    /* Arm the timer subsystem without inventing a fake periodic event. The
-     * first real interrupt will come from whichever software timer becomes the
-     * list head next.
-     */
+    /* Share the one-shot hardware timer with a 20 Hz scheduling deadline. */
     sstatus = timer_irq_save();
     g_timer_enabled = 1;
     g_sched_tick_interval = (g_timebase_freq >= 20U) ? ((uint64_t)g_timebase_freq / 20ULL) : 1ULL;
@@ -159,6 +160,12 @@ void timer_init(void)
 }
 
 int add_timer(timer_callback_t callback, void *arg, uint64_t duration_ticks)
+{
+    return add_timer_with_cleanup(callback, arg, duration_ticks, 0);
+}
+
+int add_timer_with_cleanup(timer_callback_t callback, void *arg,
+                           uint64_t duration_ticks, timer_callback_t cleanup)
 {
     struct timer_event *event;
     struct timer_event **link;
@@ -182,25 +189,19 @@ int add_timer(timer_callback_t callback, void *arg, uint64_t duration_ticks)
     expire += duration_ticks;
     event->expire = expire;
     event->callback = callback;
+    event->cleanup = cleanup;
     event->arg = arg;
     event->next = 0;
 
-    /* Critical section begins here.
-     *
-     * From this point until timer_irq_restore(), we temporarily block
-     * interrupts while mutating the pending timer list and the programmed
-     * hardware deadline. The queue and the hardware timer must change as one
-     * logical update:
-     *
-     *   1. Insert the new event into the sorted pending list.
-     *   2. Recompute which event is now the head.
-     *   3. Reprogram hardware so its next deadline matches head->expire.
-     *
-     * If a timer interrupt were allowed to arrive in the middle of that
-     * sequence, the handler could observe a half-updated list or an outdated
-     * deadline.
+    /* A higher-priority callback can add a timer while a lower one is paused.
+     * Publish the event and reprogram the timer under the same IRQ lock.
      */
     sstatus = timer_irq_save();
+    if (!g_timer_enabled) {
+        timer_irq_restore(sstatus);
+        kfree(event);
+        return -1;
+    }
 
     /* Sorted insert by absolute expire so the queue head is always the next
      * event that hardware must wake up for.
@@ -212,31 +213,38 @@ int add_timer(timer_callback_t callback, void *arg, uint64_t duration_ticks)
     event->next = *link;
     *link = event;
 
-    /* Still inside the same critical section: after the list order may have
-     * changed, update the one hardware timer source so it always tracks the
-     * new head deadline.
-     */
     timer_reprogram_locked();
-
-    /* Critical section ends here. Restore the caller's previous interrupt
-     * state now that both the software queue and the hardware deadline are
-     * consistent again.
-     */
     timer_irq_restore(sstatus);
+    return 0;
+}
+
+int timer_periodic_demo(int enabled)
+{
+    uint64_t status = timer_irq_save();
+
+    if (!g_timer_enabled || g_timebase_freq == 0) {
+        timer_irq_restore(status);
+        return -1;
+    }
+    g_periodic_demo_deadline = enabled ?
+        timer_read() + 2ULL * g_timebase_freq : 0;
+    timer_reprogram_locked();
+    timer_irq_restore(status);
     return 0;
 }
 
 void timer_irq_top(void)
 {
-    demo_trace_record(DEMO_TRACE_TIMER_TOP, timer_pending_count());
     timer_source_mask();
-
+    /* Do not walk the timeout list while entering the interrupt. */
+    demo_trace_record(DEMO_TRACE_TIMER_TOP, 0U);
     (void)irq_task_enqueue(&g_timer_task);
 }
 
 int timer_task_run(struct irq_task *task)
 {
     uint64_t now;
+    uint64_t status;
     int fired_any = 0;
 
     (void)task;
@@ -248,39 +256,54 @@ int timer_task_run(struct irq_task *task)
         return 0;
     }
 
-    now = timer_read();
-    timer_sync_uptime(now);
     g_timer_irq_count++;
-    while (g_sched_tick_interval != 0 && g_sched_tick_deadline <= now) {
-        g_sched_tick_deadline += g_sched_tick_interval;
-    }
+    for (;;) {
+        struct timer_event *event;
+        int print_uptime = 0;
 
-    /* Timer ISR body: consume every event that is already due at this
-     * interrupt edge. This
-     * keeps the queue invariant simple: once the loop exits, either the list
-     * is empty or the new head has expire > now.
-     */
-    while (g_timer_head != 0 && g_timer_head->expire <= now) {
-        struct timer_event *event = g_timer_head;
-
-        g_timer_head = event->next;
-        event->next = 0;
-        /* First version: callbacks run synchronously in the timer interrupt
-         * path. This keeps the implementation simple and matches the current
-         * one-shot software timer exercise.
-         */
-        event->callback(event->arg);
-        kfree(event);
-        fired_any = 1;
-
+        status = timer_irq_save();
+        if (!g_timer_enabled) {
+            timer_irq_restore(status);
+            break;
+        }
         now = timer_read();
         timer_sync_uptime(now);
-    }
+        while (g_sched_tick_interval != 0 && g_sched_tick_deadline <= now) {
+            g_sched_tick_deadline += g_sched_tick_interval;
+        }
+        if (g_periodic_demo_deadline != 0 && g_periodic_demo_deadline <= now) {
+            g_periodic_demo_deadline = now + 2ULL * g_timebase_freq;
+            print_uptime = 1;
+        }
 
-    /* Invariant: after consuming all expired events, the programmed hardware
-     * deadline must equal the new list head.
-     */
-    timer_reprogram_locked();
+        event = g_timer_head;
+        if (event != 0 && event->expire <= now) {
+            g_timer_head = event->next;
+            event->next = 0;
+        } else {
+            event = 0;
+        }
+        timer_irq_restore(status);
+
+        if (print_uptime) {
+            uart_send_string("\n[timer] uptime=");
+            uart_send_dec((unsigned long)((now - g_boot_time) / g_timebase_freq));
+            uart_send_string(" seconds\n");
+        }
+        if (event == 0) {
+            break;
+        }
+
+        /* The event is detached. Callbacks may add/stop timers or be
+         * interrupted by higher-priority work without exposing half a list.
+         */
+        event->callback(event->arg);
+        if (event->cleanup != 0) {
+            event->cleanup(event->arg);
+        }
+        kfree(event);
+        fired_any = 1;
+    }
 
     /* Once the entire interrupt path is done, redraw the REPL prompt. Doing
      * it here instead of inside the callback avoids printing ">" before the
@@ -290,7 +313,12 @@ int timer_task_run(struct irq_task *task)
         shell_redraw_prompt_delayed();
     }
 
-    if (g_timer_enabled) { timer_source_unmask(); }
+    status = timer_irq_save();
+    if (g_timer_enabled) {
+        timer_reprogram_locked();
+        asm volatile("csrs sie, %0" : : "r"(SIE_STIE) : "memory");
+    }
+    timer_irq_restore(status);
     return 0;
 }
 
@@ -302,29 +330,39 @@ void timer_irq_isr(void)
 void timer_stop(void)
 {
     uint64_t sstatus;
-
-    timer_source_mask();
+    struct timer_event *pending;
 
     sstatus = timer_irq_save();
+    timer_source_mask();
     g_timer_enabled = 0;
     irq_task_cancel(&g_timer_task);
-    /* Stop means "drop the whole pending queue" in this first version. */
-    while (g_timer_head != 0) {
-        struct timer_event *event = g_timer_head;
-        g_timer_head = event->next;
-        kfree(event);
-    }
+    pending = g_timer_head;
+    g_timer_head = 0;
     g_next_deadline = 0;
     g_sched_tick_interval = 0;
     g_sched_tick_deadline = 0;
+    g_periodic_demo_deadline = 0;
     (void)sbi_set_timer(~0ULL);
     timer_irq_restore(sstatus);
+
+    /* Pending payloads belong to the event until firing or cancellation.
+     * The currently executing event is already detached and frees itself.
+     */
+    while (pending != 0) {
+        struct timer_event *event = pending;
+        pending = event->next;
+        if (event->cleanup != 0) {
+            event->cleanup(event->arg);
+        }
+        kfree(event);
+    }
 
     uart_send_string("[timer] stopped\n");
 }
 
 unsigned int timer_pending_count(void)
 {
+    uint64_t status = timer_irq_save();
     unsigned int count = 0;
     struct timer_event *cur = g_timer_head;
 
@@ -332,11 +370,13 @@ unsigned int timer_pending_count(void)
         count++;
         cur = cur->next;
     }
+    timer_irq_restore(status);
     return count;
 }
 
 void timer_dump_queue(void)
 {
+    uint64_t status = timer_irq_save();
     uint64_t now = timer_read();
     struct timer_event *cur = g_timer_head;
     unsigned int idx = 0;
@@ -364,4 +404,5 @@ void timer_dump_queue(void)
         uart_send_string("\n");
         cur = cur->next;
     }
+    timer_irq_restore(status);
 }

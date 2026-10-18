@@ -18,6 +18,7 @@ typedef void (*timer_callback_t)(void *arg);
 struct timer_event {
     uint64_t expire;
     timer_callback_t callback;
+    timer_callback_t cleanup;
     void *arg;
     struct timer_event *next;
 };
@@ -60,6 +61,13 @@ void timer_stop(void);
  * list sorted by that absolute deadline.
  */
 int add_timer(timer_callback_t callback, void *arg, uint64_t duration_ticks);
+/* On success, cleanup(arg) runs after the callback or when timer_stop drops
+ * the event. On failure the caller still owns arg. NULL cleanup is allowed.
+ */
+int add_timer_with_cleanup(timer_callback_t callback, void *arg,
+                           uint64_t duration_ticks, timer_callback_t cleanup);
+/* Basic lab demo: print uptime every two seconds; scheduler ticks stay armed. */
+int timer_periodic_demo(int enabled);
 unsigned int timer_pending_count(void);
 void timer_dump_queue(void);
 #endif

@@ -2,9 +2,7 @@
 .global _start
 
 _start:
-    /* Deliberately execute an invalid instruction so the user fault path
-     * can be verified without involving the ecall syscall path.
-     */
+    /* Test user-fault termination independently of the syscall path. */
     .word 0xffffffff
 
 1:

@@ -3,11 +3,23 @@
 #include "irq_task.h"
 #include "trap.h"
 
-/* Single deferred-task queue for the Advanced Exercise 2 MVP.
- * Tasks are ordered by software priority rank. Lower rank runs first.
+/* Single-hart deferred work. A smaller rank runs first; equal ranks are FIFO.
+ * Nested IRQs may queue work, but the current callback finishes before it runs.
  */
 static struct irq_task *g_irq_task_head = 0;
 static int g_irq_task_running = 0;
+
+/* A fixed pool lets an IRQ enqueue a callback without allocating heap memory.
+ * Keep the slot occupied until its callback and runner bookkeeping finish.
+ */
+struct irq_callback {
+    struct irq_task task;
+    task_callback_t callback;
+    void *arg;
+    int allocated;
+};
+
+static struct irq_callback g_irq_callbacks[IRQ_CALLBACK_CAPACITY];
 
 /* Queue operations only protect queue linkage and task state transitions.
  * The deferred task body itself must run outside this critical section.
@@ -23,27 +35,6 @@ static uint64_t irq_task_irq_save(void)
 static void irq_task_irq_restore(uint64_t sstatus)
 {
     asm volatile("csrw sstatus, %0" : : "r"(sstatus) : "memory");
-}
-
-/* Bottom-half work must run with global interrupts enabled so a later,
- * higher-priority interrupt can preempt a slow deferred task.
- *
- * Preemption rules:
- * - Top halves do not nest themselves here; they stay short and run with the
- *   normal trap-time interrupt masking discipline.
- * - Bottom halves may be interrupted because irq_task_run_before_return()
- *   explicitly re-enables SIE before calling task->run().
- * - If a top half interrupts a running bottom half, it only enqueues work.
- *   It does not immediately jump into another bottom half.
- * - Once control returns to the runner loop, the next bottom half is chosen
- *   purely by task->prio (lower rank first).
- */
-static uint64_t irq_task_enable_nested_interrupts(void)
-{
-    uint64_t sstatus;
-
-    asm volatile("csrrs %0, sstatus, %1" : "=r"(sstatus) : "r"(SSTATUS_SIE) : "memory");
-    return sstatus;
 }
 
 /* Queue helper used by both the public enqueue API and the runner requeue
@@ -66,13 +57,58 @@ void irq_task_backend_init(void)
 {
     g_irq_task_head = 0;
     g_irq_task_running = 0;
+    for (unsigned int i = 0; i < IRQ_CALLBACK_CAPACITY; i++) {
+        g_irq_callbacks[i].allocated = 0;
+    }
+}
+
+static int irq_callback_run(struct irq_task *task)
+{
+    struct irq_callback *work = (struct irq_callback *)task;
+
+    work->callback(work->arg);
+    return 0;
+}
+
+int add_task(task_callback_t callback, void *arg, int priority)
+{
+    uint64_t status;
+
+    if (callback == 0 || priority < 0 ||
+        priority >= (int)IRQ_TASK_PRIORITY_LEVELS) {
+        return -1;
+    }
+
+    status = irq_task_irq_save();
+    for (unsigned int i = 0; i < IRQ_CALLBACK_CAPACITY; i++) {
+        struct irq_callback *work = &g_irq_callbacks[i];
+
+        if (work->allocated) {
+            continue;
+        }
+        work->allocated = 1;
+        work->callback = callback;
+        work->arg = arg;
+        work->task.type = IRQ_TASK_CALLBACK;
+        work->task.prio = (uint8_t)priority;
+        work->task.state = IRQ_TASK_QUEUED;
+        work->task.rerun = 0;
+        work->task.run = irq_callback_run;
+        irq_task_insert_locked(&work->task);
+        irq_task_irq_restore(status);
+        return 0;
+    }
+    irq_task_irq_restore(status);
+    return -1;
 }
 
 int irq_task_enqueue(struct irq_task *task)
 {
     uint64_t sstatus;
 
-    if (task == 0 || task->run == 0) {
+    /* Callback slots are owned by add_task(), not this persistent-task API. */
+    if (task == 0 || task->run == 0 ||
+        (unsigned int)task->type >= IRQ_TASK_CALLBACK) {
         return -1;
     }
 
@@ -108,6 +144,8 @@ void irq_task_cancel(struct irq_task *task)
         task->next = 0;
         task->state = IRQ_TASK_IDLE;
         task->rerun = 0;
+    } else if (task != 0 && task->state == IRQ_TASK_RUNNING) {
+        task->rerun = 0;
     }
     irq_task_irq_restore(status);
 }
@@ -142,31 +180,26 @@ int irq_task_queue_empty(void)
     return empty;
 }
 
-void irq_task_run_before_return(void)
+void irq_run_bottom_halves(void)
 {
     uint64_t entry_status = irq_task_irq_save();
+
+    /* A nested IRQ finishes its top half, then resumes the paused callback.
+     * Leave all newly queued work for the existing runner, even at rank 0.
+     */
     if (g_irq_task_running) {
         irq_task_irq_restore(entry_status);
         return;
     }
     g_irq_task_running = 1;
-    irq_task_irq_restore(entry_status);
 
     while (1) {
         struct irq_task *task;
-        uint64_t sstatus;
-        uint64_t run_sstatus;
         int action;
 
-        /* Only queue manipulation and state transitions are protected by the
-         * local critical section. This keeps top-half work short and keeps
-         * the queue/state machine coherent.
-         */
-        sstatus = irq_task_irq_save();
+        /* Priority selects the next callback; it never interrupts this one. */
         task = g_irq_task_head;
         if (task == 0) {
-            g_irq_task_running = 0;
-            irq_task_irq_restore(sstatus);
             break;
         }
 
@@ -174,7 +207,6 @@ void irq_task_run_before_return(void)
         task->next = 0;
         task->state = IRQ_TASK_RUNNING;
         task->rerun = 0;
-        irq_task_irq_restore(sstatus);
 
         switch (task->type) {
         case IRQ_TASK_TIMER:
@@ -190,22 +222,23 @@ void irq_task_run_before_return(void)
             break;
         }
 
-        /* Run the deferred task outside the queue critical section and with
-         * SIE set, so nested interrupts may preempt a long bottom half.
-         * If that happens, the top half only enqueues more work; bottom-half
-         * selection still happens back in this runner loop by priority rank.
+        /* Keep hardware IRQs enabled during the callback. Their top halves
+         * can enqueue work, but the runner guard prevents nested callbacks.
          */
-        run_sstatus = irq_task_enable_nested_interrupts();
+        asm volatile("csrs sstatus, %0" : : "r"(SSTATUS_SIE) : "memory");
         action = task->run(task);
-        irq_task_irq_restore(run_sstatus);
+        (void)irq_task_irq_save();
 
-        sstatus = irq_task_irq_save();
         if (action != 0 || task->rerun) {
             task->state = IRQ_TASK_QUEUED;
             irq_task_insert_locked(task);
         } else {
             task->state = IRQ_TASK_IDLE;
+            if (task->type == IRQ_TASK_CALLBACK) {
+                ((struct irq_callback *)task)->allocated = 0;
+            }
         }
-        irq_task_irq_restore(sstatus);
     }
+    g_irq_task_running = 0;
+    irq_task_irq_restore(entry_status);
 }

@@ -7,8 +7,9 @@ _start:
     li a7, SYS_getpid
     ecall
 
-    /* IDs can exceed nine after several launches. Build the whole decimal
-     * message on our stack instead of overwriting one byte in a literal.
+    /*
+     * A PID can span multiple digits. Keep the formatted message on this
+     * thread's stack instead of changing the shared user image.
      */
     addi sp, sp, -32
     addi t0, sp, 31

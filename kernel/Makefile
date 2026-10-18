@@ -23,6 +23,9 @@ USER_TEST_BIN := $(USER_ROOTFS_DIR)/test.bin
 USER_BADINST_SRC := $(USER_DIR)/badinst.S
 USER_BADINST_ELF := $(USER_BUILD_DIR)/badinst.elf
 USER_BADINST_BIN := $(USER_ROOTFS_DIR)/badinst.bin
+USER_PROG_SRC := $(USER_DIR)/prog.S
+USER_PROG_ELF := $(USER_BUILD_DIR)/prog.elf
+USER_PROG_BIN := $(USER_ROOTFS_DIR)/prog.bin
 USER_FORK_START_SRC := $(USER_DIR)/fork_start.S
 USER_FORK_SRC := $(USER_DIR)/fork.c
 USER_FORK_ELF := $(USER_BUILD_DIR)/fork.elf
@@ -51,7 +54,7 @@ BOARD_LDFLAGS := --defsym=KERNEL_LOAD_ADDR=0x20000000
 QEMU_LDFLAGS  := --defsym=KERNEL_LOAD_ADDR=0x82000000
 USER_LINK_ADDR := 0x32000000
 QEMU_USER_LINK_ADDR := 0x83000000
-QEMU_USER_BINS := $(addprefix $(USER_BUILD_DIR)/qemu_,$(addsuffix .bin,test badinst fork preempt threads))
+QEMU_USER_BINS := $(addprefix $(USER_BUILD_DIR)/qemu_,$(addsuffix .bin,test badinst fork preempt threads prog))
 QEMU_ROOTFS_DIR := $(BUILD_DIR)/rootfs_qemu
 QEMU_INITRAMFS := $(BUILD_DIR)/initramfs_qemu.cpio
 
@@ -104,6 +107,12 @@ $(USER_BADINST_ELF): $(USER_BADINST_SRC) | $(USER_BUILD_DIR)
 $(USER_BADINST_BIN): $(USER_BADINST_ELF) | $(USER_ROOTFS_DIR)
 	$(OBJCOPY) -O binary -S $< $@
 
+$(USER_PROG_ELF): $(USER_PROG_SRC) | $(USER_BUILD_DIR)
+	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $<
+
+$(USER_PROG_BIN): $(USER_PROG_ELF) | $(USER_ROOTFS_DIR)
+	$(OBJCOPY) -O binary -S $< $@
+
 $(USER_FORK_ELF): $(USER_FORK_START_SRC) $(USER_FORK_SRC) $(INC_DIR)/syscall.h | $(USER_BUILD_DIR)
 	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_FORK_START_SRC) $(USER_FORK_SRC)
 
@@ -144,10 +153,10 @@ $(USER_BUILD_DIR)/qemu_%.bin: $(USER_BUILD_DIR)/qemu_%.elf
 $(QEMU_INITRAMFS): $(ROOTFS_FILES) $(QEMU_USER_BINS)
 	mkdir -p $(QEMU_ROOTFS_DIR)/bin
 	cp -a $(ROOTFS_DIR)/. $(QEMU_ROOTFS_DIR)/
-	$(foreach name,test badinst fork preempt threads,cp $(USER_BUILD_DIR)/qemu_$(name).bin $(QEMU_ROOTFS_DIR)/bin/$(name).bin;)
+	$(foreach name,test badinst fork preempt threads prog,cp $(USER_BUILD_DIR)/qemu_$(name).bin $(QEMU_ROOTFS_DIR)/bin/$(name).bin;)
 	cd $(QEMU_ROOTFS_DIR) && find . -print0 | LC_ALL=C sort -z | cpio --null -o -H newc --owner=0:0 > ../initramfs_qemu.cpio
 
-$(INITRAMFS): $(ROOTFS_FILES) $(USER_TEST_BIN) $(USER_BADINST_BIN) $(USER_FORK_BIN) $(USER_PREEMPT_BIN) $(USER_THREADS_BIN)
+$(INITRAMFS): $(ROOTFS_FILES) $(USER_TEST_BIN) $(USER_BADINST_BIN) $(USER_FORK_BIN) $(USER_PREEMPT_BIN) $(USER_THREADS_BIN) $(USER_PROG_BIN)
 	@if [ ! -d "$(ROOTFS_DIR)" ]; then \
 		echo "Missing $(ROOTFS_DIR)/ directory"; \
 		exit 1; \

@@ -98,6 +98,7 @@ static int parse_seconds_to_ticks(const char *s, uint64_t *ticks_out, uint64_t *
     uint64_t frac_scale = 1;
     unsigned int i = 0;
     int seen_dot = 0;
+    int seen_digit = 0;
 
     if (s == 0 || ticks_out == 0 || whole_out == 0 || s[0] == '\0' || g_timebase_freq == 0U) {
         return -1;
@@ -117,6 +118,7 @@ static int parse_seconds_to_ticks(const char *s, uint64_t *ticks_out, uint64_t *
         if (c < '0' || c > '9') {
             return -1;
         }
+        seen_digit = 1;
 
         if (!seen_dot) {
             if (whole > (UINT64_MAX - (uint64_t)(c - '0')) / 10ULL) {
@@ -133,6 +135,9 @@ static int parse_seconds_to_ticks(const char *s, uint64_t *ticks_out, uint64_t *
         i++;
     }
 
+    if (!seen_digit) {
+        return -1;
+    }
     {
         uint64_t fraction_ticks = (frac * (uint64_t)g_timebase_freq) / frac_scale;
         if (whole > (UINT64_MAX - fraction_ticks) / (uint64_t)g_timebase_freq) {
@@ -677,6 +682,79 @@ static void cmd_addtimer(const char *arg)
     uart_send_string(" sec\n");
 }
 
+struct shell_timeout {
+    uint64_t submitted;
+    char message[];
+};
+
+static void shell_print_time(uint64_t ticks)
+{
+    uint64_t elapsed = ticks - g_boot_time;
+    unsigned long ms = (unsigned long)((elapsed % g_timebase_freq) *
+                                       1000ULL / g_timebase_freq);
+
+    uart_send_dec((unsigned long)(elapsed / g_timebase_freq));
+    uart_send('.');
+    if (ms < 100UL) { uart_send('0'); }
+    if (ms < 10UL) { uart_send('0'); }
+    uart_send_dec(ms);
+}
+
+static void shell_timeout_callback(void *arg)
+{
+    struct shell_timeout *timeout = arg;
+    uint64_t fired = timer_read();
+
+    uart_send_string("\n[timeout] submitted=");
+    shell_print_time(timeout->submitted);
+    uart_send_string("s fired=");
+    shell_print_time(fired);
+    uart_send_string("s message=");
+    uart_send_string(timeout->message);
+    uart_send_string("\n");
+}
+
+static void cmd_set_timeout(char *arg)
+{
+    char *seconds;
+    char *message;
+    struct shell_timeout *timeout;
+    uint64_t ticks;
+    uint64_t whole;
+    uint64_t submitted = timer_read();
+    unsigned int length;
+
+    if (arg == 0) {
+        goto usage;
+    }
+    split_first_arg(arg, &seconds, &message);
+    if (message == 0 || parse_seconds_to_ticks(seconds, &ticks, &whole) != 0) {
+        goto usage;
+    }
+
+    length = str_len(message) + 1U;
+    timeout = kmalloc(sizeof(*timeout) + length);
+    if (timeout == 0) {
+        uart_send_string("setTimeout: allocation failed\n");
+        return;
+    }
+    timeout->submitted = submitted;
+    /* The next shell command reuses its stack buffer. Keep our own message
+     * until this event fires or timer_stop cancels it.
+     */
+    copy_bytes(timeout->message, message, length);
+    if (add_timer_with_cleanup(shell_timeout_callback, timeout, ticks, kfree) != 0) {
+        kfree(timeout);
+        uart_send_string("setTimeout: timer registration failed\n");
+        return;
+    }
+    uart_send_string("setTimeout: queued\n");
+    return;
+
+usage:
+    uart_send_string("usage: setTimeout SECONDS MESSAGE\n");
+}
+
 /* Single memory status command: counters plus slab/buddy snapshots. */
 static void cmd_mem(void)
 {
@@ -727,7 +805,8 @@ static void cmd_uartstress(const char *arg)
 static int shell_launch_user_program_instances(const char *name,
                                                const char *label,
                                                unsigned int instances,
-                                               int verbose)
+                                               int verbose,
+                                               int lab_ecalls)
 {
     unsigned long size;
     uintptr_t entry;
@@ -804,6 +883,9 @@ static int shell_launch_user_program_instances(const char *name,
             uart_send_string(": failed to create user task\n");
             goto launch_failed;
         }
+        if (lab_ecalls) {
+            trap_set_ecall_demo(created_pids[i]);
+        }
     }
 
     if (instances == 1U) {
@@ -817,11 +899,13 @@ static int shell_launch_user_program_instances(const char *name,
     }
     uart_tx_wait_idle();
     thread_run_until_idle();
+    if (lab_ecalls) { trap_set_ecall_demo(-1); }
     uart_send_string(label);
     uart_send_string(": user task finished, back to shell\n");
     return 0;
 
 launch_failed:
+    if (lab_ecalls) { trap_set_ecall_demo(-1); }
     /* Do not leave a partly created batch runnable after reporting failure. */
     while (i > 0U) {
         (void)thread_stop_tid(created_pids[--i], -1);
@@ -836,17 +920,33 @@ static void cmd_runu(const char *arg) {
         uart_send_string("usage: runu <name>\n");
         return;
     }
-    (void)shell_launch_user_program_instances(arg, "runu", 1U, 1);
+    (void)shell_launch_user_program_instances(arg, "runu", 1U, 1, 0);
+}
+
+static void cmd_exec(const char *arg)
+{
+    int previous_trace;
+
+    if (arg == 0) {
+        arg = "prog";
+    }
+    /* The basic trap exercise prints CSR snapshots for each user ecall. */
+    previous_trace = trap_trace_ecalls(1);
+    if (streq(arg, "prog")) {
+        uart_send_string("exec: lab diagnostic image; final U-mode loop runs until reset\n");
+    }
+    (void)shell_launch_user_program_instances(arg, "exec", 1U, 1, streq(arg, "prog"));
+    (void)trap_trace_ecalls(previous_trace);
 }
 
 static void cmd_fork_test(void)
 {
-    (void)shell_launch_user_program_instances("fork", "fork_test", 1U, 0);
+    (void)shell_launch_user_program_instances("fork", "fork_test", 1U, 0, 0);
 }
 
 static void cmd_preempt_test(void)
 {
-    (void)shell_launch_user_program_instances("preempt", "preempt_test", 2U, 0);
+    (void)shell_launch_user_program_instances("preempt", "preempt_test", 2U, 0, 0);
 }
 
 /* Main command dispatcher for the interactive shell. */
@@ -868,10 +968,13 @@ void processCommand(shell_t* shell) {
         uart_send_string("  cores  - Show HSM status for core 0..7\n");
         uart_send_string("  ls     - List initrd files\n");
         uart_send_string("  cat    - Show initrd file content\n");
-        uart_send_string("  demo <name> - Run demos/tests (thread|uart|stress|mem|nested|trace)\n");
+        uart_send_string("  demo <name> - Run demos/tests (thread|uart|stress|mem|nested|tasks|trace)\n");
         uart_send_string("  mem    - Show allocator, slab, and buddy state\n");
         uart_send_string("  timer  - Show timer subsystem state and pending queue\n");
+        uart_send_string("  timer periodic on|off - Enable/disable the two-second uptime demo\n");
         uart_send_string("  addtimer <sec> - Schedule a one-shot software timer (supports 1.5)\n");
+        uart_send_string("  setTimeout <seconds> <message> - Print a saved message after a delay\n");
+        uart_send_string("  exec [name] - Run with ecall diagnostics (default: Lab 4 prog)\n");
         uart_send_string("  runu <name> - Load and run bin/<name>.bin from initramfs\n");
         uart_send_string("  fork_test - Run the user-space fork test and return to shell\n");
         uart_send_string("  preempt_test - Run two busy user tasks to test timer preemption\n");
@@ -936,7 +1039,28 @@ void processCommand(shell_t* shell) {
     }
 
     if (streq(cmd, "timer")) {
-        cmd_timer();
+        if (arg == 0) {
+            cmd_timer();
+        } else if (streq(arg, "periodic on") || streq(arg, "periodic off")) {
+            int enabled = streq(arg, "periodic on");
+            if (timer_periodic_demo(enabled) != 0) {
+                uart_send_string("timer: subsystem unavailable\n");
+            } else {
+                uart_send_string(enabled ? "timer: periodic on\n" : "timer: periodic off\n");
+            }
+        } else {
+            uart_send_string("usage: timer [periodic on|off]\n");
+        }
+        return;
+    }
+
+    if (streq(cmd, "setTimeout")) {
+        cmd_set_timeout(arg);
+        return;
+    }
+
+    if (streq(cmd, "exec")) {
+        cmd_exec(arg);
         return;
     }
 

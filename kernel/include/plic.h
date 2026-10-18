@@ -20,7 +20,6 @@
  * forwarding. Kernel code mainly fills in the policy knobs and later uses
  * claim/complete during interrupt handling.
  */
-#ifndef QEMU
 #define PLIC_HART0_SCTX            1UL
 /* Per-source priority registers live here. Source priority 0 means the IRQ
  * will never be forwarded by the PLIC.
@@ -40,7 +39,6 @@
 #define PLIC_CONTEXT_STRIDE        0x1000UL
 #define PLIC_THRESHOLD_OFFSET      0x0UL
 #define PLIC_CLAIM_COMPLETE_OFFSET 0x4UL
-#endif
 
 void plic_set_priority(uint32_t irq, uint32_t priority);
 void plic_enable_irq(uint32_t irq);

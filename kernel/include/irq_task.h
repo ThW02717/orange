@@ -3,6 +3,11 @@
 
 #include <stdint.h>
 
+#define IRQ_TASK_PRIORITY_LEVELS 8U
+#define IRQ_CALLBACK_CAPACITY 32U
+
+typedef void (*task_callback_t)(void *arg);
+
 /* Deferred task types handled by the Advanced Exercise 2 backend.
  * These are software bottom-half work items, not raw hardware interrupt IDs.
  */
@@ -10,6 +15,7 @@ enum irq_task_type {
     IRQ_TASK_TIMER,
     IRQ_TASK_UART_RX,
     IRQ_TASK_UART_TX,
+    IRQ_TASK_CALLBACK,
 };
 
 /* Task state is tracked explicitly so the same persistent deferred task
@@ -45,7 +51,7 @@ struct irq_task {
 };
 
 /* Software deferred-work priority policy.
- * Lower rank means higher priority.
+ * Lower rank runs first after the current callback returns.
  */
 static inline uint8_t irq_task_prio_for_type(enum irq_task_type type)
 {
@@ -57,7 +63,7 @@ static inline uint8_t irq_task_prio_for_type(enum irq_task_type type)
     case IRQ_TASK_UART_TX:
         return 6U;
     default:
-        return 10U;
+        return IRQ_TASK_PRIORITY_LEVELS - 1U;
     }
 }
 
@@ -66,6 +72,15 @@ int irq_task_enqueue(struct irq_task *task);
 void irq_task_cancel(struct irq_task *task);
 struct irq_task *irq_task_pop_head(void);
 int irq_task_queue_empty(void);
-void irq_task_run_before_return(void);
+/* Queue a kernel callback. Priority 0 is highest, 7 is lowest; equal ranks
+ * keep FIFO order. Return -1 for invalid input or a full callback pool.
+ * The caller owns arg and keeps it alive until the callback returns.
+ * Callbacks run on the interrupted kernel stack: do not sleep, schedule,
+ * or wait for another deferred callback, regardless of its priority.
+ */
+int add_task(task_callback_t callback, void *arg, int priority);
+
+/* Run queued callbacks with IRQs enabled. Nested calls leave work queued. */
+void irq_run_bottom_halves(void);
 
 #endif
