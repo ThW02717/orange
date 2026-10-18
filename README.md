@@ -15,8 +15,8 @@ python3 -B scripts/run_system_tests.py
 The regression runner checks malformed CPIO/DTB inputs with host ASan/UBSan,
 then exercises integer-register trap round trips, scheduler reclamation,
 thread groups, allocation-failure rollback, priority/FIFO ordering, callback
-non-reentrancy during nested traps, callback-pool exhaustion/reuse, timer payload cleanup, and
-masked UART polling in RV64 QEMU.
+non-reentrancy during nested traps, callback-pool exhaustion/reuse, timer
+payload cleanup, and masked UART polling in RV64 QEMU.
 The system runner boots the real QEMU kernel and its separately linked user
 images to test syscalls, faults, fork, same-process user threads, preemption,
 timers, and allocator demos. It also checks real QEMU UART/PLIC interrupts,
@@ -191,8 +191,8 @@ struct thread (kernel allocation)
 For a newly created user task, let `K` be its kernel-stack base. The stack is
 16 KiB, and the 280-byte context occupies a 288-byte slot to preserve 16-byte
 stack alignment. Kernel calls and deferred callbacks share this stack with
-nested hardware-interrupt contexts. Callbacks need bounded stack use; there is no MMU
-guard page.
+nested hardware-interrupt contexts. Callbacks need bounded stack use; there
+is no MMU guard page.
 
 ```text
 Higher addresses
@@ -227,34 +227,12 @@ Caller-saved registers do not need a second copy at this function-call boundary.
 A trap can interrupt code between arbitrary instructions. Its context needs
 slots for caller-saved registers as well, plus the return PC and privilege
 state. The CPU supplies trap information in CSRs; assembly creates the memory
-snapshot. `trap_return()` restores `sepc`, `sstatus`, and the integer-register
-slots before executing `sret`. `scause` and `stval` are diagnostic fields, not
-restored execution state.
-
-```text
-Task A running in U-mode
-        |
-        | trap: switch to A's kernel stack and create trap_context
-        v
-Kernel handling A's trap
-        |
-        +-- No task switch --> trap_return() --> sret --> A in U-mode
-        |
-        `-- schedule() --> switch_to(A, B)
-                              |
-                              | Save A's kernel thread_context
-                              | Restore B's kernel thread_context
-                              v
-                         B's kernel continuation
-
-Later, when A is scheduled again:
-restore A's thread_context --> resume its kernel path
-                          --> trap_return() --> sret --> A in U-mode
-```
+snapshot.
 
 A privilege transition is not necessarily a task switch. If A is suspended
 inside the trap handler, its trap context remains on A's kernel stack while
-`thread_context` records where its kernel execution should resume.
+`thread_context` records where its kernel execution should resume. The
+[trap return flow](#trap-return-and-task-switching) shows both paths.
 
 #### First user entry and register convention
 
@@ -263,7 +241,7 @@ It is shared by process launch, same-process thread creation, and fork:
 
 - `thread_context.ra = thread_bootstrap`; `thread_context.sp = kstack_top - 288`.
 - `tc->sp = user_stack_top`; `tc->tp = thread`; `tc->sepc = user_entry`.
-- `tc->sstatus = SSTATUS_SPIE`: `SPP = 0` selects U-mode and `SPIE = 1` enables interrupts on return.
+- `tc->sstatus = SSTATUS_SPIE`: initial `SPP = 0`, `SPIE = 1`.
 
 The caller finishes any operation-specific fields before
 `thread_publish_user()` makes the task runnable. A new user thread also gets
@@ -278,17 +256,9 @@ switch_to() -> thread_bootstrap() -> user_task_entry()
 ```
 
 In this kernel, `tp` points to the current `struct thread` in both U-mode and
-S-mode; user TLS is not implemented. While a task runs in U-mode, `sp` points
-into its user stack and `sscratch` holds its kernel-stack top. On a user-origin
-trap, `csrrw sp, sscratch, sp` switches stacks and retains the interrupted user
-`sp` for the snapshot. In S-mode, `sscratch` is zero; a supervisor-origin trap
-recovers the interrupted kernel `sp` after the swap. No general-purpose register
-is borrowed until its original value has been saved.
-
-The return path keeps interrupts masked while restoring state. It sets
-`sscratch` to the kernel-stack top only for a U-mode return, or zero for an
-S-mode return, before restoring `t1`. Deferred work finishes before a user-task
-reschedule so the timer interrupt source is rearmed before the next task runs.
+S-mode; user TLS is not implemented. Trap entry selects the stack and saves
+the interrupted `sp`; the [trap handling diagrams](#trap-handling) cover entry,
+deferred work, and return.
 
 ### Processes and Threads
 
@@ -500,46 +470,200 @@ rejection, and both group-exit paths. It also stops a group after its leader
 exits. The system runner repeats the launch and then loads another image to
 check that cleanup releases the loader's busy condition.
 
-### Interrupts and Deferred Work
+### Trap Handling
 
-The primary hart handles timer and UART interrupts. `trap_dispatch()` runs
-the top half, then `trap_entry.S` calls `irq_run_bottom_halves()` before the
-return path checks user exit and rescheduling. Deferred callbacks use the
-interrupted thread's kernel stack; no worker thread is created.
+The following paths run on the primary hart and cover traps routed to S-mode.
+Timer and UART interrupts are asynchronous events. Exceptions come from the
+instruction being executed, including deliberate user `ecall` instructions.
 
-The runner enables `sstatus.SIE` while executing a callback. A nested IRQ can
-run its top half and enqueue more work, but it resumes the paused callback
-without running another bottom half. Once that callback returns, the existing
-runner selects the highest-priority queued task. Priorities are 0 through 7,
-with 0 highest; equal priorities keep FIFO order. Priority chooses the next
-callback, not whether to preempt the current one. PLIC source priorities and
-these software task priorities are separate.
+#### Trap entry and dispatch
+
+[`trap_entry.S`](kernel/src/trap_entry.S) saves CPU state before calling
+[`trap_dispatch()`](kernel/src/trap.c). The dispatcher handles interrupts and
+exceptions; only returning handlers reach the deferred-work runner.
 
 ```text
-Low-priority callback (rank 5)
-    |
-    +-- Timer IRQ: save context, mask STIE, queue timer work (rank 1)
-    |       |
-    |       +-- Nested runner sees that a callback is already running
-    |       +-- Leave timer work queued
-    |       +-- Restore context and sret to the paused callback
-    |
-Low-priority callback resumes and returns
-    |
-Outer runner selects timer work (rank 1), then the next queued task by priority
+Code running in U-mode or S-mode
+                |
+         Trap routed to S-mode
+                |
+                v
+CPU records trap state
+  sepc, scause, stval
+  SPP  <- previous privilege
+  SPIE <- SIE
+  SIE  <- 0
+                |
+                v
+trap_entry                         [trap_entry.S]
+  U-origin: select kernel stack using sscratch
+  S-origin: keep current kernel stack
+  Save integer registers and trap CSRs
+  Set sscratch = 0 for kernel execution
+                |
+                | a0 = trap_context address
+                v
+trap_dispatch(tc)                  [trap.c]
+  |
+  +-- Interrupt
+  |     |
+  |     +-- Timer
+  |     |     Mask STIE and queue timer bottom half
+  |     |     Request rescheduling if needed for U-origin
+  |     |
+  |     +-- External
+  |     |     PLIC claim; for UART, handle device state
+  |     |     and queue RX/TX work; PLIC complete
+  |     |
+  |     `-- Other interrupt: report the unhandled cause
+  |
+  +-- U-mode ecall
+  |     Handle syscall, or the selected Lab diagnostic
+  |
+  +-- Other U-mode exception
+  |     Report fault and mark the user task exited
+  |
+  `-- Other S-mode exception
+        Report fatal kernel fault
+        STOP -- does not return
+
+Returning handlers
+        |
+        v
+irq_run_bottom_halves()            [irq_task.c]
+        |
+        v
+Check origin, task exit and rescheduling
+        |
+        v
+Restore a live context, or switch away
 ```
 
-`g_irq_task_running` prevents both explicit and trap-driven recursive runner
-calls. Persistent timer/UART tasks stay `RUNNING` while paused; another enqueue
-sets `rerun` instead of inserting the same object twice. Queue links and
-task-state transitions are changed with local interrupts disabled. This is a
-single-hart design, not SMP synchronization.
+`sstatus.SIE` controls ordinary S-mode interrupts while executing in S-mode; it
+does not mask synchronous exceptions. Individual sources have separate enables
+in `sie`, including STIE for timers and SEIE for external interrupts. In U-mode,
+SIE does not gate interrupts routed to S-mode; source enables still apply.
 
-This follows the same-CPU non-reentrancy rule of ordinary non-PREEMPT_RT Linux
-softirqs. P1 still uses its own callback queue; it has no Linux softirq bitmask,
-execution budget, or `ksoftirqd` worker. The Lab 4 extension requiring a newly
-queued high-priority bottom half to preempt the current callback is deliberately
-not provided by this policy.
+#### Nested interrupts and deferred work
+
+A deferred task is a queued callback. It runs on the interrupted thread's
+kernel stack, with hardware interrupts enabled outside protected sections.
+It does not get a worker thread or a separate stack.
+
+```text
+Outer runner: g_irq_task_running = 1
+    |
+    +-- Run callback A, rank 5
+    |     SIE = 1 outside protected critical sections
+    |     |
+    |     +-- Hardware IRQ B arrives
+    |     |      |
+    |     |      CPU enters S-mode trap: SIE = 0
+    |     |      Save A's interrupted context
+    |     |      |
+    |     |      Run B's top half
+    |     |      Queue B's bottom half, rank 1
+    |     |      |
+    |     |      Call irq_run_bottom_halves()
+    |     |      g_irq_task_running is already 1
+    |     |      Leave B queued and return
+    |     |      |
+    |     |      Restore A's context
+    |     |      sret resumes A in S-mode
+    |     |
+    |     +-- A continues
+    |     `-- A returns
+    |
+    +-- Update A's state with interrupts disabled
+    |     Complete A, or requeue it if more work remains
+    |
+    +-- Select the highest-priority queued task
+    |     B can now run
+    |
+    +-- Continue until the queue is empty
+    |
+    `-- g_irq_task_running = 0
+
+Priority: 0 is highest, 7 is lowest; equal ranks are FIFO.
+Priority selects the next callback; it does not preempt one.
+```
+
+[`irq_run_bottom_halves()`](kernel/src/irq_task.c) changes queue links and task
+states with local interrupts disabled. A persistent timer/UART task stays
+`RUNNING` while paused; another enqueue sets `rerun` instead of inserting the
+same object twice. Queue priority and PLIC source priority are separate.
+
+This follows the same-CPU non-reentrancy rule of non-PREEMPT_RT Linux softirqs.
+P1 has no softirq bitmask, execution budget, or `ksoftirqd` worker. The Lab 4
+extension for high-priority bottom-half preemption is not implemented by this
+policy. Local IRQ masking protects this single-hart design, not other harts.
+
+#### Trap return and task switching
+
+SPP means **Supervisor Previous Privilege**, bit 8 of `sstatus`. Its saved value
+records the trap's origin: 0 for U-mode, 1 for S-mode. `sret` uses SPP to select
+the return privilege. SPIE holds the previous supervisor interrupt-enable bit;
+`sret` copies it back to SIE.
+
+```text
+irq_run_bottom_halves() returns
+                |
+                v
+Check saved sstatus.SPP
+                |
+        +-------+------------------------------+
+        |                                      |
+        v                                      v
+SPP = 1: S-origin                     SPP = 0: U-origin
+        |                                      |
+Resume interrupted kernel work        Has the user task exited?
+        |                               |              |
+        |                              Yes             No
+        |                               |              |
+        |                        Switch away;      Consume reschedule
+        |                        never restore     request
+        |                        exited context        |
+        |                                      +-------+-------+
+        |                                      |               |
+        |                                  No switch        schedule()
+        |                                      |               |
+        |                                      |        If A switches to B:
+        |                                      |        save A.thread_context
+        |                                      |        restore B.thread_context
+        |                                      |               |
+        |                                      |        B's kernel continuation
+        |                                      |
+        +-------------------+------------------+
+                            |
+                            v
+                     trap_return(tc)
+                       Keep SIE = 0 while restoring
+                       Restore sepc and sstatus
+                       Prepare sscratch:
+                         Return to U: kernel stack top
+                         Return to S: zero
+                       Restore integer registers and sp
+                            |
+                            v
+                           sret
+                       PC   <- sepc
+                       Mode <- saved SPP
+                       SIE  <- SPIE
+
+
+When A is scheduled again:
+  Restore A's thread_context
+      -> Continue after A's schedule() call
+      -> trap_return(A's trap_context)
+      -> sret
+```
+
+`scause` and `stval` are diagnostic snapshots, not restored execution state.
+Deferred timer work rearms its source before a user-task switch. A new user
+task uses the same return routine with a context prepared by the kernel, as
+shown in [first user entry](#first-user-entry-and-register-convention).
+
+#### Deferred work API
 
 ```c
 int add_task(task_callback_t callback, void *arg, int priority);
@@ -559,12 +683,10 @@ not guarantee fairness under an endless stream of higher-priority work.
 
 #### Timer and UART split
 
-The timer top half masks STIE and queues the persistent timer task. Its bottom
-half updates scheduling deadlines, detaches expired events, invokes callbacks,
-and programs the next SBI deadline before re-enabling STIE. A single hardware
-timer serves the 20 Hz scheduler tick, one-shot events, and the optional
-two-second uptime demo. Conversion uses the DT `timebase-frequency`, not the
-CPU instruction clock.
+The timer bottom half updates scheduling deadlines, runs expired events, and
+programs the next SBI deadline before re-enabling STIE. One hardware timer
+serves the 20 Hz scheduler tick, one-shot events, and the optional two-second
+uptime demo. Conversion uses the DT `timebase-frequency`.
 
 Timer-list changes are protected while callbacks run outside the critical
 section. `add_timer()` borrows its argument. `add_timer_with_cleanup()` also
@@ -572,14 +694,12 @@ accepts a cleanup function: after successful registration, cleanup runs once
 after firing or when `timer_stop()` discards the event. Failed registration
 leaves the argument with the caller.
 
-The UART RX top half masks its source and copies up to 16 bytes from hardware
-into the RX ring before queuing the remaining work. The RX bottom half drains
-bounded batches and re-enables RX when finished. TX work drains the software
-ring and leaves TX interrupts disabled when there is nothing to send. Ring
-updates, IER read/modify/write, and stress-marker batches are protected against
-nested producers. IRQ-off/early-boot console paths retain polling fallbacks.
-QEMU now uses its real PLIC/UART IRQ route as well; the board still discovers
-its UART and PLIC addresses from the supplied DTB.
+UART RX copies up to 16 bytes into its ring in the top half. The bottom half
+drains bounded batches, requeues if needed, and re-enables RX when finished.
+TX drains the software ring and leaves TX interrupts disabled when idle. Ring
+updates, IER read/modify/write, and stress-marker batches use local IRQ masking.
+Early-boot and IRQ-off console paths retain polling fallbacks. QEMU exercises
+its PLIC/UART IRQ route; board addresses come from the supplied DTB.
 
 #### Lab commands
 
@@ -593,15 +713,9 @@ exec test
 exec prog
 ```
 
-`demo tasks` runs a bounded busy interval in a low-priority callback and checks
-the trace for a real timer top half. It does not wait for a deferred callback,
-yield, or call the runner from that callback. The timer bottom half and all
-newly queued callbacks must wait until the low-priority callback returns:
-
-```text
-low:start -> timer:top -> low:resume -> timer:bottom -> high -> equal -> lower
-[tasks] PASS
-```
+`demo tasks` checks that a real timer top half interrupts a running callback
+while the timer bottom half waits for that callback to return. It reports
+`[tasks] PASS` after checking execution order.
 
 `setTimeout` returns to the shell after registering an event. It copies the
 message out of the reusable shell input buffer and prints the submission and
