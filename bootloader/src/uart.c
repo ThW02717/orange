@@ -34,6 +34,7 @@ static inline void uart_reg_write(uintptr_t reg, uint32_t value)
  * Drain the RX FIFO: read-and-discard any stale bytes left
  * by a previous kernel session or cable noise.
  */
+#ifndef QEMU
 static void uart_flush_hardware_rx_fifo(void)
 {
     unsigned int limit = 256U;
@@ -42,6 +43,7 @@ static void uart_flush_hardware_rx_fifo(void)
         (void)uart_reg_read(UART_RBR_REG);
     }
 }
+#endif
 
 /*
  * uart_init: prepare the UART for polling-based communication.
@@ -135,10 +137,3 @@ void uart_send_dec(unsigned long value)
         uart_send(buf[i]);
     }
 }
-
-/* Compatibility wrappers */
-void uart_putc(char c) { uart_send(c); }
-void uart_puts(const char *s) { uart_send_string(s); }
-char uart_getc(void) { return uart_recv(); }
-void uart_hex(unsigned long value) { uart_send_hex(value); }
-void uart_dec(unsigned long value) { uart_send_dec(value); }

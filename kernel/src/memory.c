@@ -1,3 +1,11 @@
+/*
+ * Physical pages: memory_init() discovers RAM, reserves live ranges and builds
+ * buddy free lists. p_alloc()/p_free() split and merge power-of-two blocks.
+ * Byte-sized allocations and slab lists are in slab.c.
+ */
+#include "memory_internal.h"
+#include "user_layout.h"
+#include "irqflags.h"
 #include <stdint.h>
 #include "memory.h"
 #include "fdt.h"
@@ -5,12 +13,8 @@
 #include "trap.h"
 
 #define MEMORY_MAX_RESERVES 64
-/* Largest buddy block tracked by this allocator.
- * order 20 means 2^20 pages; with 4KB pages this covers a 4GB block.
- */
-#define MEMORY_BUDDY_MAX_ORDER 20
-
-/* frame_meta.state encoding.
+/*
+ * frame_meta.state encoding.
  * Free block head: non-negative order.
  * Free block body: FRAME_BUDDY.
  * Allocated block body: FRAME_USED.
@@ -19,12 +23,6 @@
 #define FRAME_BUDDY ((int16_t)-1)
 #define FRAME_USED  ((int16_t)-2)
 #define FRAME_ALLOC_BASE ((int16_t)-100)
-#define SLAB_MAGIC       0x534C4142U /* "SLAB" */
-#define KMALLOC_MAX_SLAB_SIZE (PAGE_SIZE / 2U)
-#define KMEM_CACHE_EMPTY_LIMIT 1U
-#define POISON_FREE_OBJECT 0xAAU
-#define POISON_RECLAIM_PAGE 0xCCU
-
 
 /* One page-aligned RAM range discovered from the devicetree. */
 struct mem_region_info {
@@ -39,110 +37,18 @@ struct reserve_range {
     uint64_t end;
 };
 
-/* Upper-layer owner tag stored in frame_meta.kind.
- *
- * This is separate from frame_meta.state: state belongs to the buddy allocator
- * and tracks free/allocated block order, while kind tells kfree() what the
- * allocated page is being used for at the kmalloc/slab layer.
- */
-enum page_kind {
-    /* No active kmalloc owner.
-     * This includes free buddy pages, reserved pages, and pages that are not
-     * currently managed as slab or large kmalloc allocations.
-     */
-    PAGE_KIND_NONE = 0,
-    /* Page belongs to a slab block.
-     * kfree(ptr) must find the slab_header and return ptr to that slab's
-     * object freelist instead of freeing the whole page block.
-     */
-    PAGE_KIND_SLAB,
-    /* Head page of a large kmalloc allocation.
-     * kfree(ptr) must validate that ptr is page-aligned and then return the
-     * buddy block through p_free().
-     */
-    PAGE_KIND_LARGE,
-};
-
-enum slab_state {
-    SLAB_EMPTY = 0,
-    SLAB_PARTIAL,
-    SLAB_FULL,
-};
-
 struct frame_meta {
-    /* Buddy-layer state for this physical page frame:
-     * >= 0 means a free block head and stores the order, FRAME_BUDDY marks
-     * a non-head page inside a free block, FRAME_USED marks a non-head page
-     * inside an allocation, and FRAME_ALLOC_BASE-order marks an allocated
-     * block head.
-     */
+    /* Block-head order or one of the state tags above. */
     int16_t state;
-    /* Links used only when this page is the head of a free buddy block.
-     * Multi-page slab allocations also reuse free_prev on all slab pages to
-     * remember the slab head index so kfree(ptr) can find the slab header.
-     */
+    /* Only free block heads use these links. */
     int32_t free_prev;
     int32_t free_next;
-    /* Upper-layer owner tag for allocated pages, used by kfree() to dispatch
+    /*
+     * Upper-layer owner tag for allocated pages, used by kfree() to dispatch
      * either back to slab object free or to the large-allocation page path.
      */
     enum page_kind kind;
 };
-
-/* Free-object node used inside one slab block.
- * This is not separate metadata: when an object is free, its first bytes are
- * temporarily overlaid with this struct and linked through slab_header.freelist.
- * Once kmalloc() returns the object, the same bytes become caller-owned data.
- */
-struct kmalloc_free_chunk {
-    struct kmalloc_free_chunk *next;
-};
-
-struct slab_header;
-/* Intrusive doubly linked-list node for slab_header objects.
- * kmem_cache uses this link to chain slab blocks in its partial/full/empty
- * lists. The link lives inside slab_header, so no extra list-node allocation is
- * needed while the allocator is managing its own metadata.
- */
-struct slab_link {
-    struct slab_header *prev;
-    struct slab_header *next;
-};
-
-/* One cache manages one kmalloc size class, such as 64, 128, or 2048 bytes.
- * It owns three lists of slab blocks:
- * - partial: at least one allocated object and at least one free object
- * - full: no free objects left
- * - empty: no allocated objects; kept for quick reuse up to empty_count limit
- */
-struct kmem_cache {
-    unsigned int class_idx; // Index in g_kmalloc_classes.
-    unsigned int obj_size;  // Requested class size visible to callers.
-    unsigned int obj_align; // Alignment used when laying objects out.
-    unsigned int obj_stride; // Actual distance between objects after alignment.
-    unsigned int empty_count; // Number of cached empty slab blocks.
-    struct slab_header *slabs_partial;
-    struct slab_header *slabs_full;
-    struct slab_header *slabs_empty;
-};
-
-/* Metadata stored at the beginning of each slab block.
- * Current size classes fit in one buddy page, including this header and object
- * alignment padding. The remaining bytes are split into fixed-size objects
- * owned by this slab's kmem_cache.
- */
-struct slab_header {
-    struct slab_link link; // Node in one kmem_cache slab list.
-    struct kmem_cache *cache; // Back-pointer to the owning size class.
-    void *freelist; // Head of free objects inside this slab block.
-    unsigned int inuse; // Number of currently allocated objects.
-    unsigned int capacity; // Maximum objects this slab block can hold.
-    unsigned int page_order; // Buddy order used for this slab block.
-    enum slab_state state; // Current list/state: partial, full, or empty.
-    unsigned int magic; // SLAB_MAGIC, used to catch bad frees/corruption.
-};
-
-
 
 /* Physical memory description and reserved ranges. */
 static struct mem_region_info g_regions[FDT_MAX_MEM_REGIONS];
@@ -168,61 +74,43 @@ static uint64_t g_direct_map_last_idx = 0;
 static int g_memory_ready = 0;
 static uint64_t g_page_alloc_count = 0;
 static uint64_t g_page_free_count = 0;
-static uint64_t g_object_alloc_count = 0;
-static uint64_t g_object_free_count = 0;
-static uint64_t g_slab_reclaim_count = 0;
 static int g_allocator_log_enabled = 0;
-
-/* One-page slab classes cover requests up to 2048 bytes. Larger requests go
- * straight to buddy, avoiding extra pages just to fit an in-block slab header.
- */
-static const uint16_t g_kmalloc_classes[] = {
-    16U, 32U, 64U, 128U, 256U, 512U, 1024U, 2048U
-};
-#define KMALLOC_CLASS_COUNT ((unsigned int)(sizeof(g_kmalloc_classes) / sizeof(g_kmalloc_classes[0])))
-static struct kmem_cache g_kmem_caches[KMALLOC_CLASS_COUNT];
 
 /* Linker-provided physical range occupied by the kernel image. */
 extern char _phys_start;
 extern char _phys_end;
 
-/* Validate a bootloader-provided initrd hint before trusting it as reserved
- * memory. The devicetree /chosen values are preferred when available.
- */
-static int initrd_hint_valid(uint64_t start, uint64_t end) {
-    if (start == 0 || end <= start) {
-        return 0;
-    }
-    if ((end - start) > (256UL * 1024UL * 1024UL)) {
-        return 0;
-    }
-    return 1;
-}
 /* Align down/up. Alignment values used here are powers of two. */
-static uint64_t align_down_u64(uint64_t v, uint64_t a) {
+static uint64_t align_down_u64(uint64_t v, uint64_t a)
+{
     return v & ~(a - 1U);
 }
 
-static uint64_t align_up_u64(uint64_t v, uint64_t a) {
+static uint64_t align_up_u64(uint64_t v, uint64_t a)
+{
     return (v + (a - 1U)) & ~(a - 1U);
 }
 
 /* Half-open range overlap check: [a_start, a_end) intersects [b_start, b_end). */
-static int ranges_overlap(uint64_t a_start, uint64_t a_end, uint64_t b_start, uint64_t b_end) {
+static int ranges_overlap(uint64_t a_start, uint64_t a_end, uint64_t b_start, uint64_t b_end)
+{
     return a_start < b_end && b_start < a_end;
 }
 
 /* UART logging helpers kept tiny so they work in the freestanding kernel. */
-static void log_prefix(void) {
+static void log_prefix(void)
+{
     uart_send_string("[Allocator] ");
 }
 
-static void log_hex_u64(uint64_t value) {
+static void log_hex_u64(uint64_t value)
+{
     uart_send_string("0x");
     uart_send_hex((unsigned long)value);
 }
 
-static void log_page_range(uint64_t start_idx, unsigned int order) {
+static void log_page_range(uint64_t start_idx, unsigned int order)
+{
     uint64_t end_idx = start_idx + (1ULL << order) - 1ULL;
 
     uart_send_string("[");
@@ -232,18 +120,9 @@ static void log_page_range(uint64_t start_idx, unsigned int order) {
     uart_send_string("]");
 }
 
-/* Count list nodes for shell/debug snapshots. Not used on the allocation fast path. */
-static unsigned int slab_list_count(struct slab_header *head) {
-    unsigned int n = 0;
-    while (head != 0) {
-        n++;
-        head = head->link.next;
-    }
-    return n;
-}
-
 /* Count free buddy blocks of one order for memstat output. */
-static unsigned int freelist_count_order(unsigned int order) {
+static unsigned int freelist_count_order(unsigned int order)
+{
     unsigned int n = 0;
     int32_t cur = g_free_lists[order];
 
@@ -255,7 +134,8 @@ static unsigned int freelist_count_order(unsigned int order) {
 }
 
 /* Sum every buddy free list as pages, not blocks. */
-static uint64_t total_free_pages_count(void) {
+static uint64_t total_free_pages_count(void)
+{
     unsigned int order;
     uint64_t total = 0;
 
@@ -265,431 +145,34 @@ static uint64_t total_free_pages_count(void) {
     return total;
 }
 
-/* Fill freed/reclaimed memory with a visible byte pattern for debugging. */
-static void poison_memory(void *ptr, uint64_t size, uint8_t value) {
-    uint8_t *p = (uint8_t *)ptr;
-    uint64_t i;
-
-    if (ptr == 0) {
-        return;
-    }
-    for (i = 0; i < size; i++) {
-        p[i] = value;
-    }
-}
-
-/* Print one slab invariant failure when allocator logging is enabled. */
-static void slab_log_invariant_error(unsigned int class_idx, const char *list_name,
-                                     struct slab_header *slab, const char *reason) {
-    if (!g_allocator_log_enabled) {
-        return;
-    }
-    log_prefix();
-    uart_send_string("[Invariant] class ");
-    uart_send_dec(class_idx);
-    uart_send_string(" ");
-    uart_send_string(list_name);
-    uart_send_string(" slab ");
-    log_hex_u64((uint64_t)(uintptr_t)slab);
-    uart_send_string(": ");
-    uart_send_string(reason);
-    uart_send_string("\n");
-}
-
-/* Validate that every slab in a cache list matches the list's promised state. */
-static int slab_check_list_invariants(unsigned int class_idx, const char *list_name,
-                                      struct slab_header *head, enum slab_state expected_state) {
-    int ok = 1;
-
-    while (head != 0) {
-        if (head->state != expected_state) {
-            slab_log_invariant_error(class_idx, list_name, head, "state mismatch");
-            ok = 0;
-        }
-        if (expected_state == SLAB_PARTIAL && head->freelist == 0) {
-            slab_log_invariant_error(class_idx, list_name, head, "partial slab has empty freelist");
-            ok = 0;
-        }
-        if (expected_state == SLAB_FULL && head->inuse != head->capacity) {
-            slab_log_invariant_error(class_idx, list_name, head, "full slab inuse != capacity");
-            ok = 0;
-        }
-        if (expected_state == SLAB_EMPTY && head->inuse != 0) {
-            slab_log_invariant_error(class_idx, list_name, head, "empty slab inuse != 0");
-            ok = 0;
-        }
-        head = head->link.next;
-    }
-    return ok;
-}
-/* Encode/decode the allocated block order into frame_meta.state.
+/*
+ * Encode/decode the allocated block order into frame_meta.state.
  * This lets p_free(ptr) recover the original buddy order from the head page.
  */
-static int16_t alloc_tag_from_order(unsigned int order) {
+static int16_t alloc_tag_from_order(unsigned int order)
+{
     return (int16_t)(FRAME_ALLOC_BASE - (int16_t)order);
 }
 
-static int is_alloc_head_tag(int16_t tag) {
+static int is_alloc_head_tag(int16_t tag)
+{
     return tag <= FRAME_ALLOC_BASE;
 }
 
-static unsigned int order_from_alloc_tag(int16_t tag) {
+static unsigned int order_from_alloc_tag(int16_t tag)
+{
     return (unsigned int)(FRAME_ALLOC_BASE - tag);
 }
 
 static int pa_to_index(uint64_t pa, uint64_t *idx_out, unsigned int *rid_out);
 
-/* kmem_cache slab-list helpers.
- * These manipulate whole slab blocks between the partial/full/empty lists.
- * The object freelist inside each slab is separate and uses slab_push_free().
- */
-static void cache_add_partial(struct kmem_cache *cache, struct slab_header *slab) {
-    if (cache == 0 || slab == 0) {
-        return;
-    }
-
-    slab->cache = cache;
-    slab->state = SLAB_PARTIAL;
-    slab->link.prev = 0;
-    slab->link.next = cache->slabs_partial;
-    if (cache->slabs_partial != 0) {
-        cache->slabs_partial->link.prev = slab;
-    }
-    cache->slabs_partial = slab;
-}
-static void cache_add_full(struct kmem_cache *cache, struct slab_header *slab) {
-    if (cache == 0 || slab == 0) {
-        return;
-    }
-
-    slab->cache = cache;
-    slab->state = SLAB_FULL;
-    slab->link.prev = 0;
-    slab->link.next = cache->slabs_full;
-    if (cache->slabs_full != 0) {
-        cache->slabs_full->link.prev = slab;
-    }
-    cache->slabs_full = slab;
-}
-
-static void cache_add_empty(struct kmem_cache *cache, struct slab_header *slab) {
-    if (cache == 0 || slab == 0) {
-        return;
-    }
-
-    slab->cache = cache;
-    slab->state = SLAB_EMPTY;
-    slab->link.prev = 0;
-    slab->link.next = cache->slabs_empty;
-    if (cache->slabs_empty != 0) {
-        cache->slabs_empty->link.prev = slab;
-    }
-    cache->slabs_empty = slab;
-    cache->empty_count++;
-}
-
-static void cache_remove_slab(struct slab_header *slab) {
-    struct kmem_cache *cache;
-
-    if (slab == 0 || slab->cache == 0) {
-        return;
-    }
-    cache = slab->cache;
-
-    if (slab->link.prev != 0) {
-        slab->link.prev->link.next = slab->link.next;
-    } else {
-        if (slab->state == SLAB_PARTIAL) {
-            cache->slabs_partial = slab->link.next;
-        } else if (slab->state == SLAB_FULL) {
-            cache->slabs_full = slab->link.next;
-        } else {
-            cache->slabs_empty = slab->link.next;
-        }
-    }
-
-    if (slab->link.next != 0) {
-        slab->link.next->link.prev = slab->link.prev;
-    }
-
-    if (slab->state == SLAB_EMPTY && cache->empty_count > 0) {
-        cache->empty_count--;
-    }
-
-    slab->link.prev = 0;
-    slab->link.next = 0;
-}
-
-static void cache_move_partial_to_full(struct kmem_cache *cache, struct slab_header *slab) {
-    if (cache == 0 || slab == 0) {
-        return;
-    }
-
-    cache_remove_slab(slab);
-    cache_add_full(cache, slab);
-}
-
-static void cache_move_full_to_partial(struct kmem_cache *cache, struct slab_header *slab) {
-    if (cache == 0 || slab == 0) {
-        return;
-    }
-
-    cache_remove_slab(slab);
-    cache_add_partial(cache, slab);
-}
-
-static void cache_move_empty_to_partial(struct kmem_cache *cache, struct slab_header *slab) {
-    if (cache == 0 || slab == 0) {
-        return;
-    }
-
-    cache_remove_slab(slab);
-    cache_add_partial(cache, slab);
-}
-
-/* Per-slab free-object stack.
- *
- * slab_header.freelist points to the first free object in this slab block.
- * Each free object overlays its first bytes with kmalloc_free_chunk, whose
- * next pointer links to the next free object. Allocated objects are not in
- * this list; their bytes belong entirely to the caller.
- *
- * These helpers implement LIFO push/pop at the freelist head:
- *   push: obj -> old_head
- *   pop:  remove and return old_head
- * Head-only operations keep object allocation/free O(1) and require only one
- * next pointer inside each free object.
- */
-static void slab_push_free(struct slab_header *slab, void *obj) {
-    struct kmalloc_free_chunk *chunk;
-
-    if (slab == 0 || obj == 0) {
-        return;
-    }
-
-    chunk = (struct kmalloc_free_chunk *)obj;
-    chunk->next = (struct kmalloc_free_chunk *)slab->freelist;
-    slab->freelist = obj;
-}
-
-/* Return one free object from this slab, or 0 if no object is available. */
-static void *slab_pop_free(struct slab_header *slab) {
-    struct kmalloc_free_chunk *chunk;
-
-    if (slab == 0 || slab->freelist == 0) {
-        return 0;
-    }
-
-    chunk = (struct kmalloc_free_chunk *)slab->freelist;
-    slab->freelist = chunk->next;
-    return (void *)chunk;
-}
-
-/* Linear debug check used by kfree() to catch double frees.
- * Example: if obj is already in slab->freelist, freeing it again would insert
- * the same object twice and corrupt the free-object stack.
- */
-static int slab_freelist_contains(struct slab_header *slab, void *obj) {
-    struct kmalloc_free_chunk *cur;
-
-    if (slab == 0 || obj == 0) {
-        return 0;
-    }
-
-    cur = (struct kmalloc_free_chunk *)slab->freelist;
-    while (cur != 0) {
-        if ((void *)cur == obj) {
-            return 1;
-        }
-        cur = cur->next;
-    }
-    return 0;
-}
-
-/* Map a requested kmalloc size to the smallest fitting cache class.
- * Example: 65 bytes maps to the 128-byte class; 2049 bytes returns -1 and
- * takes the large-allocation path.
- */
-static int size_to_class(unsigned long size) {
-    unsigned int i;
-
-    if (size == 0 || size > KMALLOC_MAX_SLAB_SIZE) {
-        return -1;
-    }
-
-    for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
-        if (size <= (unsigned long)g_kmalloc_classes[i]) {
-            return (int)i;
-        }
-    }
-    return -1;
-}
-
-/* Return the object size for a class index.
- * Example: class 3 is the 128-byte cache in g_kmalloc_classes.
- */
-static unsigned int class_to_size(unsigned int class_idx) {
-    if (class_idx >= KMALLOC_CLASS_COUNT) {
-        return 0;
-    }
-    return (unsigned int)g_kmalloc_classes[class_idx];
-}
-
-/* Round object size up to its alignment to get object-to-object spacing.
- * Current classes are already power-of-two and use align == size, so this is
- * mostly a layout checker/extension point. Example for a future odd class:
- * a 65-byte object with 128-byte alignment would get stride 128.
- */
-static unsigned int slab_calc_stride(unsigned int obj_size, unsigned int align) {
-    if (obj_size == 0) {
-        return 0;
-    }
-    if (align == 0) {
-        align = 1;
-    }
-    return (unsigned int)align_up_u64((uint64_t)obj_size, (uint64_t)align);
-}
-
-/* Buddy helper: return the smallest buddy order that can cover a page count.
- * Example: 3 pages needs order 2 because 2^2 = 4 pages.
- */
-static unsigned int order_for_pages(uint64_t pages) {
-    unsigned int order = 0;
-
-    if (pages == 0) {
-        return 0;
-    }
-    while ((1ULL << order) < pages) {
-        order++;
-    }
-    return order;
-}
-
-/* Slab helper: choose how many buddy pages one slab block needs for a cache.
- * All current classes fit in one page, including the header and alignment
- * padding. The largest class places one 2048-byte object at offset 2048.
- */
-static unsigned int slab_order_for_cache(struct kmem_cache *cache) {
-    uint64_t bytes;
-    uint64_t pages;
-
-    if (cache == 0 || cache->obj_stride == 0) {
-        return 0;
-    }
-
-    bytes = (uint64_t)sizeof(struct slab_header) + (uint64_t)cache->obj_stride;
-    pages = (bytes + PAGE_SIZE - 1ULL) / PAGE_SIZE;
-    return order_for_pages(pages);
-}
-
-/* Slab helper: convert a slab block's buddy order back into bytes.
- * Example: page_order 2 means 4 * PAGE_SIZE bytes.
- */
-static uint64_t slab_total_size(struct slab_header *slab) {
-    if (slab == 0) {
-        return PAGE_SIZE;
-    }
-    return PAGE_SIZE << slab->page_order;
-}
-
-/* Slab helper: return the first aligned object address inside a slab block.
- * Objects cannot start at the block base because slab_header lives there, so
- * this skips the header and any padding needed for cache->obj_align.
- * Example: base 0x1000, header ends at 0x1038, align 64 -> first object 0x1040.
- */
-static void *slab_object_start(void *page_base, struct kmem_cache *cache) {
-    uint64_t base;
-    uint64_t start;
-
-    if (page_base == 0 || cache == 0) {
-        return 0;
-    }
-
-    base = (uint64_t)(uintptr_t)page_base;
-    start = align_up_u64(base + sizeof(struct slab_header), (uint64_t)cache->obj_align);
-    return (void *)(uintptr_t)start;
-}
-
-/* Slab helper: compute how many objects fit in one slab block.
- * This subtracts the header/alignment area by starting at slab_object_start(),
- * then divides the remaining bytes by obj_stride. Example: a 4KB slab with
- * first object at offset 64 and 64B stride holds (4096 - 64) / 64 = 63 objects.
- */
-static unsigned int slab_calc_capacity(void *page_base, struct kmem_cache *cache) {
-    uint64_t base;
-    uint64_t start;
-    uint64_t usable;
-
-    if (page_base == 0 || cache == 0 || cache->obj_stride == 0) {
-        return 0;
-    }
-
-    base = (uint64_t)(uintptr_t)page_base;
-    start = (uint64_t)(uintptr_t)slab_object_start(page_base, cache);
-    if (start < base || start >= (base + slab_total_size((struct slab_header *)page_base))) {
-        return 0;
-    }
-
-    usable = (base + slab_total_size((struct slab_header *)page_base)) - start;
-    return (unsigned int)(usable / (uint64_t)cache->obj_stride);
-}
-
-/* Frame metadata helper: read the upper-layer owner tag for one page.
- * kfree() uses this to decide whether a page belongs to a slab block, a large
- * kmalloc allocation, or no active kmalloc owner.
- */
-static enum page_kind page_kind_get(uint64_t idx) {
-    if (idx >= g_total_pages || g_frame_array == 0) {
-        return PAGE_KIND_NONE;
-    }
-    return g_frame_array[idx].kind;
-}
-
-/* Frame metadata helper: set one page's upper-layer owner tag. */
-static void page_kind_set(uint64_t idx, enum page_kind kind) {
-    if (idx >= g_total_pages || g_frame_array == 0) {
-        return;
-    }
-    g_frame_array[idx].kind = kind;
-}
-
-/* Frame metadata helper: find the head page of a slab block.
- * For one-page slabs this is idx itself. For multi-page slabs, slab_mark_pages
- * stores the slab head index in each page's free_prev field.
- */
-static uint64_t slab_head_index(uint64_t idx) {
-    int32_t head;
-
-    if (idx >= g_total_pages || g_frame_array == 0) {
-        return idx;
-    }
-    head = g_frame_array[idx].free_prev;
-    if (head >= 0 && (uint64_t)head < g_total_pages) {
-        return (uint64_t)head;
-    }
-    return idx;
-}
-
-/* Frame metadata helper for slab ownership.
- * Mark every page in a slab block as PAGE_KIND_SLAB and remember the head page
- * index, or clear those fields when the slab block is reclaimed.
- */
-static void slab_mark_pages(uint64_t base_idx, unsigned int order, enum page_kind kind) {
-    uint64_t pages = 1ULL << order;
-    uint64_t i;
-
-    for (i = 0; i < pages && (base_idx + i) < g_total_pages; i++) {
-        g_frame_array[base_idx + i].kind = kind;
-        g_frame_array[base_idx + i].free_prev = (kind == PAGE_KIND_SLAB) ? (int32_t)base_idx : -1;
-        g_frame_array[base_idx + i].free_next = -1;
-    }
-}
-
-/* Reserve a physical address range so the buddy allocator will never hand it
+/*
+ * Reserve a physical address range so the buddy allocator will never hand it
  * out. The range is rounded to full pages because the allocator manages memory
  * at PAGE_SIZE granularity.
  */
-void memory_reserve(uint64_t start, uint64_t size) {
+void memory_reserve(uint64_t start, uint64_t size)
+{
     uint64_t end;
     uint64_t rs;
     uint64_t re;
@@ -741,7 +224,8 @@ void memory_reserve(uint64_t start, uint64_t size) {
     uart_send_string("\n");
 }
 /* Return whether a physical address falls inside any reserved range. */
-static int is_reserved_pa(uint64_t pa) {
+static int is_reserved_pa(uint64_t pa)
+{
     unsigned int i;
     for (i = 0; i < g_reserve_count; i++) {
         if (pa >= g_reserves[i].start && pa < g_reserves[i].end) {
@@ -751,7 +235,8 @@ static int is_reserved_pa(uint64_t pa) {
     return 0;
 }
 /* Prepare and validate the early allocation range before the buddy allocator starts. */
-static void startup_allocator_init(uint64_t base, uint64_t size) {
+static void startup_allocator_init(uint64_t base, uint64_t size)
+{
     uint64_t end = base + size;
     if (end < base) {
         end = (uint64_t)-1;
@@ -763,10 +248,12 @@ static void startup_allocator_init(uint64_t base, uint64_t size) {
     }
     g_startup_ready = (g_startup_end > g_startup_cur) ? 1 : 0;
 }
-/* Early bump allocator that skips reserved ranges and then reserves its result.
+/*
+ * Early bump allocator that skips reserved ranges and then reserves its result.
  * Used while building the buddy allocator itself, before p_alloc() is ready.
  */
-static void *startup_alloc(uint64_t size, uint64_t align) {
+static void *startup_alloc(uint64_t size, uint64_t align)
+{
     uint64_t p;
     uint64_t end;
     unsigned int i;
@@ -780,7 +267,9 @@ static void *startup_alloc(uint64_t size, uint64_t align) {
     if ((align & (align - 1U)) != 0U) {
         return 0;
     }
-    if (g_startup_cur > UINT64_MAX - (align - 1U)) { return 0; }
+    if (g_startup_cur > UINT64_MAX - (align - 1U)) {
+        return 0;
+    }
     p = align_up_u64(g_startup_cur, align);
     for (;;) {
         moved = 0;
@@ -790,7 +279,9 @@ static void *startup_alloc(uint64_t size, uint64_t align) {
         }
         for (i = 0; i < g_reserve_count; i++) {
             if (ranges_overlap(p, end, g_reserves[i].start, g_reserves[i].end)) {
-                if (g_reserves[i].end > UINT64_MAX - (align - 1U)) { return 0; }
+                if (g_reserves[i].end > UINT64_MAX - (align - 1U)) {
+                    return 0;
+                }
                 p = align_up_u64(g_reserves[i].end, align);
                 moved = 1;
                 break;
@@ -812,7 +303,8 @@ static void *startup_alloc(uint64_t size, uint64_t align) {
 }
 
 /* Locate the RAM region that owns a global page index. */
-static int find_region_by_index(uint64_t idx, unsigned int *rid_out) {
+static int find_region_by_index(uint64_t idx, unsigned int *rid_out)
+{
     unsigned int rid;
 
     if (g_regions_direct_map) {
@@ -838,7 +330,8 @@ static int find_region_by_index(uint64_t idx, unsigned int *rid_out) {
     return -1;
 }
 /* Convert a global page index into its physical address. */
-static int index_to_pa(uint64_t idx, uint64_t *pa_out) {
+static int index_to_pa(uint64_t idx, uint64_t *pa_out)
+{
     unsigned int rid;
 
     if (pa_out == 0) {
@@ -860,7 +353,8 @@ static int index_to_pa(uint64_t idx, uint64_t *pa_out) {
     return 0;
 }
 /* Convert a page-aligned physical address back into a global page index. */
-static int pa_to_index(uint64_t pa, uint64_t *idx_out, unsigned int *rid_out) {
+static int pa_to_index(uint64_t pa, uint64_t *idx_out, unsigned int *rid_out)
+{
     unsigned int rid;
 
     if (idx_out == 0) {
@@ -900,11 +394,13 @@ static int pa_to_index(uint64_t pa, uint64_t *idx_out, unsigned int *rid_out) {
 }
 /* Buddy frame metadata and free-list operations. */
 
-/* Buddy frame-state helper: mark a block as free.
+/*
+ * Buddy frame-state helper: mark a block as free.
  * The head page stores the order; following pages are marked FRAME_BUDDY so
  * they are known to belong to the same free block but are not list heads.
  */
-static void block_mark_free(uint64_t idx, unsigned int order) {
+static void block_mark_free(uint64_t idx, unsigned int order)
+{
     uint64_t pages = 1ULL << order;
     uint64_t i;
     g_frame_array[idx].state = (int16_t)order;
@@ -913,10 +409,12 @@ static void block_mark_free(uint64_t idx, unsigned int order) {
     }
 }
 
-/* Buddy frame-state helper: mark a block as allocated.
+/*
+ * Buddy frame-state helper: mark a block as allocated.
  * The head page stores an allocated-order tag; following pages are FRAME_USED.
  */
-static void block_mark_alloc(uint64_t idx, unsigned int order) {
+static void block_mark_alloc(uint64_t idx, unsigned int order)
+{
     uint64_t pages = 1ULL << order;
     uint64_t i;
     g_frame_array[idx].state = alloc_tag_from_order(order);
@@ -924,17 +422,9 @@ static void block_mark_alloc(uint64_t idx, unsigned int order) {
         g_frame_array[idx + i].state = FRAME_USED;
     }
 }
-/* Buddy free-list helper: insert a free block head into g_free_lists[order].
- *
- * Unlike the slab object freelist, this list is doubly linked through
- * frame_meta.free_prev/free_next. Buddy free needs to remove a known buddy
- * block from the middle of an order list during merging, so paying one extra
- * index for prev gives O(1) unlink.
- *
- * Only free block heads are list nodes. The non-head pages inside the same
- * block are marked FRAME_BUDDY and never appear in g_free_lists.
- */
-static void freelist_push(unsigned int order, uint64_t idx) {
+/* Link free block heads by index. prev allows O(1) unlink during buddy merging. */
+static void freelist_push(unsigned int order, uint64_t idx)
+{
     int32_t i32 = (int32_t)idx;
     int32_t old_head = g_free_lists[order];
 
@@ -958,7 +448,8 @@ static void freelist_push(unsigned int order, uint64_t idx) {
 }
 
 /* Pop the first free block head from g_free_lists[order]. */
-static int32_t freelist_pop(unsigned int order) {
+static int32_t freelist_pop(unsigned int order)
+{
     int32_t head = g_free_lists[order];
     if (head >= 0) {
         int32_t next = g_frame_array[(uint64_t)head].free_next;
@@ -984,11 +475,13 @@ static int32_t freelist_pop(unsigned int order) {
     return head;
 }
 
-/* Remove a known free block head from g_free_lists[order] in O(1).
+/*
+ * Remove a known free block head from g_free_lists[order] in O(1).
  * This is what buddy merging needs after it discovers that the adjacent buddy
  * block is also free. A singly linked list would need a scan to find prev.
  */
-static int freelist_remove(unsigned int order, uint64_t idx) {
+static int freelist_remove(unsigned int order, uint64_t idx)
+{
     int32_t prev;
     int32_t next;
 
@@ -1027,12 +520,14 @@ static int freelist_remove(unsigned int order, uint64_t idx) {
     }
     return 0;
 }
-/* Compute the adjacent buddy block for idx at the same order.
+/*
+ * Compute the adjacent buddy block for idx at the same order.
  * The XOR flips the bit representing this block size in the region-local page
  * index. Example: order 3 means 8-page blocks; local index 0 buddies with 8,
  * and local index 8 buddies with 0. The lookup stays inside one RAM region.
  */
-static int buddy_index(uint64_t idx, unsigned int order, uint64_t *out) {
+static int buddy_index(uint64_t idx, unsigned int order, uint64_t *out)
+{
     unsigned int rid;
     uint64_t local_idx;
     uint64_t buddy_local;
@@ -1062,19 +557,22 @@ static int buddy_index(uint64_t idx, unsigned int order, uint64_t *out) {
     return 0;
 }
 /* Return floor(log2(v)). Used to choose the largest block size for a run. */
-static unsigned int floor_log2_u64(uint64_t v) {
+static unsigned int floor_log2_u64(uint64_t v)
+{
     unsigned int n = 0;
     while ((1ULL << (n + 1U)) <= v) {
         n++;
     }
     return n;
 }
-/* Split one contiguous free run into aligned buddy blocks.
+/*
+ * Split one contiguous free run into aligned buddy blocks.
  * Buddy blocks must be aligned to their own size, so the function repeatedly
  * chooses the largest order that both fits in run_pages and starts at a valid
  * 2^order boundary.
  */
-static void add_free_run(unsigned int rid, uint64_t run_start_page, uint64_t run_pages) {
+static void add_free_run(unsigned int rid, uint64_t run_start_page, uint64_t run_pages)
+{
     while (run_pages > 0) {
         unsigned int order = floor_log2_u64(run_pages);
         uint64_t idx;
@@ -1082,7 +580,8 @@ static void add_free_run(unsigned int rid, uint64_t run_start_page, uint64_t run
         if (order > MEMORY_BUDDY_MAX_ORDER) {
             order = MEMORY_BUDDY_MAX_ORDER;
         }
-        /* If run_start_page is not aligned for this order, reduce the order
+        /*
+         * If run_start_page is not aligned for this order, reduce the order
          * until the block can be represented as a valid buddy block.
          */
         while (order > 0 && (run_start_page & ((1ULL << order) - 1ULL)) != 0ULL) {
@@ -1099,7 +598,8 @@ static void add_free_run(unsigned int rid, uint64_t run_start_page, uint64_t run
 }
 
 /* Allocate and initialize allocator metadata using the early bump allocator. */
-static int buddy_setup_metadata(void) {
+static int buddy_setup_metadata(void)
+{
     uint64_t frame_array_bytes = g_total_pages * sizeof(struct frame_meta);
     uint64_t i;
 
@@ -1120,7 +620,8 @@ static int buddy_setup_metadata(void) {
     return 0;
 }
 /* Build the initial buddy free lists from devicetree RAM minus reservations. */
-static void buddy_build_initial_state(void) {
+static void buddy_build_initial_state(void)
+{
     unsigned int rid;
     for (rid = 0; rid < g_region_count; rid++) {
         uint64_t p;
@@ -1150,7 +651,8 @@ static void buddy_build_initial_state(void) {
     }
 }
 
-static void *p_alloc_locked(unsigned int pages) {
+static void *p_alloc_locked(unsigned int pages)
+{
     unsigned int need_order = 0;
     unsigned int cur_order;
     int32_t idx32;
@@ -1180,7 +682,8 @@ static void *p_alloc_locked(unsigned int pages) {
         return 0;
     }
     idx = (uint64_t)idx32;
-    /* Split larger blocks. The left half continues toward the allocation;
+    /*
+     * Split larger blocks. The left half continues toward the allocation;
      * each right half becomes a free buddy block at the lower order.
      */
     while (cur_order > need_order) {
@@ -1238,7 +741,8 @@ static void *p_alloc_locked(unsigned int pages) {
     return (void *)(uintptr_t)pa;
 }
 
-static void p_free_locked(void *ptr) {
+static void p_free_locked(void *ptr)
+{
     uint64_t pa;
     uint64_t idx;
     int16_t tag;
@@ -1314,471 +818,33 @@ static void p_free_locked(void *ptr) {
     g_page_free_count++;
 }
 
-/* Add one new slab block to a kmalloc cache.
- * The buddy allocator provides pages; the slab layer builds a header and an
- * object freelist inside those pages.
- */
-static int kmalloc_refill_class(unsigned int class_idx) {
-    void *page;
-    struct kmem_cache *cache;
-    struct slab_header *slab;
-    void *obj_start;
-    uint64_t base;
-    uint64_t page_idx;
-    uint64_t chunks;
-    uint64_t i;
-    uint64_t chunk_size;
-    unsigned int page_order;
-
-    if (class_idx >= KMALLOC_CLASS_COUNT) {
-        return -1;
-    }
-    cache = &g_kmem_caches[class_idx];
-    page_order = slab_order_for_cache(cache);
-
-    page = p_alloc(1U << page_order);
-    if (page == 0) {
-        return -1;
-    }
-    /* Initialize the slab header. Buddy ownership/order stays in g_frame_array;
-     * page_kind marks these pages so kfree() takes the slab path.
-     */
-    base = (uint64_t)(uintptr_t)page;
-    if (pa_to_index(base, &page_idx, 0) != 0) {
-        p_free(page);
-        return -1;
-    }
-    slab_mark_pages(page_idx, page_order, PAGE_KIND_SLAB);
-    slab = (struct slab_header *)page;
-    slab->link.prev = 0;
-    slab->link.next = 0;
-    slab->magic = SLAB_MAGIC;
-    slab->cache = cache;
-    slab->freelist = 0;
-    slab->inuse = 0;
-    slab->page_order = page_order;
-    slab->capacity = slab_calc_capacity(page, cache);
-    slab->state = SLAB_PARTIAL;
-
-    obj_start = slab_object_start(page, cache);
-    chunk_size = (uint64_t)cache->obj_stride;
-    chunks = slab->capacity;
-    if (chunks == 0) {
-        slab_mark_pages(page_idx, page_order, PAGE_KIND_NONE);
-        p_free(page);
-        return -1;
-    }
-    /* Carve the slab payload into fixed-size objects and push each free object
-     * onto the slab's LIFO object freelist.
-     */
-    for (i = 0; i < chunks; i++) {
-        uint64_t caddr = (uint64_t)(uintptr_t)obj_start + i * chunk_size;
-        void *obj = (void *)(uintptr_t)caddr;
-        slab_push_free(slab, obj);
-    }
-    cache_add_partial(cache, slab);
-    return 0;
-}
-
-static void *kmalloc_locked(unsigned long size) {
-    if (!g_memory_ready || size == 0UL) {
-        return 0;
-    }
-
-    /* Requests up to 2048 bytes use the one-page slab caches.
-     * Example: kmalloc(64) returns one object from the 64-byte cache.
-     */
-    if (size <= KMALLOC_MAX_SLAB_SIZE) {
-        int cls = size_to_class(size);
-        struct kmem_cache *cache;
-        struct slab_header *slab;
-        void *obj;
-
-        if (cls < 0) {
-            return 0;
-        }
-
-        cache = &g_kmem_caches[(unsigned int)cls];
-        if (cache->slabs_partial == 0) {
-            if (cache->slabs_empty != 0) {
-                cache_move_empty_to_partial(cache, cache->slabs_empty);
-            } else if (kmalloc_refill_class((unsigned int)cls) != 0) {
-                return 0;
-            }
-        }
-        /* A partial slab should exist after reusing an empty slab or refilling. */
-        if (cache->slabs_partial == 0) {
-            log_prefix();
-            uart_send_string("[Error] kmalloc no partial slab after refill/reuse for class ");
-            uart_send_dec((unsigned long)cls);
-            uart_send_string("\n");
-            return 0;
-        }
-        /* Partial list entries must have free objects and valid counts. */
-        slab = cache->slabs_partial;
-        if (slab->state != SLAB_PARTIAL || slab->freelist == 0 ||
-            slab->inuse >= slab->capacity) {
-            log_prefix();
-            uart_send_string("[Error] kmalloc partial slab invariant broken for class ");
-            uart_send_dec((unsigned long)cls);
-            uart_send_string("\n");
-            return 0;
-        }
-        /* Pop one free object from the chosen slab's object freelist. */
-        obj = slab_pop_free(slab);
-        if (obj == 0) {
-            log_prefix();
-            uart_send_string("[Error] kmalloc slab_pop_free failed for class ");
-            uart_send_dec((unsigned long)cls);
-            uart_send_string(", page ");
-            log_hex_u64((uint64_t)(uintptr_t)slab);
-            uart_send_string("\n");
-            return 0;
-        }
-        slab->inuse++;
-        if (slab->inuse == slab->capacity) {
-            cache_move_partial_to_full(cache, slab);
-        }
-
-        if (g_allocator_log_enabled) {
-            log_prefix();
-            uart_send_string("[Object] Allocate ");
-            log_hex_u64((uint64_t)(uintptr_t)obj);
-            uart_send_string(" at object size ");
-            uart_send_dec(cache->obj_size);
-            uart_send_string(" (class ");
-            uart_send_dec((unsigned long)cls);
-            uart_send_string(", inuse ");
-            uart_send_dec(slab->inuse);
-            uart_send_string("/");
-            uart_send_dec(slab->capacity);
-            uart_send_string(")");
-            uart_send_string("\n");
-        }
-        g_object_alloc_count++;
-        return obj;
-    } else {
-        /* Large allocations bypass slab and reserve whole buddy pages.
-         * Example: kmalloc(9000) rounds up to 3 pages, then p_alloc() returns an
-         * order-2 block because buddy sizes are powers of two.
-         */
-        void *base;
-        uint64_t base_idx;
-        unsigned long pages;
-
-        /* Bound the request before rounding or narrowing to unsigned int. */
-        if (size > (PAGE_SIZE << MEMORY_BUDDY_MAX_ORDER)) {
-            return 0;
-        }
-        pages = (size + PAGE_SIZE - 1UL) / PAGE_SIZE;
-
-        base = p_alloc((unsigned int)pages);
-        if (base == 0) {
-            return 0;
-        }
-        if (pa_to_index((uint64_t)(uintptr_t)base, &base_idx, 0) != 0) {
-            p_free(base);
-            return 0;
-        }
-        page_kind_set(base_idx, PAGE_KIND_LARGE);
-        return base;
-    }
-}
-
-static void kfree_locked(void *ptr) {
-    uint64_t page_base;
-    uint64_t page_idx;
-    uint64_t ptr_addr;
-    enum page_kind kind;
-
-    if (!g_memory_ready || ptr == 0) {
-        return;
-    }
-    ptr_addr = (uint64_t)(uintptr_t)ptr;
-    page_base = align_down_u64((uint64_t)(uintptr_t)ptr, PAGE_SIZE);
-    if (pa_to_index(page_base, &page_idx, 0) != 0) {
-        log_prefix();
-        uart_send_string("[Error] kfree invalid page base for ptr ");
-        log_hex_u64(ptr_addr);
-        uart_send_string("\n");
-        return;
-    }
-    kind = page_kind_get(page_idx);
-
-    /* page_kind is the handoff point between kmalloc and the lower buddy
-     * allocator: slab objects go back to a slab freelist, while large
-     * allocations return whole pages through p_free().
-     */
-    if (kind == PAGE_KIND_NONE) {
-        log_prefix();
-        uart_send_string("[Error] kfree page kind NONE for ptr ");
-        log_hex_u64(ptr_addr);
-        uart_send_string(", page ");
-        log_hex_u64(page_base);
-        uart_send_string("\n");
-        return;
-    }
-
-    if (kind == PAGE_KIND_SLAB) {
-        uint64_t slab_idx = slab_head_index(page_idx);
-        uint64_t slab_base = page_base;
-        struct slab_header *slab;
-        struct kmem_cache *cache;
-        uint64_t obj_start;
-        uint64_t obj_end;
-        uint64_t offset;
-
-        if (index_to_pa(slab_idx, &slab_base) != 0) {
-            log_prefix();
-            uart_send_string("[Error] kfree slab head lookup failed for ptr ");
-            log_hex_u64(ptr_addr);
-            uart_send_string("\n");
-            return;
-        }
-        slab = (struct slab_header *)(uintptr_t)slab_base;
-
-        if (slab->magic != SLAB_MAGIC) {
-            log_prefix();
-            uart_send_string("[Error] kfree slab magic mismatch at page ");
-            log_hex_u64(slab_base);
-            uart_send_string(" for ptr ");
-            log_hex_u64(ptr_addr);
-            uart_send_string("\n");
-            return;
-        }
-        cache = slab->cache;
-        if (cache == 0 || cache->obj_stride == 0) {
-            log_prefix();
-            uart_send_string("[Error] kfree slab cache metadata invalid at page ");
-            log_hex_u64(slab_base);
-            uart_send_string("\n");
-            return;
-        }
-
-        obj_start = (uint64_t)(uintptr_t)slab_object_start((void *)(uintptr_t)slab_base, cache);
-        obj_end = obj_start + (uint64_t)cache->obj_stride * (uint64_t)slab->capacity;
-        if (ptr_addr < obj_start || ptr_addr >= obj_end) {
-            log_prefix();
-            uart_send_string("[Error] kfree slab ptr out of object range: ptr ");
-            log_hex_u64(ptr_addr);
-            uart_send_string(", range [");
-            log_hex_u64(obj_start);
-            uart_send_string(", ");
-            log_hex_u64(obj_end);
-            uart_send_string(")\n");
-            return;
-        }
-
-        offset = ptr_addr - obj_start;
-        if ((offset % (uint64_t)cache->obj_stride) != 0) {
-            log_prefix();
-            uart_send_string("[Error] kfree slab ptr misaligned to object stride: ptr ");
-            log_hex_u64(ptr_addr);
-            uart_send_string(", stride ");
-            uart_send_dec(cache->obj_stride);
-            uart_send_string("\n");
-            return;
-        }
-        if (slab->inuse == 0) {
-            log_prefix();
-            uart_send_string("[Error] kfree slab underflow attempt at ptr ");
-            log_hex_u64(ptr_addr);
-            uart_send_string("\n");
-            return;
-        }
-        /* Double-free defense: a valid allocated object must not already be on
-         * the slab's free-object list.
-         */
-        if (slab_freelist_contains(slab, ptr)) {
-            log_prefix();
-            uart_send_string("[Object] Double free detected at ");
-            log_hex_u64(ptr_addr);
-            uart_send_string("\n");
-            return;
-        }
-
-        /* Return the object to its slab, then move the slab between cache
-         * lists if it changed state.
-         */
-        poison_memory(ptr, cache->obj_size, POISON_FREE_OBJECT);
-        slab_push_free(slab, ptr);
-        slab->inuse--;
-        g_object_free_count++;
-        if (slab->state == SLAB_FULL) {
-            cache_move_full_to_partial(cache, slab);
-        }
-        if (slab->inuse == 0) {
-            cache_remove_slab(slab);
-            if (cache->empty_count < KMEM_CACHE_EMPTY_LIMIT) {
-                cache_add_empty(cache, slab);
-
-                if (g_allocator_log_enabled) {
-                    log_prefix();
-                    uart_send_string("[Object] Free ");
-                    log_hex_u64(ptr_addr);
-                    uart_send_string(" at object size ");
-                    uart_send_dec(cache->obj_size);
-                    uart_send_string(". [Slab] Keep empty page ");
-                    log_hex_u64(slab_base);
-                    uart_send_string("\n");
-                }
-            } else {
-                /* Keep at most one empty slab per cache. Extra empty slabs are
-                 * returned to the buddy allocator to reduce memory hoarding.
-                 */
-                slab_mark_pages(slab_idx, slab->page_order, PAGE_KIND_NONE);
-                slab->magic = 0;
-                slab->cache = 0;
-                slab->freelist = 0;
-                poison_memory((void *)(uintptr_t)slab_base, slab_total_size(slab), POISON_RECLAIM_PAGE);
-
-                if (g_allocator_log_enabled) {
-                    log_prefix();
-                    uart_send_string("[Object] Free ");
-                    log_hex_u64(ptr_addr);
-                    uart_send_string(" at object size ");
-                    uart_send_dec(cache->obj_size);
-                    uart_send_string(". [Slab] Reclaim page ");
-                    log_hex_u64(slab_base);
-                    uart_send_string("\n");
-                }
-                g_slab_reclaim_count++;
-                p_free((void *)(uintptr_t)slab_base);
-            }
-            return;
-        }
-        slab->state = SLAB_PARTIAL;
-        if (g_allocator_log_enabled) {
-            log_prefix();
-            uart_send_string("[Object] Free ");
-            log_hex_u64(ptr_addr);
-            uart_send_string(" at object size ");
-            uart_send_dec(cache->obj_size);
-            uart_send_string("\n");
-        }
-        return;
-    }
-
-    if (kind == PAGE_KIND_LARGE) {
-        int16_t tag = g_frame_array[page_idx].state;
-        /* Large kmalloc pointers must be the page-aligned allocation head;
-         * freeing an interior page would lose the original buddy order.
-         */
-        if ((ptr_addr & (PAGE_SIZE - 1U)) != 0U) {
-            log_prefix();
-            uart_send_string("[Error] kfree large ptr not page-aligned: ");
-            log_hex_u64(ptr_addr);
-            uart_send_string("\n");
-            return;
-        }
-        if (!is_alloc_head_tag(tag)) {
-            log_prefix();
-            uart_send_string("[Error] kfree large ptr is not allocation head: ptr ");
-            log_hex_u64(ptr_addr);
-            uart_send_string(", page ");
-            uart_send_dec((unsigned long)page_idx);
-            uart_send_string("\n");
-            return;
-        }
-        page_kind_set(page_idx, PAGE_KIND_NONE);
-
-        if (g_allocator_log_enabled) {
-            log_prefix();
-            uart_send_string("[Page] Free ");
-            log_hex_u64(ptr_addr);
-            uart_send_string("\n");
-        }
-        p_free((void *)(uintptr_t)page_base);
-        return;
-    }
-
-    log_prefix();
-    uart_send_string("[Error] kfree unknown page kind for ptr ");
-    log_hex_u64(ptr_addr);
-    uart_send_string("\n");
-}
-
-/* Deferred callbacks also allocate/free memory. On this single active hart,
- * IRQ masking prevents reentrant mutation of buddy and slab metadata. Nested
- * allocator calls restore the already-masked state rather than enabling IRQs.
- */
-static uint64_t memory_irq_save(void) {
-    uint64_t status;
-    asm volatile("csrrc %0, sstatus, %1" : "=r"(status) : "r"(SSTATUS_SIE) : "memory");
-    return status;
-}
-
-static void memory_irq_restore(uint64_t status) {
-    asm volatile("csrw sstatus, %0" : : "r"(status) : "memory");
-}
-
-void *p_alloc(unsigned int pages) {
-    uint64_t status = memory_irq_save();
+void *p_alloc(unsigned int pages)
+{
+    uint64_t status = local_irq_save();
     void *ptr = p_alloc_locked(pages);
-    memory_irq_restore(status);
+    local_irq_restore(status);
     return ptr;
 }
 
-void p_free(void *ptr) {
-    uint64_t status = memory_irq_save();
+void p_free(void *ptr)
+{
+    uint64_t status = local_irq_save();
     p_free_locked(ptr);
-    memory_irq_restore(status);
-}
-
-void *kmalloc(unsigned long size) {
-    uint64_t status = memory_irq_save();
-    void *ptr = kmalloc_locked(size);
-    memory_irq_restore(status);
-    return ptr;
-}
-
-void kfree(void *ptr) {
-    uint64_t status = memory_irq_save();
-    kfree_locked(ptr);
-    memory_irq_restore(status);
-}
-
-/* Shell/debug dump of slab cache list sizes. */
-void memory_print_slabinfo(void) {
-    unsigned int i;
-    struct memory_slab_class_snapshot snapshot[KMALLOC_CLASS_COUNT];
-    uint64_t status = memory_irq_save();
-
-    /* Copy list counts while stable; do not hold IRQs off during UART output. */
-    for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
-        (void)memory_get_slab_class_snapshot(i, &snapshot[i]);
-    }
-    memory_irq_restore(status);
-
-    uart_send_string("Slab caches:\n");
-    uart_send_string("class size stride partial full empty\n");
-    for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
-        uart_send_dec(i);
-        uart_send_string(" ");
-        uart_send_dec(snapshot[i].obj_size);
-        uart_send_string(" ");
-        uart_send_dec(snapshot[i].obj_stride);
-        uart_send_string(" ");
-        uart_send_dec(snapshot[i].partial_count);
-        uart_send_string(" ");
-        uart_send_dec(snapshot[i].full_count);
-        uart_send_string(" ");
-        uart_send_dec(snapshot[i].empty_count);
-        uart_send_string("\n");
-    }
+    local_irq_restore(status);
 }
 
 /* Shell/debug dump of buddy free lists by order. */
-void memory_print_buddyinfo(void) {
+void memory_print_buddyinfo(void)
+{
     unsigned int order;
     uint64_t total_free_pages = 0;
     unsigned int block_counts[MEMORY_BUDDY_MAX_ORDER + 1U];
-    uint64_t status = memory_irq_save();
+    uint64_t status = local_irq_save();
 
     for (order = 0; order <= MEMORY_BUDDY_MAX_ORDER; order++) {
         block_counts[order] = freelist_count_order(order);
     }
-    memory_irq_restore(status);
+    local_irq_restore(status);
 
     uart_send_string("Buddy free lists:\n");
     uart_send_string("order blocks pages\n");
@@ -1802,72 +868,21 @@ void memory_print_buddyinfo(void) {
     uart_send_string("\n");
 }
 
-/* Runtime invariant check for all slab cache lists. */
-int memory_check_slabs_ok(void) {
-    unsigned int i;
-    int ok = 1;
-    uint64_t status = memory_irq_save();
-
-    for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
-        if (!slab_check_list_invariants(i, "partial", g_kmem_caches[i].slabs_partial, SLAB_PARTIAL)) {
-            ok = 0;
-        }
-        if (!slab_check_list_invariants(i, "full", g_kmem_caches[i].slabs_full, SLAB_FULL)) {
-            ok = 0;
-        }
-        if (!slab_check_list_invariants(i, "empty", g_kmem_caches[i].slabs_empty, SLAB_EMPTY)) {
-            ok = 0;
-        }
-    }
-
-    memory_irq_restore(status);
-    return ok;
-}
-
 /* Copy allocator counters into a test-friendly snapshot struct. */
-void memory_get_stats(struct memory_stats_snapshot *out) {
+void memory_get_stats(struct memory_stats_snapshot *out)
+{
     uint64_t status;
     if (out == 0) {
         return;
     }
-    status = memory_irq_save();
+    status = local_irq_save();
 
     out->page_allocs = g_page_alloc_count;
     out->page_frees = g_page_free_count;
-    out->object_allocs = g_object_alloc_count;
-    out->object_frees = g_object_free_count;
-    out->slab_reclaims = g_slab_reclaim_count;
     out->total_pages = g_total_pages;
     out->free_pages = total_free_pages_count();
-    out->empty_slab_limit = KMEM_CACHE_EMPTY_LIMIT;
-    memory_irq_restore(status);
-}
-
-/* Copy one kmalloc cache's state into a test-friendly snapshot struct. */
-int memory_get_slab_class_snapshot(unsigned int class_idx, struct memory_slab_class_snapshot *out) {
-    struct kmem_cache *cache;
-    uint64_t status;
-
-    if (out == 0 || class_idx >= KMALLOC_CLASS_COUNT) {
-        return -1;
-    }
-    status = memory_irq_save();
-
-    cache = &g_kmem_caches[class_idx];
-    out->class_idx = class_idx;
-    out->obj_size = cache->obj_size;
-    out->obj_stride = cache->obj_stride;
-    out->partial_count = slab_list_count(cache->slabs_partial);
-    out->full_count = slab_list_count(cache->slabs_full);
-    out->empty_count = slab_list_count(cache->slabs_empty);
-    out->cached_empty_count = cache->empty_count;
-    memory_irq_restore(status);
-    return 0;
-}
-
-/* Expose size-to-class mapping for allocator tests and shell diagnostics. */
-int memory_class_for_size(unsigned long size) {
-    return size_to_class(size);
+    slab_get_stats(out);
+    local_irq_restore(status);
 }
 
 /* Enable verbose allocator logging during bring-up/tests. */
@@ -1876,58 +891,9 @@ void memory_set_allocator_log_enabled(int enabled)
     g_allocator_log_enabled = (enabled != 0);
 }
 
-/* Shell/debug dump of allocator counters and debug settings. */
-void memory_print_memstat(void) {
-    struct memory_stats_snapshot snapshot;
-    memory_get_stats(&snapshot);
-
-    uart_send_string("Allocator stats:\n");
-    uart_send_string("page_allocs: ");
-    uart_send_dec((unsigned long)snapshot.page_allocs);
-    uart_send_string("\n");
-    uart_send_string("page_frees: ");
-    uart_send_dec((unsigned long)snapshot.page_frees);
-    uart_send_string("\n");
-    uart_send_string("object_allocs: ");
-    uart_send_dec((unsigned long)snapshot.object_allocs);
-    uart_send_string("\n");
-    uart_send_string("object_frees: ");
-    uart_send_dec((unsigned long)snapshot.object_frees);
-    uart_send_string("\n");
-    uart_send_string("slab_reclaims: ");
-    uart_send_dec((unsigned long)snapshot.slab_reclaims);
-    uart_send_string("\n");
-    uart_send_string("total_pages: ");
-    uart_send_dec((unsigned long)snapshot.total_pages);
-    uart_send_string("\n");
-    uart_send_string("empty_slab_limit: ");
-    uart_send_dec((unsigned long)KMEM_CACHE_EMPTY_LIMIT);
-    uart_send_string("\n");
-    uart_send_string("poison_free_object: 0x");
-    uart_send_hex((unsigned long)POISON_FREE_OBJECT);
-    uart_send_string("\n");
-    uart_send_string("poison_reclaim_page: 0x");
-    uart_send_hex((unsigned long)POISON_RECLAIM_PAGE);
-    uart_send_string("\n");
-}
-
-/* Shell command helper for checking slab list invariants. */
-void memory_debug_check_slabs(void) {
-    if (memory_check_slabs_ok()) {
-        uart_send_string("slabcheck: OK\n");
-    } else {
-        uart_send_string("slabcheck: FAILED\n");
-    }
-}
-
-/* Initialize the memory allocator.
- * 1. Read RAM and reserved-memory information from the devicetree.
- * 2. Reserve page 0, DTB, kernel, initrd, user image, and DTB reservations.
- * 3. Allocate frame metadata with the early bump allocator.
- * 4. Initialize kmalloc slab caches.
- * 5. Build buddy free lists from remaining usable pages.
- */
-void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_end_hint) {
+/* Discover RAM, reserve occupied pages, then build buddy and slab state. */
+void memory_init(const void *fdt, uint64_t initrd_start, uint64_t initrd_end)
+{
     struct fdt_mem_region dt_regions[FDT_MAX_MEM_REGIONS];
     struct fdt_mem_region dt_reserved[FDT_MAX_MEM_REGIONS];
     int dt_count;
@@ -1938,8 +904,6 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
     uint64_t dtb_size;
     uint64_t k_start;
     uint64_t k_size;
-    uint64_t initrd_start = 0;
-    uint64_t initrd_end = 0;
 
     if (g_memory_ready) {
         return;
@@ -1962,7 +926,9 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
 
     g_region_count = 0;
     for (i = 0; i < dt_count && g_region_count < FDT_MAX_MEM_REGIONS; i++) {
-        if (dt_regions[i].base > UINT64_MAX - (PAGE_SIZE - 1U)) { return; }
+        if (dt_regions[i].base > UINT64_MAX - (PAGE_SIZE - 1U)) {
+            return;
+        }
         uint64_t start = align_up_u64(dt_regions[i].base, PAGE_SIZE);
         uint64_t raw_end = dt_regions[i].base + dt_regions[i].size;
         uint64_t end;
@@ -2003,7 +969,8 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
         return;
     }
 
-    /* Common case: one contiguous RAM range. Direct mapping avoids scanning
+    /*
+     * Common case: one contiguous RAM range. Direct mapping avoids scanning
      * g_regions for every page/address conversion.
      */
     if (g_region_count == 1) {
@@ -2016,7 +983,8 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
     g_total_pages = total_pages;
     startup_allocator_init(g_regions[0].base, g_regions[0].size);
 
-    /* Never allocate physical page 0; a null/low address is too easy to misuse
+    /*
+     * Never allocate physical page 0; a null/low address is too easy to misuse
      * and some firmware/platform code may treat it specially.
      */
     memory_reserve(0, PAGE_SIZE);
@@ -2033,21 +1001,13 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
     k_size = (uint64_t)((uintptr_t)&_phys_end - (uintptr_t)&_phys_start);
     memory_reserve(k_start, k_size);
 
-    /* Raw user binaries execute here even though no page tables are active.
+    /*
+     * Raw user binaries execute here even though no page tables are active.
      * This window must not also be returned as buddy pages or allocator data.
      */
     memory_reserve(USER_CODE_BASE, USER_CODE_SIZE);
 
-    /* Reserve initrd either from /chosen linux,initrd-* or from bootloader hints. */
-    if (fdt_get_initrd_range(fdt, &initrd_start, &initrd_end) != 0 || initrd_end <= initrd_start) {
-        initrd_start = 0;
-        initrd_end = 0;
-    }
-    if ((initrd_start == 0 || initrd_end <= initrd_start) &&
-        initrd_hint_valid(initrd_start_hint, initrd_end_hint)) {
-        initrd_start = initrd_start_hint;
-        initrd_end = initrd_end_hint;
-    }
+    /* Platform discovery already resolved the archive range. */
     if (initrd_end > initrd_start) {
         memory_reserve(initrd_start, initrd_end - initrd_start);
     }
@@ -2077,18 +1037,7 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
         return;
     }
 
-    /* Initialize slab caches after metadata exists but before kmalloc is used. */
-    for (i = 0; i < (int)KMALLOC_CLASS_COUNT; i++) {
-        g_kmem_caches[i].class_idx = (unsigned int)i;
-        g_kmem_caches[i].obj_size = class_to_size((unsigned int)i);
-        g_kmem_caches[i].obj_align = g_kmem_caches[i].obj_size;
-        g_kmem_caches[i].obj_stride =
-            slab_calc_stride(g_kmem_caches[i].obj_size, g_kmem_caches[i].obj_align);
-        g_kmem_caches[i].empty_count = 0;
-        g_kmem_caches[i].slabs_partial = 0;
-        g_kmem_caches[i].slabs_full = 0;
-        g_kmem_caches[i].slabs_empty = 0;
-    }
+    slab_init();
 
     buddy_build_initial_state();
     g_memory_ready = 1;
@@ -2100,9 +1049,38 @@ void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_en
     uart_send_dec((unsigned long)g_total_pages);
     uart_send_string("\n");
 
-    /* Keep allocator logs for boot-time bring-up only. Runtime allocations from
+    /*
+     * Keep allocator logs for boot-time bring-up only. Runtime allocations from
      * runu/fork/thread demos are too noisy; memory tests re-enable them
      * explicitly around allocator validation.
      */
     g_allocator_log_enabled = 0;
+}
+
+int page_query(uintptr_t base, struct page_info *out)
+{
+    uint64_t idx;
+
+    if (out == 0 || !g_memory_ready || pa_to_index(base, &idx, 0) != 0) {
+        return -1;
+    }
+    out->index = idx;
+    out->kind = g_frame_array[idx].kind;
+    out->allocated_head = is_alloc_head_tag(g_frame_array[idx].state);
+    return 0;
+}
+
+void page_set_kind(uintptr_t base, enum page_kind kind)
+{
+    uint64_t idx;
+
+    if (g_memory_ready && pa_to_index(base, &idx, 0) == 0 &&
+        is_alloc_head_tag(g_frame_array[idx].state)) {
+        g_frame_array[idx].kind = kind;
+    }
+}
+
+int memory_allocator_log_enabled(void)
+{
+    return g_allocator_log_enabled;
 }

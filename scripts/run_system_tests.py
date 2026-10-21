@@ -73,6 +73,14 @@ def test_lab_commands(proc):
     assert b"rx_fallback=0" in output and b"tx_poll=0" in output, output
     print("[SYSTEM] UART RX/TX through PLIC, no polling fallback: PASS")
 
+    # Refill the ring repeatedly, then start a second stream after it drains.
+    for count in (128, 24):
+        output = command_output(proc, f"demo stress {count}", f"[U{count - 1}]".encode())
+        markers = [int(n) for n in re.findall(rb"\[U(\d+)\]", output)]
+        assert markers == list(range(count)), output
+        command_output(proc, "hello", b"Hello World!")
+    print("[SYSTEM] UART streaming refill, FIFO output and restart: PASS")
+
     # The supplied image ends in an infinite U-mode loop. Run it last and
     # verify that timer interrupts still arrive after all five ecall returns.
     command_output(proc, "timer periodic on", b"timer: periodic on")

@@ -25,6 +25,7 @@ def main() -> int:
             "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
             "-iquote", str(ROOT / "kernel/include"), str(ROOT / "tests/parser_regression.c"),
             str(ROOT / "kernel/src/cpio.c"), str(ROOT / "kernel/src/fdt.c"),
+            str(ROOT / "kernel/src/platform.c"),
             "-o", str(parser_test),
         ], check=True)
         # LeakSanitizer cannot inspect processes under the desktop sandbox's
@@ -32,18 +33,32 @@ def main() -> int:
         subprocess.run([str(parser_test), str(dtb), str(ROOT / "kernel/x1_orangepi-rv2.dtb")], check=True,
                        env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
         elf = Path(directory) / "regression.elf"
-        subprocess.run([
-            compiler, "-march=rv64imac_zicsr", "-mabi=lp64", "-mcmodel=medany",
+        flags = [
+            "-march=rv64imac_zicsr", "-mabi=lp64", "-mcmodel=medany",
             "-msmall-data-limit=0", "-mno-relax", "-ffreestanding", "-nostdlib",
-            "-DQEMU", "-fno-builtin", "-O2", "-Wall", "-Wextra", "-Werror",
-            "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
-            "-I", str(ROOT / "kernel/include"),
-            "-Wl,-T," + str(ROOT / "tests/regression.ld"),
-            str(ROOT / "tests/trap_roundtrip.S"), str(ROOT / "tests/kernel_regression.c"),
-            str(args.trap_source), str(ROOT / "kernel/src/switch_to.S"),
-            str(ROOT / "kernel/src/irq_task.c"), str(ROOT / "kernel/src/ringbuf.c"),
-            str(ROOT / "kernel/src/sbi.c"), "-o", str(elf),
-        ], check=True)
+            "-DQEMU", "-DKERNEL_TEST", "-fno-builtin", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-ffunction-sections", "-fdata-sections", "-I", str(ROOT / "kernel/include"),
+        ]
+        sources = [ROOT / "tests/trap_roundtrip.S", ROOT / "tests/kernel_regression.c",
+                   args.trap_source]
+        sources += [ROOT / "kernel/src" / name for name in (
+            "switch_to.S", "context_layout.c", "thread.c", "sched.c", "user.c",
+            "syscall.c", "trap.c", "exec.c", "demo.c", "demo_uart.c", "trace.c",
+            "timer.c", "uart.c", "deferred_work.c", "ringbuf.c", "sbi.c", "string.c", "plic.c",
+        )]
+        objects = []
+        for index, source in enumerate(sources):
+            obj = Path(directory) / f"module-{index}.o"
+            overrides = []
+            if source.name == "trap.c":
+                overrides.append("-Dtrap_dispatch=production_trap_dispatch")
+            if source.name == "user.c":
+                overrides.append("-Duser_has_exited=production_user_has_exited")
+            subprocess.run([compiler, *flags, *overrides, "-c", str(source), "-o", str(obj)], check=True)
+            objects.append(str(obj))
+        subprocess.run([compiler, *flags, "-Wl,--gc-sections",
+                        "-Wl,-T," + str(ROOT / "tests/regression.ld"),
+                        *objects, "-o", str(elf)], check=True)
         proc = subprocess.Popen([
             "qemu-system-riscv64", "-M", "virt", "-smp", "1", "-m", "128M",
             "-nographic", "-bios", "default", "-kernel", str(elf),

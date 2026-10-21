@@ -5,7 +5,8 @@
 
 struct trap_context;
 
-/* Single-active-hart scheduler:
+/*
+ * Single-active-hart scheduler:
  * - cooperative kernel workers
  * - user tasks with separate user/kernel stacks
  * - timer-driven preemption at user trap-return boundaries
@@ -19,11 +20,12 @@ enum thread_kind {
 enum thread_state {
     THREAD_RUNNING = 0,
     THREAD_RUNNABLE,
-    THREAD_BLOCKED,
+    THREAD_NEW,      /* private construction state; not waiting for I/O */
     THREAD_ZOMBIE,
 };
 
-/* Kernel execution context saved/restored by switch_to().
+/*
+ * Kernel execution context saved/restored by switch_to().
  * Save callee-saved registers plus ra/sp at the function-call boundary.
  * Registers interrupted by a trap are saved separately in trap_context.
  */
@@ -44,7 +46,8 @@ struct thread_context {
     uint64_t s11;
 };
 
-/* Thread control block.
+/*
+ * Thread control block.
  *
  * Keep thread_context first so switch_to.S can treat a
  * `struct thread *` as the base address of the saved context without adding
@@ -69,10 +72,7 @@ struct thread {
 
     int is_idle;
 
-    /* BE2 foundation: optional user-mode state carried by the same
-     * schedulable entity so kernel threads and user processes can share
-     * the same run queue / scheduler machinery.
-     */
+    /* User-only state; kernel workers leave these fields zero. */
     uintptr_t user_entry;
     uintptr_t user_stack_base;
     uintptr_t user_stack_top;
@@ -80,44 +80,21 @@ struct thread {
     struct trap_context *tc; /* points into this thread's kernel stack */
 };
 
-/* Shared scheduler API for kernel workers and user tasks. */
-void thread_init(void);
-void thread_system_bootstrap_init(void);
-int thread_system_active(void);
-struct thread *thread_current(void);
-struct thread *thread_find_by_tid(int32_t tid);
-int thread_user_image_busy(const struct thread *except);
-int thread_create_kernel(void (*entry)(void *arg), void *arg, int is_idle);
-/* Start the first thread of a new process in the already-loaded image.
- * The caller keeps its user stack on failure; the task owns it on success.
- */
+/* Create runnable tasks. Each gets its own kernel stack and saved context. */
+int thread_create_kernel(void (*entry)(void *), void *arg);
+/* On failure, the caller retains ownership of the supplied user stack. */
 int user_process_create(uintptr_t entry, uintptr_t stack_base, uintptr_t stack_top);
-/* Start a sibling in the current user process, with a fresh stack, not a copy.
- * return_pc is a user-space stub that exits only this thread.
- */
+/* Same TGID, new TID and stack; return_pc exits the worker after entry returns. */
 int thread_create_user(uintptr_t entry, uintptr_t arg, uintptr_t return_pc);
-int thread_user_group_size(const struct thread *task);
-int thread_user_stack_contains(const struct thread *task, uintptr_t start, uintptr_t end);
-/* Internal construction helpers. Fork finishes its copied context before
- * publication. A prepared task owns the supplied stack; publish it exactly
- * once, after every field needed by its first run has been set.
- */
-struct thread *thread_prepare_user(uintptr_t entry, uintptr_t stack_base, uintptr_t stack_top);
-void thread_publish_user(struct thread *task);
-/* Save the current thread context into `prev`, restore `next`, then set
- * tp to the new current-thread pointer before returning into `next`.
- */
-void switch_to(struct thread *prev, struct thread *next);
-void thread_enter_idle(void);
-void thread_run_until_idle(void);
-void thread_yield(void);
-void thread_exit(void);
+
+/* Marking exit leaves trap return responsible for switching away. */
 void thread_mark_current_zombie(int exit_status);
+void thread_exit(void);
 int thread_stop_tid(int32_t tid, int exit_status);
 int thread_stop_process(int32_t tgid, int exit_status);
-int thread_has_runnable_tasks(void);
-void thread_request_resched(void);
-int thread_consume_resched_request(void);
-void schedule(void);
+
+int thread_user_group_size(const struct thread *task);
+int thread_user_stack_contains(const struct thread *task, uintptr_t start, uintptr_t end);
+int thread_user_image_busy(const struct thread *except);
 
 #endif

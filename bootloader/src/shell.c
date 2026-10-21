@@ -44,38 +44,21 @@ static unsigned long g_dtb = 0;
 static unsigned long g_initrd_start = 0;
 static unsigned long g_initrd_end = 0;
 
-void shell_set_context(unsigned long hartid, unsigned long dtb_addr) {
+void shell_set_context(unsigned long hartid, unsigned long dtb_addr)
+{
     g_hartid = hartid;
     g_dtb = dtb_addr;
 }
 
 /* check if character is whitespace */
-static int is_space(char c) {
+static int is_space(char c)
+{
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
-static unsigned int str_len(const char *s) {
-    unsigned int n = 0;
-    while (s[n] != '\0') {
-        n++;
-    }
-    return n;
-}
-
-/* simple string equality check */
-static int streq(const char *a, const char *b) {
-    while (*a != '\0' && *b != '\0') {
-        if (*a != *b) {
-            return 0;
-        }
-        a++;
-        b++;
-    }
-    return *a == *b;
-}
-
 /* trim leading and trailing whitespace in-place */
-static void trim_in_place(char *s) {
+static void trim_in_place(char *s)
+{
     char *p = s;
     while (is_space(*p)) {
         p++;
@@ -88,7 +71,7 @@ static void trim_in_place(char *s) {
         *dst = '\0';
     }
 
-    unsigned int len = str_len(s);
+    unsigned int len = strlen(s);
     while (len > 0 && is_space(s[len - 1])) {
         s[len - 1] = '\0';
         len--;
@@ -96,11 +79,12 @@ static void trim_in_place(char *s) {
 }
 
 /*
- * getCommand: read a line from UART into buffer.
+ * shell_readline: read a line from UART into buffer.
  * Supports backspace (127, '\b') for editing.
  * Converts '\r' or '\n' to line terminator.
  */
-static void getCommand(char* buffer, int max_len) {
+static void shell_readline(char* buffer, int max_len)
+{
     int idx = 0;
     int ignore_next_lf = 0;
 
@@ -138,14 +122,15 @@ static void getCommand(char* buffer, int max_len) {
         if (c >= ' ' && c <= '~') {
             if (idx < max_len - 1) {
                 buffer[idx++] = c;
-                uart_send(c);               // echo back to terminal
+                uart_send(c); /* echo back to terminal */
             }
         }
     }
 }
 
 /* read a little-endian 32-bit unsigned integer from UART (4 bytes) */
-static unsigned long recv_u32_le(void) {
+static unsigned long recv_u32_le(void)
+{
     unsigned long v = 0;
     v |= (unsigned long)(uint8_t)uart_recv();
     v |= (unsigned long)(uint8_t)uart_recv() << 8;
@@ -155,7 +140,8 @@ static unsigned long recv_u32_le(void) {
 }
 
 /* read 'size' raw bytes from UART into dst */
-static void recv_bytes(void *dst, unsigned long size) {
+static void recv_bytes(void *dst, unsigned long size)
+{
     unsigned char *p = (unsigned char *)dst;
     unsigned long i;
     for (i = 0; i < size; i++) {
@@ -164,7 +150,8 @@ static void recv_bytes(void *dst, unsigned long size) {
 }
 
 /* read a little-endian 32-bit unsigned integer from memory */
-static uint32_t load_u32_le(const uint8_t *p) {
+static uint32_t load_u32_le(const uint8_t *p)
+{
     return (uint32_t)p[0] |
            ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) |
@@ -172,7 +159,8 @@ static uint32_t load_u32_le(const uint8_t *p) {
 }
 
 /* copy bytes handle overlapping regions correctly */
-static void copy_bytes(uint8_t *dst, const uint8_t *src, unsigned long size) {
+static void copy_bytes(uint8_t *dst, const uint8_t *src, unsigned long size)
+{
     unsigned long i;
     if (dst < src) {
         for (i = 0; i < size; i++) {
@@ -186,7 +174,8 @@ static void copy_bytes(uint8_t *dst, const uint8_t *src, unsigned long size) {
 }
 
 /* compute a simple 32-bit sum checksum */
-static unsigned long checksum_bytes(const uint8_t *data, unsigned long size) {
+static unsigned long checksum_bytes(const uint8_t *data, unsigned long size)
+{
     unsigned long sum = 0;
     unsigned long i;
 
@@ -204,7 +193,8 @@ static unsigned long checksum_bytes(const uint8_t *data, unsigned long size) {
 static int uart_load_image_payload(uint8_t *dst, unsigned long max_size,
                                    unsigned long load_addr,
                                    unsigned long size, unsigned long expected_sum,
-                                   unsigned long *size_out) {
+                                   unsigned long *size_out)
+{
     unsigned long actual_sum;
 
     if (size == 0 || size > max_size) {
@@ -250,7 +240,8 @@ static int uart_load_image_payload(uint8_t *dst, unsigned long max_size,
  *            [kernel_checksum:4B][initrd_checksum:4B]
  *            [kernel raw bytes...][initrd raw bytes...]
  */
-static void boot_load_and_jump(void) {
+static void boot_load_and_jump(void)
+{
     unsigned long magic;
     unsigned long size;
     unsigned long expected_sum;
@@ -287,10 +278,10 @@ static void boot_load_and_jump(void) {
         }
 
         /* step 3: parse bundle metadata (first 16 bytes) */
-        kernel_size = load_u32_le(bundle);        // offset 0
-        initrd_size = load_u32_le(bundle + 4);    // offset 4
-        kernel_sum = load_u32_le(bundle + 8);     // offset 8
-        initrd_sum = load_u32_le(bundle + 12);    // offset 12
+        kernel_size = load_u32_le(bundle); /* offset 0 */
+        initrd_size = load_u32_le(bundle + 4); /* offset 4 */
+        kernel_sum = load_u32_le(bundle + 8); /* offset 8 */
+        initrd_sum = load_u32_le(bundle + 12); /* offset 12 */
 
         /* step 4: validate sizes */
         total_needed = 16UL + (unsigned long)kernel_size + (unsigned long)initrd_size;
@@ -367,43 +358,40 @@ static void boot_load_and_jump(void) {
     uart_send_string("loaded image returned\n");
 }
 
-/* processCommand: dispatch shell commands */
-void processCommand(shell_t* shell) {
-    if (shell->command[0] == '\0') {
+/* Dispatch one complete command line. */
+static void shell_execute(char *line)
+{
+    if (line[0] == '\0') {
         return;
     }
 
-    if (streq(shell->command, "help")) {
+    if (strcmp(line, "help") == 0) {
         uart_send_string("Available commands:\n");
         uart_send_string("  help   - Show this message\n");
         uart_send_string("  load   - Load kernel+initrd bundle via UART and jump\n");
         return;
     }
 
-    if (streq(shell->command, "load")) {
+    if (strcmp(line, "load") == 0) {
         boot_load_and_jump();
         return;
     }
 
     uart_send_string("Unknown command: ");
-    uart_send_string(shell->command);
+    uart_send_string(line);
     uart_send_string("\n");
-
 
 }
 
-/* runAShell: display prompt, read a line, dispatch it */
-void runAShell(int32_t pid) {
-    char* prompt_start = "> ";
-    shell_t shell; 
-    char command_buffer[128]; 
-    shell.pid = pid;
-    uart_send_string(prompt_start);
+/* The same kernel flow owns every prompt; commands do not create a shell task. */
+void shell_run(void)
+{
+    char line[128];
 
-    getCommand(command_buffer, 128);
-    trim_in_place(command_buffer);
-
-    shell.command = command_buffer; 
-
-    processCommand(&shell); 
+    for (;;) {
+        uart_send_string("> ");
+        shell_readline(line, sizeof(line));
+        trim_in_place(line);
+        shell_execute(line);
+    }
 }

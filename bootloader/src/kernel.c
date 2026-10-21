@@ -11,7 +11,8 @@
  */
 static volatile unsigned long bootstrap_hart = ~0UL;
 
-void secondary_main(unsigned long hartid) {
+void secondary_main(unsigned long hartid)
+{
     (void)hartid;
     /* secondary harts just sleep forever */
     while (1) {
@@ -23,7 +24,8 @@ void secondary_main(unsigned long hartid) {
  * kernel_main: entry point called from boot.S (_start).
  * Receives hartid and dtb_addr from OpenSBI via a0, a1.
  */
-void kernel_main(unsigned long hartid, unsigned long dtb_addr) {
+void kernel_main(unsigned long hartid, unsigned long dtb_addr)
+{
     /* first hart to arrive becomes the bootstrap hart */
     if (bootstrap_hart == ~0UL) {
         bootstrap_hart = hartid;
@@ -51,15 +53,5 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr) {
     uart_send_string("\n");
     uart_send_string("Type 'help' for commands\n");
 
-    {
-        int32_t pid = 1;
-        /* main loop: repeatedly run the shell prompt */
-        while (1) {
-            runAShell(pid++);
-        }
-    }
-
-    while (1) {
-        asm volatile("wfi");
-    }
+    shell_run();
 }

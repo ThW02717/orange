@@ -1,35 +1,6 @@
 #include <stdint.h>
 
-#include "syscall.h"
-
-#define DO_SYSCALL0(nr)                                                       \
-    ({                                                                        \
-        register long a0_ asm("a0");                                          \
-        register long a7_ asm("a7") = (nr);                                   \
-        asm volatile("ecall" : "=r"(a0_) : "r"(a7_) : "memory");              \
-        a0_;                                                                   \
-    })
-
-#define DO_SYSCALL1(nr, arg0)                                                 \
-    ({                                                                        \
-        register long a0_ asm("a0") = (arg0);                                 \
-        register long a7_ asm("a7") = (nr);                                   \
-        asm volatile("ecall" : "+r"(a0_) : "r"(a7_) : "memory");              \
-        a0_;                                                                   \
-    })
-
-#define DO_SYSCALL2(nr, arg0, arg1)                                           \
-    ({                                                                        \
-        register long a0_ asm("a0") = (arg0);                                 \
-        register long a1_ asm("a1") = (arg1);                                 \
-        register long a7_ asm("a7") = (nr);                                   \
-        asm volatile("ecall" : "+r"(a0_) : "r"(a1_), "r"(a7_) : "memory");    \
-        a0_;                                                                   \
-    })
-
-static long getpid(void) { return DO_SYSCALL0(SYS_getpid); }
-static long uart_write(const char *buf, long count) { return DO_SYSCALL2(SYS_uart_write, (long)buf, count); }
-static void exit_proc(int status) { (void)DO_SYSCALL1(SYS_exit, status); for (;;) {} }
+#include "user_api.h"
 
 static long str_len(const char *s)
 {
@@ -103,5 +74,5 @@ void preempt_main(void)
         put_str(buf);
     }
 
-    exit_proc(0);
+    thread_exit(0);
 }

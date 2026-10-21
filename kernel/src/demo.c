@@ -1,78 +1,29 @@
+/*
+ * Shell demos only. Kernel mechanisms do not depend on this file.
+ * demo_run() selects the test; helpers prepare its input and check output.
+ */
+#include "string.h"
+#include "thread_internal.h"
+#include "demo_uart.h"
+#include "trace.h"
+#include "sched.h"
+#include "user_layout.h"
+#include "irqflags.h"
 #include <stdint.h>
 #include "demo.h"
 #include "memory.h"
 #include "memory_test.h"
-#include "shell.h"
+#include "exec.h"
 #include "trap.h"
 #include "thread.h"
 #include "timer.h"
 #include "uart.h"
-#include "irq_task.h"
-
-#define DEMO_TRACE_CAPACITY 128U
-
-/* =========================
- * Demo Trace Support
- *
- * Records recent top-half / bottom-half events so nested-interrupt behavior
- * can be checked without relying only on UART output interleaving.
- * ========================= */
-struct demo_trace_event {
-    uint64_t now;
-    uint32_t aux;
-    uint8_t kind;
-};
-
-static struct demo_trace_event g_demo_trace[DEMO_TRACE_CAPACITY];
-static unsigned int g_demo_trace_head = 0;
-static unsigned int g_demo_trace_count = 0;
-static int g_demo_nested_active = 0;
+#include "deferred_work.h"
 
 struct demo_thread_arg {
     char tag;
     unsigned int rounds;
 };
-
-static uint64_t demo_trace_irq_save(void)
-{
-    uint64_t sstatus;
-
-    asm volatile("csrrc %0, sstatus, %1" : "=r"(sstatus) : "r"(SSTATUS_SIE) : "memory");
-    return sstatus;
-}
-
-static void demo_trace_irq_restore(uint64_t sstatus)
-{
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus) : "memory");
-}
-
-static const char *demo_trace_kind_name(enum demo_trace_kind kind)
-{
-    switch (kind) {
-    case DEMO_TRACE_TIMER_TOP:      return "timer_top";
-    case DEMO_TRACE_TIMER_BOTTOM:   return "timer_bottom";
-    case DEMO_TRACE_UART_TOP_RX:    return "uart_top_rx";
-    case DEMO_TRACE_UART_TOP_TX:    return "uart_top_tx";
-    case DEMO_TRACE_UART_RX_BOTTOM: return "uart_rx_bottom";
-    case DEMO_TRACE_UART_TX_BOTTOM: return "uart_tx_bottom";
-    case DEMO_TRACE_RUN_TIMER:      return "run_timer";
-    case DEMO_TRACE_RUN_UART_RX:    return "run_uart_rx";
-    case DEMO_TRACE_RUN_UART_TX:    return "run_uart_tx";
-    default:                        return "unknown";
-    }
-}
-
-static int streq_local(const char *a, const char *b)
-{
-    while (*a != '\0' && *b != '\0') {
-        if (*a != *b) {
-            return 0;
-        }
-        a++;
-        b++;
-    }
-    return *a == *b;
-}
 
 static int is_space_local(char c)
 {
@@ -94,7 +45,9 @@ static int parse_u64_dec_local(const char *s, uint64_t *out)
         if (c < '0' || c > '9') {
             return -1;
         }
-        if (value > (UINT64_MAX - (uint64_t)(c - '0')) / 10ULL) { return -1; }
+        if (value > (UINT64_MAX - (uint64_t)(c - '0')) / 10ULL) {
+            return -1;
+        }
         value = (value * 10ULL) + (uint64_t)(c - '0');
         i++;
     }
@@ -142,88 +95,10 @@ void demo_print_usage(void)
     uart_send_string("  demo trace reset - clear recent trace events\n");
 }
 
-void demo_trace_reset(void)
-{
-    uint64_t sstatus;
-
-    sstatus = demo_trace_irq_save();
-    g_demo_trace_head = 0U;
-    g_demo_trace_count = 0U;
-    demo_trace_irq_restore(sstatus);
-}
-
-void demo_trace_record(enum demo_trace_kind kind, uint32_t aux)
-{
-    uint64_t sstatus;
-    unsigned int slot;
-
-    sstatus = demo_trace_irq_save();
-    slot = g_demo_trace_head;
-    g_demo_trace[slot].now = timer_read();
-    g_demo_trace[slot].aux = aux;
-    g_demo_trace[slot].kind = (uint8_t)kind;
-    g_demo_trace_head = (slot + 1U) % DEMO_TRACE_CAPACITY;
-    if (g_demo_trace_count < DEMO_TRACE_CAPACITY) {
-        g_demo_trace_count++;
-    }
-    demo_trace_irq_restore(sstatus);
-}
-
-void demo_trace_dump(void)
-{
-    struct demo_trace_event snapshot[DEMO_TRACE_CAPACITY];
-    uint64_t sstatus;
-    unsigned int count;
-    unsigned int head;
-    unsigned int start;
-    unsigned int i;
-
-    sstatus = demo_trace_irq_save();
-    count = g_demo_trace_count;
-    head = g_demo_trace_head;
-    start = (head + DEMO_TRACE_CAPACITY - count) % DEMO_TRACE_CAPACITY;
-    for (i = 0; i < count; i++) {
-        snapshot[i] = g_demo_trace[(start + i) % DEMO_TRACE_CAPACITY];
-    }
-    demo_trace_irq_restore(sstatus);
-
-    uart_send_string("demo trace: ");
-    uart_send_dec(count);
-    uart_send_string(" events\n");
-    for (i = 0; i < count; i++) {
-        uint64_t ms = 0U;
-
-        if (g_timebase_freq != 0U) {
-            ms = ((snapshot[i].now - g_boot_time) * 1000ULL) / g_timebase_freq;
-        }
-        uart_send_string("trace[");
-        uart_send_dec(i);
-        uart_send_string("] t=");
-        uart_send_dec((unsigned long)ms);
-        uart_send_string("ms kind=");
-        uart_send_string(demo_trace_kind_name((enum demo_trace_kind)snapshot[i].kind));
-        uart_send_string(" aux=");
-        uart_send_dec((unsigned long)snapshot[i].aux);
-        uart_send_string("\n");
-    }
-}
-
-int demo_nested_active(void)
-{
-    return g_demo_nested_active;
-}
-
-/* =========================
- * Nested Interrupt Demo
- *
- * This does not run the full test automatically. It prints the recommended
- * manual sequence so the user can combine addtimer + uartstress and then
- * check whether timer markers appear between UART markers.
- * ========================= */
+/* Manual UART/timer interleave test; inspect the trace afterward. */
 static int demo_nested(void)
 {
-    demo_trace_reset();
-    g_demo_nested_active = 0;
+    trace_reset();
     uart_send_string("manual nested-interrupt test:\n");
     uart_send_string("  addtimer 1\n");
     uart_send_string("  addtimer 2\n");
@@ -233,7 +108,8 @@ static int demo_nested(void)
     return 0;
 }
 
-/* Keep the fixture alive even if a broken timer path misses the test timeout.
+/*
+ * Keep the fixture alive even if a broken timer path misses the test timeout.
  * A generation token makes a late timer from an earlier run harmless.
  */
 static struct {
@@ -247,14 +123,14 @@ static struct {
 
 static void demo_task_event(unsigned int event)
 {
-    uint64_t status = demo_trace_irq_save();
+    uint64_t status = local_irq_save();
 
     if (g_task_demo.count < 8U) {
         g_task_demo.events[g_task_demo.count++] = event;
     } else {
         g_task_demo.failed = 1;
     }
-    demo_trace_irq_restore(status);
+    local_irq_restore(status);
 }
 
 static void demo_task_high(void *arg)
@@ -283,30 +159,11 @@ static void demo_task_timer(void *arg)
         return;
     }
     demo_task_event(4);
-    if (add_task(demo_task_high, 0, 0) != 0 ||
-        add_task(demo_task_equal, 0, 5) != 0 ||
-        add_task(demo_task_lower, 0, 7) != 0) {
+    if (deferred_work_add(demo_task_high, 0, 0) != 0 ||
+        deferred_work_add(demo_task_equal, 0, 5) != 0 ||
+        deferred_work_add(demo_task_lower, 0, 7) != 0) {
         g_task_demo.failed = 1;
     }
-}
-
-static int demo_task_timer_top_seen(uint64_t since)
-{
-    uint64_t status = demo_trace_irq_save();
-    unsigned int start = (g_demo_trace_head + DEMO_TRACE_CAPACITY -
-                          g_demo_trace_count) % DEMO_TRACE_CAPACITY;
-    int found = 0;
-
-    for (unsigned int i = 0; i < g_demo_trace_count; i++) {
-        const struct demo_trace_event *event =
-            &g_demo_trace[(start + i) % DEMO_TRACE_CAPACITY];
-        if (event->kind == DEMO_TRACE_TIMER_TOP && event->now >= since) {
-            found = 1;
-            break;
-        }
-    }
-    demo_trace_irq_restore(status);
-    return found;
 }
 
 static void demo_task_low(void *arg)
@@ -319,13 +176,14 @@ static void demo_task_low(void *arg)
         g_task_demo.failed = 1;
         return;
     }
-    /* Spend a bounded interval doing work with IRQs enabled. The timer top
+    /*
+     * Spend a bounded interval doing work with IRQs enabled. The timer top
      * half must arrive, but its callback cannot run until we return.
      */
     while (timer_read() - start < (delay ? delay : 1U)) {
         asm volatile("" ::: "memory");
     }
-    if (demo_task_timer_top_seen(start)) {
+    if (trace_seen_since(TRACE_TIMER_TOP, start)) {
         demo_task_event(2);
     } else {
         g_task_demo.failed = 1;
@@ -352,8 +210,8 @@ static int demo_tasks(void)
     g_task_demo.high_done = 0;
     g_task_demo.failed = 0;
     g_task_demo.count = 0;
-    demo_trace_reset();
-    if (add_task(demo_task_low, (void *)(uintptr_t)g_task_demo.generation, 5) != 0) {
+    trace_reset();
+    if (deferred_work_add(demo_task_low, (void *)(uintptr_t)g_task_demo.generation, 5) != 0) {
         g_task_demo.active = 0;
         uart_send_string("[tasks] callback queue full\n");
         return -1;
@@ -366,7 +224,9 @@ static int demo_tasks(void)
         unsigned int event = g_task_demo.events[i];
         if (i != 0) { uart_send_string(" -> "); }
         uart_send_string(event < 8U ? names[event] : "?");
-        if (event != i + 1U) { g_task_demo.failed = 1; }
+        if (event != i + 1U) {
+            g_task_demo.failed = 1;
+        }
     }
     uart_send_string("\n");
     if (g_task_demo.failed || g_task_demo.count != 7U || !g_task_demo.high_done) {
@@ -382,80 +242,26 @@ static int demo_mem(const char *name)
     return memory_run_kmtest(name);
 }
 
-static int demo_launch_user_program(const char *name,
-                                    const char *label,
+static int demo_launch_user_program(const char *name, const char *label,
                                     unsigned int instances)
 {
-    uintptr_t entry;
-    unsigned long size;
-    unsigned int i;
-    int created_pids[2];
+    struct exec_result result;
 
-    if (instances == 0U || instances > 2U) {
-        return -1;
-    }
-
-    if (shell_load_user_program_named(name, &entry, &size) != 0) {
-        uart_send_string("demo ");
-        uart_send_string(name);
-        uart_send_string(": failed to load bin/");
-        uart_send_string(name);
-        uart_send_string(".bin\n");
-        return -1;
-    }
-
-    if (!thread_system_active()) {
+    if (exec_spawn(name, instances, &result) != 0) {
         uart_send_string(label);
-        uart_send_string(": bootstrap shell -> idle\n");
-        thread_system_bootstrap_init();
+        uart_send_string(": failed to load or create user task\n");
+        return -1;
     }
-
-    for (i = 0; i < instances; i++) {
-        uintptr_t user_stack_base;
-        uintptr_t user_stack_top;
-
-        user_stack_base = (uintptr_t)kmalloc(USER_STACK_SIZE);
-        if (user_stack_base == 0) {
-            uart_send_string("demo ");
-            uart_send_string(name);
-            uart_send_string(": failed to allocate user stack\n");
-            goto launch_failed;
-        }
-        user_stack_top = (user_stack_base + USER_STACK_SIZE) & ~0xFUL;
-        created_pids[i] = user_process_create(entry, user_stack_base, user_stack_top);
-        if (created_pids[i] < 0) {
-            kfree((void *)(uintptr_t)user_stack_base);
-            uart_send_string("demo ");
-            uart_send_string(name);
-            uart_send_string(": failed to create user task\n");
-            goto launch_failed;
-        }
-    }
-
     uart_send_string(label);
     uart_send_string(": run user demo\n");
     uart_tx_wait_idle();
     thread_run_until_idle();
     uart_send_string(label);
     uart_send_string(": done\n");
-    (void)size;
     return 0;
-
-launch_failed:
-    while (i > 0U) {
-        (void)thread_stop_tid(created_pids[--i], -1);
-    }
-    thread_run_until_idle();
-    return -1;
 }
 
-/* =========================
- * demo foo
- *
- * Minimal thread-create example that mirrors the spec most directly:
- * thread_create_kernel(foo, ...). The goal is only to show that a plain function
- * name can be passed as the thread entry.
- * ========================= */
+/* Cooperative workers yield after each printed round. */
 static void foo(void *arg)
 {
     unsigned int id = *(unsigned int *)arg;
@@ -480,49 +286,41 @@ static void foo(void *arg)
     uart_send_string(":done]\n");
 }
 
-/* Bootstrap current shell flow as idle, create three foo workers, then hand
- * control to the cooperative scheduler by entering the idle loop. */
+/* Roll back before returning: workers borrow arguments from the caller's stack. */
+static int demo_create_workers(void (*entry)(void *), void *args[3])
+{
+    int tids[3];
+    unsigned int i;
+
+    thread_system_bootstrap_init();
+    for (i = 0; i < 3; i++) {
+        tids[i] = thread_create_kernel(entry, args[i]);
+        if (tids[i] < 0) {
+            while (i > 0) {
+                thread_stop_tid(tids[--i], -1);
+            }
+            thread_reap_zombies();
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int demo_foo(void)
 {
-    unsigned int ids[3];
-    int tid;
+    unsigned int ids[3] = { 1, 2, 3 };
+    void *args[3] = { &ids[0], &ids[1], &ids[2] };
 
-    ids[0] = 1U;
-    ids[1] = 2U;
-    ids[2] = 3U;
-
-    uart_send_string("[foo] bootstrap shell -> idle\n");
-    thread_system_bootstrap_init();
-
-    tid = thread_create_kernel(foo, &ids[0], 0);
-    if (tid < 0) {
-        uart_send_string("demo foo: failed to create foo #1\n");
+    if (demo_create_workers(foo, args) != 0) {
+        uart_send_string("demo foo: worker creation failed\n");
         return -1;
     }
-    tid = thread_create_kernel(foo, &ids[1], 0);
-    if (tid < 0) {
-        uart_send_string("demo foo: failed to create foo #2\n");
-        return -1;
-    }
-    tid = thread_create_kernel(foo, &ids[2], 0);
-    if (tid < 0) {
-        uart_send_string("demo foo: failed to create foo #3\n");
-        return -1;
-    }
-
-    uart_send_string("[foo] using thread_create_kernel(foo, ...)\n");
     uart_send_string("[foo] expect [foo 1:0] [foo 2:0] [foo 3:0] ...\n");
     thread_enter_idle();
     return -1;
 }
 
-/* =========================
- * demo thread
- *
- * Main cooperative RR scheduler demo. Three worker threads share the same
- * entry function but receive different arguments so the output shows
- * interleaving like A/B/C -> A/B/C -> ...
- * ========================= */
+/* Same entry, separate stack arguments and execution contexts. */
 static void demo_thread_worker(void *arg)
 {
     struct demo_thread_arg *cfg = (struct demo_thread_arg *)arg;
@@ -547,52 +345,22 @@ static void demo_thread_worker(void *arg)
     uart_send_string(":done]\n");
 }
 
-/* Bootstrap current shell flow as idle, create three tagged workers, then
- * enter the idle loop permanently. This demo intentionally does not return
- * to the shell. */
 static int demo_thread(void)
 {
-    struct demo_thread_arg args[3];
-    int tid;
+    struct demo_thread_arg cfg[3] = { { 'A', 5 }, { 'B', 5 }, { 'C', 5 } };
+    void *args[3] = { &cfg[0], &cfg[1], &cfg[2] };
 
-    args[0].tag = 'A';
-    args[0].rounds = 5U;
-    args[1].tag = 'B';
-    args[1].rounds = 5U;
-    args[2].tag = 'C';
-    args[2].rounds = 5U;
-
-    uart_send_string("[thread] bootstrap shell -> idle\n");
-    thread_system_bootstrap_init();
-
-    tid = thread_create_kernel(demo_thread_worker, &args[0], 0);
-    if (tid < 0) {
-        uart_send_string("thread demo: failed to create worker A\n");
+    if (demo_create_workers(demo_thread_worker, args) != 0) {
+        uart_send_string("thread demo: worker creation failed\n");
         return -1;
     }
-    tid = thread_create_kernel(demo_thread_worker, &args[1], 0);
-    if (tid < 0) {
-        uart_send_string("thread demo: failed to create worker B\n");
-        return -1;
-    }
-    tid = thread_create_kernel(demo_thread_worker, &args[2], 0);
-    if (tid < 0) {
-        uart_send_string("thread demo: failed to create worker C\n");
-        return -1;
-    }
-
     uart_send_string("[thread] RR: [A:0] [B:0] [C:0] ...\n");
     uart_send_string("[thread] enter idle\n");
     thread_enter_idle();
     return -1;
 }
 
-/* =========================
- * demo fork
- *
- * Launch the user-space fork smoke test, let the scheduler run until all user
- * work is gone, then return control to the shell.
- * ========================= */
+/* Run the raw-image fork demo, then resume the shell. */
 static int demo_fork(void)
 {
     return demo_launch_user_program("fork", "[fork]", 1U);
@@ -613,19 +381,14 @@ static int demo_badinst(void)
     return demo_launch_user_program("badinst", "[badinst]", 1U);
 }
 
-/* =========================
- * UART Interrupt Demo
- *
- * Verifies the one-shot interrupt-driven UART RX/TX path and prints the
- * counters used to judge whether polling was avoided.
- * ========================= */
+/* Verify RX/TX IRQ delivery without polling fallback. */
 static int demo_uart(void)
 {
-    struct uart_demo_stats stats;
+    struct uart_stats stats;
     char c;
     int pass;
 
-    uart_demo_reset_stats();
+    uart_reset_stats();
 
     uart_send_string("uartdemo: TX phase\n");
     uart_send_string("uartdemo: TX interrupt-driven output test line\n");
@@ -634,7 +397,7 @@ static int demo_uart(void)
     c = uart_recv();
     uart_send_string("\n");
 
-    uart_demo_get_stats(&stats);
+    uart_get_stats(&stats);
 
     uart_send_string("uartdemo: got '");
     uart_send(c);
@@ -684,18 +447,14 @@ static int demo_stress(const char *arg)
     uart_send_dec((unsigned long)count);
     uart_send_string(" TX markers\n");
 
-    if (uart_stress_start(count) != 0) {
+    if (demo_uart_stress_start(count) != 0) {
         uart_send_string("uartstress: failed to start TX stress\n");
         return -1;
     }
     return 0;
 }
 
-/* =========================
- * Demo Command Dispatch
- *
- * Parses `demo <name> [arg]` and routes to the corresponding test entry.
- * ========================= */
+/* Shell entry: demo <name> [argument]. */
 int demo_run(const char *name)
 {
     char buf[64];
@@ -715,49 +474,49 @@ int demo_run(const char *name)
     buf[i] = '\0';
     split_first_arg_local(buf, &cmd, &arg);
 
-    if (streq_local(cmd, "nested")) {
+    if (strcmp(cmd, "nested") == 0) {
         return demo_nested();
     }
-    if (streq_local(cmd, "tasks")) {
+    if (strcmp(cmd, "tasks") == 0) {
         return demo_tasks();
     }
-    if (streq_local(cmd, "foo")) {
+    if (strcmp(cmd, "foo") == 0) {
         return demo_foo();
     }
-    if (streq_local(cmd, "fork")) {
+    if (strcmp(cmd, "fork") == 0) {
         return demo_fork();
     }
-    if (streq_local(cmd, "test")) {
+    if (strcmp(cmd, "test") == 0) {
         return demo_test();
     }
-    if (streq_local(cmd, "badinst")) {
+    if (strcmp(cmd, "badinst") == 0) {
         return demo_badinst();
     }
-    if (streq_local(cmd, "preempt")) {
+    if (strcmp(cmd, "preempt") == 0) {
         return demo_preempt();
     }
-    if (streq_local(cmd, "threads")) {
+    if (strcmp(cmd, "threads") == 0) {
         return demo_launch_user_program("threads", "[threads]", 1U);
     }
-    if (streq_local(cmd, "uart")) {
+    if (strcmp(cmd, "uart") == 0) {
         return demo_uart();
     }
-    if (streq_local(cmd, "thread")) {
+    if (strcmp(cmd, "thread") == 0) {
         return demo_thread();
     }
-    if (streq_local(cmd, "stress")) {
+    if (strcmp(cmd, "stress") == 0) {
         return demo_stress(arg);
     }
-    if (streq_local(cmd, "trace")) {
-        if (arg != 0 && streq_local(arg, "reset")) {
-            demo_trace_reset();
+    if (strcmp(cmd, "trace") == 0) {
+        if (arg != 0 && (strcmp(arg, "reset") == 0)) {
+            trace_reset();
             uart_send_string("demo trace: reset\n");
             return 0;
         }
-        demo_trace_dump();
+        trace_dump();
         return 0;
     }
-    if (streq_local(cmd, "mem") || streq_local(cmd, "kmtest") || streq_local(cmd, "memtest")) {
+    if (strcmp(cmd, "mem") == 0 || strcmp(cmd, "kmtest") == 0 || strcmp(cmd, "memtest") == 0) {
         return demo_mem(arg);
     }
 

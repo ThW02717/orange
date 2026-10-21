@@ -1,3 +1,4 @@
+#include "platform.h"
 
 #include <stdint.h>
 #include "uart.h"
@@ -7,10 +8,11 @@
 #include "memory.h"
 #include "timer.h"
 #include "trap.h"
-#include "irq_task.h"
+#include "deferred_work.h"
 
-/* Bootstrap-core-only kernel entry. Secondary harts are started after the
- * primary hart initializes memory, shell context, and other global state.
+/*
+ * Bootstrap-core-only kernel entry. Secondary harts are started after the
+ * primary hart initializes memory, platform resources and interrupt state.
  */
 static volatile unsigned long bootstrap_hart = ~0UL;
 static volatile unsigned int greet_ticket = 0;
@@ -24,7 +26,8 @@ static volatile unsigned int started_cores = 1;
 static unsigned char secondary_stacks[MAX_CORES - 1][SECONDARY_STACK_SIZE] __attribute__((aligned(16)));
 extern void secondary_start(void);
 
-/* Boot-time rdtime probe only: add a little distance between reads so the
+/*
+ * Boot-time rdtime probe only: add a little distance between reads so the
  * monotonic counter is visible on a fast CPU.
  */
 static void timer_probe_delay(unsigned long count)
@@ -40,7 +43,8 @@ static void timer_probe_readout(void)
     uint64_t t2;
     uint64_t t3;
 
-    /* Read the raw time counter a few times to confirm it is increasing
+    /*
+     * Read the raw time counter a few times to confirm it is increasing
      * before building interrupt scheduling on top of it.
      */
     t1 = timer_read();
@@ -60,7 +64,8 @@ static void timer_probe_readout(void)
 
 static void timer_probe_state(void)
 {
-    /* Dump the timer subsystem's initial bookkeeping before interrupts are
+    /*
+     * Dump the timer subsystem's initial bookkeeping before interrupts are
      * wired in so later regressions have a clear baseline.
      */
     uart_send_string("timer state: boot=");
@@ -76,7 +81,8 @@ static void timer_probe_sbi_support(void)
 {
     long supported;
 
-    /* Probe the SBI TIME extension explicitly so we can distinguish
+    /*
+     * Probe the SBI TIME extension explicitly so we can distinguish
      * "deadline math is wrong" from "firmware does not implement TIME".
      */
     supported = sbi_probe_extension(SBI_EXT_TIMER);
@@ -85,7 +91,8 @@ static void timer_probe_sbi_support(void)
     uart_send_string("\n");
 }
 
-static void greet_once(unsigned long core_id) {
+static void greet_once(unsigned long core_id)
+{
     unsigned int my_ticket = __sync_fetch_and_add(&greet_ticket, 1);
     while (greet_serving != my_ticket) {
         asm volatile("nop");
@@ -100,7 +107,8 @@ static void greet_once(unsigned long core_id) {
     __sync_fetch_and_add(&greeted_count, 1);
 }
 
-void secondary_main(unsigned long hartid) {
+void secondary_main(unsigned long hartid)
+{
     greet_once(hartid);
     while (1) {
         asm volatile("wfi");
@@ -108,7 +116,8 @@ void secondary_main(unsigned long hartid) {
 }
 
 void kernel_main(unsigned long hartid, unsigned long dtb_addr,
-                 unsigned long initrd_start_hint, unsigned long initrd_end_hint) {
+                 unsigned long initrd_start_hint, unsigned long initrd_end_hint)
+{
     unsigned int stack_slot = 0;
     unsigned long target_hart;
 
@@ -123,17 +132,17 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
         }        
     }
 
-    if (uart_platform_init_from_fdt((const void *)dtb_addr) != 0) {
+    if (platform_init(hartid, dtb_addr, initrd_start_hint, initrd_end_hint) != 0) {
         while (1) {
             asm volatile("wfi");
         }
     }
 
-    /* Save boot context and resolve the initramfs range before memory init. */
-    shell_set_context(hartid, dtb_addr, (uint64_t)initrd_start_hint, (uint64_t)initrd_end_hint);
-    /* Discover usable RAM, reserve occupied ranges, and build the allocators. */
-    memory_init((const void *)dtb_addr, (uint64_t)initrd_start_hint, (uint64_t)initrd_end_hint);
-    /* Timer interrupts are delivered while the shell is running in S-mode,
+    /* Reserve the same archive range that the shell and loader will use. */
+    memory_init((const void *)dtb_addr, platform_boot_info()->initrd_start,
+                platform_boot_info()->initrd_end);
+    /*
+     * Timer interrupts are delivered while the shell is running in S-mode,
      * so stvec must already point at trap_entry before timeron can be used.
      */
     trap_init();
@@ -174,7 +183,8 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
         }
     }
 
-    /* Print the DT-provided timer frequency after the multi-core greeting
+    /*
+     * Print the DT-provided timer frequency after the multi-core greeting
      * burst settles down so the value is easier to read on the shared UART.
      */
     if (fdt_get_timebase_frequency((const void *)dtb_addr, &g_timebase_freq) == 0) {
@@ -190,11 +200,12 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
     timer_probe_readout();
     timer_probe_sbi_support();
 
-    irq_task_backend_init();
+    deferred_work_init();
 
     /* One SBI timer serves scheduler ticks and queued timeout events. */
     timer_init();
-    /* Arm the UART external-interrupt route during boot so shell I/O can
+    /*
+     * Arm the UART external-interrupt route during boot so shell I/O can
      * transition to the asynchronous path without a manual enable command.
      * uart_recv() still keeps a polling fallback until the first real RX IRQ
      * is observed, which keeps bring-up interactive on real hardware.
@@ -203,14 +214,5 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
     uart_send_string("uart: interrupt-driven I/O armed at boot\n");
 
     /* The primary hart remains in the shell loop for the rest of boot. */
-    {
-        int32_t pid = 1;
-        while (1) {
-            runAShell(pid++);
-        }
-    }
-
-    while (1) {
-        asm volatile("wfi");
-    }
+    shell_run();
 }

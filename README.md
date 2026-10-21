@@ -2,6 +2,47 @@
 
 An educational RV64 kernel for OrangePi RV2, written in C and RISC-V assembly.
 
+## Reading the code
+
+Start at the entry points below. File-local helpers stay `static`; the
+`*_internal.h` headers are shared implementation contracts, not user APIs.
+
+| What to trace | File | Start here |
+| --- | --- | --- |
+| Boot and hardware discovery | `kernel.c`, `platform.c` | `kernel_main()`, `platform_init()` |
+| Kernel console | `shell.c` | `shell_run()` -> `shell_readline()` -> `shell_execute()` |
+| Raw user image loading | `exec.c` | `exec_spawn()`, `exec_load_image()` |
+| Thread creation and lifetime | `thread.c` | `thread_create_kernel()`, `thread_create_user()`, `thread_mark_current_zombie()` |
+| CPU scheduling | `sched.c` | `schedule()`, `thread_consume_resched_request()` |
+| Trap entry, dispatch and return | `trap_entry.S`, `trap.c` | `trap_entry`, `trap_dispatch()`, `trap_return` |
+| User syscalls | `syscall.c` | `handle_user_ecall()` -> `sys_*()` |
+| Deferred work | `deferred_work.c` | `deferred_work_enqueue()`, `deferred_work_add()`, `irq_run_bottom_halves()` |
+| Timer and UART | `timer.c`, `uart.c` | `timer_irq_top()`, `uart_irq_top()` and their callbacks |
+| Physical page allocation | `memory.c` | `memory_init()`, `p_alloc()`, `p_free()` |
+| Byte allocation | `slab.c` | `kmalloc()`, `kfree()` |
+| Tests and event history | `demo.c`, `demo_uart.c`, `trace.c` | `demo_run()`, `trace_dump()` |
+
+```text
+shell / syscall
+    +-- exec.c ----------> thread.c <----> sched.c --> switch_to.S
+    +-- kmalloc/kfree ---> slab.c -------> memory.c (buddy)
+
+trap_entry.S --> trap.c --> timer / PLIC + UART top half
+                           |
+                           v
+                      deferred_work.c --> timer / UART callbacks
+
+platform.c --> configure UART + PLIC; resolve one boot/initramfs description
+irqflags.h --> local SIE save/restore, shared by kernel critical sections
+trace.c    --> event storage; demos read it, drivers do not call demo code
+```
+
+The deferred-work queue holds short callbacks; the scheduler run queue holds
+runnable threads. Timer and UART top halves enqueue persistent work items;
+`deferred_work_add()` queues one-shot custom work, including the `demo tasks`
+ordering test. Local IRQ masking protects both queues on the scheduling hart;
+it is not an SMP lock or kernel-preemption mechanism.
+
 ## Verification
 
 ```sh
@@ -10,11 +51,12 @@ make -C bootloader all
 python3 -B scripts/run_allocator_tests.py
 python3 -B scripts/run_regression_tests.py
 python3 -B scripts/run_system_tests.py
+python3 -B scripts/run_bootloader_tests.py
 ```
 
 The regression runner checks malformed CPIO/DTB inputs with host ASan/UBSan,
 then exercises integer-register trap round trips, scheduler reclamation,
-thread groups, allocation-failure rollback, priority/FIFO ordering, callback
+thread groups, allocation-failure rollback (including partially created kernel demos), priority/FIFO ordering, callback
 non-reentrancy during nested traps, callback-pool exhaustion/reuse, timer
 payload cleanup, and masked UART polling in RV64 QEMU.
 The system runner boots the real QEMU kernel and its separately linked user
@@ -22,7 +64,9 @@ images to test syscalls, faults, fork, same-process user threads, preemption,
 timers, and allocator demos. It also checks real QEMU UART/PLIC interrupts,
 nonblocking timeouts, the two-second timer demo, and all five ecalls in the
 supplied Lab 4 program.
-These checks do not validate OrangePi UART/PLIC wiring or the board upload path.
+The bootloader runner sends a real bundle through QEMU UART, checks the initrd
+hint fallback, and launches a user image from the received archive.
+These checks do not validate OrangePi UART/PLIC wiring or the physical upload path.
 Dependencies: a RISC-V bare-metal toolchain, QEMU, Python 3, a host C compiler,
 `dtc`, `cpio`, and `mkimage` (for the board image).
 
@@ -112,15 +156,17 @@ Section sizes and alignment gaps depend on the linked build. The whole
 Compiler-generated small-data sections are grouped with their corresponding
 data sections in this diagram.
 
-The bootstrap shell later becomes the idle thread and keeps using the boot
-stack. Secondary harts use separate static 4 KiB stacks in `.bss`; they do not
+The first scheduler initialization registers the existing shell flow as the
+bootstrap idle thread (TID 0). It keeps using the boot stack; initialization is
+idempotent and does not reset live tasks or the TID counter. Shell command
+iterations do not create threads or assign process IDs. Secondary harts use separate static 4 KiB stacks in `.bss`; they do not
 participate in the scheduler. Scheduling runs on the bootstrap hart.
 
 #### User image and per-task storage
 
 User programs are linked at `0x32000000`, converted from ELF to raw `.bin`
 files, and packed into initramfs. The
-[`shell loader`](kernel/src/shell.c) copies `bin/<name>.bin` into the fixed
+[`raw-image loader`](kernel/src/exec.c) copies `bin/<name>.bin` into the fixed
 1 MiB window `[0x32000000, 0x32100000)`. The entry address is `0x32000000`;
 the window size is a loading limit, not the size of every program.
 
@@ -155,6 +201,31 @@ data, BSS, heap, or TLS mappings. The shared image window is reserved before
 buddy initialization. The loader rejects image replacement while another live
 user task uses the window; this prevents accidental overwrite, not unauthorized
 access or per-process isolation.
+
+#### Allocator boundary
+
+`memory.c` owns RAM regions, reservations, frame metadata and buddy lists.
+`slab.c` owns size-class caches, slab headers and object freelists. It queries
+page ownership through `memory_internal.h`; it does not modify the buddy's
+private frame array directly.
+
+```text
+p_alloc(pages)  --> buddy block (page count rounded to a power of two)
+
+kmalloc(bytes)
+    +-- 1..2048  --> class 16/32/64/128/256/512/1024/2048
+    |               one 4 KiB page per slab, including header and padding
+    `-- >2048    --> round bytes to pages --> p_alloc()
+
+kfree(ptr)      --> page owner tag --> slab object or large buddy allocation
+p_free(ptr)     --> original buddy allocation head only
+```
+
+The current RV64 slab header is 48 bytes. There is no multi-page slab path;
+large byte requests still work through `kmalloc()`. Each cache retains at most
+one empty slab. Extra empty slabs return to buddy. The double-free check scans
+the object freelist, so the whole `kfree()` path is not constant-time merely
+because list insertion is O(1).
 
 ### Execution Contexts
 
@@ -244,9 +315,12 @@ It is shared by process launch, same-process thread creation, and fork:
 - `tc->sstatus = SSTATUS_SPIE`: initial `SPP = 0`, `SPIE = 1`.
 
 The caller finishes any operation-specific fields before
-`thread_publish_user()` makes the task runnable. A new user thread also gets
+`thread_publish()` makes the task runnable. A new user thread also gets
 its argument in `a0` and a user-space return-to-exit stub in `ra`. Fork instead
 copies the parent's interrupted context and adjusts it to resume after `ecall`.
+
+Assembly offsets live in `context_offsets.h`; `context_layout.c` checks every
+register offset and both structure sizes at build time.
 
 The first switch follows this path without requiring a previous user trap:
 
@@ -300,7 +374,7 @@ file-descriptor table, or pthread implementation.
 
 | Entry point | Identity | Initial execution | User stack |
 | --- | --- | --- | --- |
-| `thread_create_kernel(fn, arg, 0)` | New TID, TGID = TID | Calls `fn(arg)` in S-mode | None |
+| `thread_create_kernel(fn, arg)` | New TID, TGID = TID | Calls `fn(arg)` in S-mode | None |
 | `user_process_create(entry, base, top)` | New TID, TGID = TID | Starts at the loaded image entry in U-mode | Supplied by the kernel caller |
 | `thread_create_user(entry, arg, return_pc)` | New TID, current user's TGID | Starts a new function in U-mode | Newly allocated; not copied |
 | User `fork()` -> `sys_fork(tc)` | New TID, TGID = TID | Continues after the parent's `ecall` | Copied and heuristically rebased |
@@ -324,7 +398,8 @@ Boot -> kernel shell
           |
           | runu threads
           v
-shell_load_user_program_named("threads")
+exec_spawn("threads", 1, &result)
+          | exec_load_image("threads", ...)
           | find bin/threads.bin in initramfs
           | reject replacement if another live user task uses the window
           | copy the image and synchronize instruction fetch
@@ -334,15 +409,15 @@ allocate user stack
 user_process_create(entry, stack_base, stack_top)
           | thread_prepare_user(): allocate task + kernel stack, seed contexts
           | keep TGID = new TID
-          | thread_publish_user(): add the finished task to the run queue
+          | thread_publish(): add the finished task to the run queue
           v
 schedule -> switch_to -> user_task_entry -> trap_return -> sret
           v
 _start in the loaded user program
 ```
 
-`user_process_create()` does not load a binary. The shell performs the load
-first and supplies its entry address and a user stack. This separates
+`user_process_create()` does not load a binary. The shell calls `exec_spawn()`,
+which loads it first and supplies its entry address and a user stack. This separates
 launching the first process from creating a sibling thread. There is no
 permanent user-space init process or user shell at boot.
 
@@ -438,16 +513,28 @@ that thread exits. Syscall buffer checks accept live same-group stacks and
 reject other groups' stacks; direct memory accesses remain unisolated.
 
 ```text
-running/runnable
+NEW (private allocation; not an I/O wait)
+      |
+      | constructor fills entry, stacks and contexts
+      v
+thread_publish() -> RUNNABLE <----> RUNNING
+                                    |
+                                    | yield / timer: return to RUNNABLE
+
+RUNNING / RUNNABLE
       |
       | exit or stop; unlink from run queue if queued
       v
-    zombie
+    ZOMBIE
       |
-      | switch away; idle collects it
+      | another stack reaps it (normally idle; also failed-launch cleanup)
       v
 free user stack (if any) + kernel stack + struct thread
 ```
+
+There is no blocked I/O state or wait queue yet. `NEW` only covers construction;
+it must not be treated as a sleeping task. The shell still doubles as the idle
+fallback, not a separately scheduled user shell.
 
 The shared image window is never freed through `kfree()`. It stays reserved
 and can be reused by the loader once no other live user task needs it.
@@ -530,7 +617,7 @@ trap_dispatch(tc)                  [trap.c]
 Returning handlers
         |
         v
-irq_run_bottom_halves()            [irq_task.c]
+irq_run_bottom_halves()            [deferred_work.c]
         |
         v
 Check origin, task exit and rescheduling
@@ -551,7 +638,7 @@ kernel stack, with hardware interrupts enabled outside protected sections.
 It does not get a worker thread or a separate stack.
 
 ```text
-Outer runner: g_irq_task_running = 1
+Outer runner: g_deferred_work_running = 1
     |
     +-- Run callback A, rank 5
     |     SIE = 1 outside protected critical sections
@@ -565,7 +652,7 @@ Outer runner: g_irq_task_running = 1
     |     |      Queue B's bottom half, rank 1
     |     |      |
     |     |      Call irq_run_bottom_halves()
-    |     |      g_irq_task_running is already 1
+    |     |      g_deferred_work_running is already 1
     |     |      Leave B queued and return
     |     |      |
     |     |      Restore A's context
@@ -582,13 +669,13 @@ Outer runner: g_irq_task_running = 1
     |
     +-- Continue until the queue is empty
     |
-    `-- g_irq_task_running = 0
+    `-- g_deferred_work_running = 0
 
 Priority: 0 is highest, 7 is lowest; equal ranks are FIFO.
 Priority selects the next callback; it does not preempt one.
 ```
 
-[`irq_run_bottom_halves()`](kernel/src/irq_task.c) changes queue links and task
+[`irq_run_bottom_halves()`](kernel/src/deferred_work.c) changes queue links and task
 states with local interrupts disabled. A persistent timer/UART task stays
 `RUNNING` while paused; another enqueue sets `rerun` instead of inserting the
 same object twice. Queue priority and PLIC source priority are separate.
@@ -666,15 +753,15 @@ shown in [first user entry](#first-user-entry-and-register-convention).
 #### Deferred work API
 
 ```c
-int add_task(task_callback_t callback, void *arg, int priority);
+int deferred_work_add(deferred_callback_t callback, void *arg, int priority);
 
 /* Queue two kernel callbacks. The first one has higher priority. */
-add_task(handle_urgent, urgent_request, 1);
-add_task(handle_background, background_request, 6);
+deferred_work_add(handle_urgent, urgent_request, 1);
+deferred_work_add(handle_background, background_request, 6);
 ```
 
-`add_task()` uses a static pool of 32 callback slots. It returns 0 on success
-and -1 for an invalid callback/priority or a full pool. The slot is released
+`deferred_work_add()` uses a static pool of 32 callback slots. It returns 0 on
+success and -1 for an invalid callback/priority or a full pool. The slot is released
 after the callback returns. The argument is borrowed: its owner must keep it
 alive until completion. Callbacks must not sleep, call the thread scheduler,
 or wait for any other deferred callback, even one with higher priority. Keep

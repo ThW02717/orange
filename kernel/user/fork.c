@@ -1,36 +1,7 @@
 #include <stdint.h>
 
-#include "syscall.h"
+#include "user_api.h"
 
-#define DO_SYSCALL0(nr)                                                       \
-    ({                                                                        \
-        register long a0_ asm("a0");                                          \
-        register long a7_ asm("a7") = (nr);                                   \
-        asm volatile("ecall" : "=r"(a0_) : "r"(a7_) : "memory");              \
-        a0_;                                                                   \
-    })
-
-#define DO_SYSCALL1(nr, arg0)                                                 \
-    ({                                                                        \
-        register long a0_ asm("a0") = (arg0);                                 \
-        register long a7_ asm("a7") = (nr);                                   \
-        asm volatile("ecall" : "+r"(a0_) : "r"(a7_) : "memory");              \
-        a0_;                                                                   \
-    })
-
-#define DO_SYSCALL2(nr, arg0, arg1)                                           \
-    ({                                                                        \
-        register long a0_ asm("a0") = (arg0);                                 \
-        register long a1_ asm("a1") = (arg1);                                 \
-        register long a7_ asm("a7") = (nr);                                   \
-        asm volatile("ecall" : "+r"(a0_) : "r"(a1_), "r"(a7_) : "memory");    \
-        a0_;                                                                   \
-    })
-
-static long getpid(void);
-static long fork_proc(void);
-static long uart_write(const char *buf, long count);
-static void exit_proc(int status);
 static long str_len(const char *s);
 static void put_str(const char *s);
 static char *append_str(char *dst, const char *src);
@@ -54,12 +25,12 @@ void fork_main(void)
         put_str(num);
     }
 
-    ret = fork_proc();
+    ret = fork();
     if (ret == 0) {
         print_state("child1", cnt, &cnt);
         cnt++;
 
-        ret = fork_proc();
+        ret = fork();
         if (ret != 0) {
             print_state("child1", cnt, &cnt);
         } else {
@@ -86,13 +57,9 @@ void fork_main(void)
         print_state("parent", cnt, &cnt);
     }
 
-    exit_proc(0);
+    thread_exit(0);
 }
 
-static long getpid(void) { return DO_SYSCALL0(SYS_getpid); }
-static long fork_proc(void) { return DO_SYSCALL0(SYS_fork); }
-static long uart_write(const char *buf, long count) { return DO_SYSCALL2(SYS_uart_write, (long)buf, count); }
-static void exit_proc(int status) { (void)DO_SYSCALL1(SYS_exit, status); for (;;) {} }
 
 static long str_len(const char *s)
 {

@@ -37,7 +37,7 @@ USER_PREEMPT_BIN := $(USER_ROOTFS_DIR)/preempt.bin
 USER_THREADS_SRCS := $(USER_DIR)/threads_start.S $(USER_DIR)/threads.c
 USER_THREADS_ELF := $(USER_BUILD_DIR)/threads.elf
 USER_THREADS_BIN := $(USER_ROOTFS_DIR)/threads.bin
-USER_THREADS_HEADERS := $(USER_DIR)/user_api.h $(INC_DIR)/syscall.h
+USER_API_HEADERS := $(USER_DIR)/user_api.h $(INC_DIR)/syscall.h
 
 C_SRCS    := $(wildcard $(SRC_DIR)/*.c)
 ASM_SRCS  := $(wildcard $(SRC_DIR)/*.S)
@@ -113,13 +113,13 @@ $(USER_PROG_ELF): $(USER_PROG_SRC) | $(USER_BUILD_DIR)
 $(USER_PROG_BIN): $(USER_PROG_ELF) | $(USER_ROOTFS_DIR)
 	$(OBJCOPY) -O binary -S $< $@
 
-$(USER_FORK_ELF): $(USER_FORK_START_SRC) $(USER_FORK_SRC) $(INC_DIR)/syscall.h | $(USER_BUILD_DIR)
+$(USER_FORK_ELF): $(USER_FORK_START_SRC) $(USER_FORK_SRC) $(USER_API_HEADERS) | $(USER_BUILD_DIR)
 	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_FORK_START_SRC) $(USER_FORK_SRC)
 
 $(USER_FORK_BIN): $(USER_FORK_ELF) | $(USER_ROOTFS_DIR)
 	$(OBJCOPY) -O binary -S $< $@
 
-$(USER_PREEMPT_ELF): $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC) $(INC_DIR)/syscall.h | $(USER_BUILD_DIR)
+$(USER_PREEMPT_ELF): $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC) $(USER_API_HEADERS) | $(USER_BUILD_DIR)
 	$(CC) $(BOARD_CFLAGS) -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC)
 
 $(USER_PREEMPT_BIN): $(USER_PREEMPT_ELF) | $(USER_ROOTFS_DIR)
@@ -127,7 +127,7 @@ $(USER_PREEMPT_BIN): $(USER_PREEMPT_ELF) | $(USER_ROOTFS_DIR)
 
 # User tp belongs to the scheduler, not TLS. Avoid gp-relative relaxation;
 # the minimal raw-image entry has no C runtime to initialize gp.
-$(USER_THREADS_ELF): $(USER_THREADS_SRCS) $(USER_THREADS_HEADERS) | $(USER_BUILD_DIR)
+$(USER_THREADS_ELF): $(USER_THREADS_SRCS) $(USER_API_HEADERS) | $(USER_BUILD_DIR)
 	$(CC) $(BOARD_CFLAGS) -msmall-data-limit=0 -mno-relax -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_THREADS_SRCS)
 
 $(USER_THREADS_BIN): $(USER_THREADS_ELF) | $(USER_ROOTFS_DIR)
@@ -138,13 +138,13 @@ $(USER_THREADS_BIN): $(USER_THREADS_ELF) | $(USER_ROOTFS_DIR)
 $(USER_BUILD_DIR)/qemu_%.elf: $(USER_DIR)/%.S $(INC_DIR)/syscall.h | $(USER_BUILD_DIR)
 	$(CC) $(QEMU_CFLAGS) -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $<
 
-$(USER_BUILD_DIR)/qemu_fork.elf: $(USER_FORK_START_SRC) $(USER_FORK_SRC) $(INC_DIR)/syscall.h | $(USER_BUILD_DIR)
+$(USER_BUILD_DIR)/qemu_fork.elf: $(USER_FORK_START_SRC) $(USER_FORK_SRC) $(USER_API_HEADERS) | $(USER_BUILD_DIR)
 	$(CC) $(QEMU_CFLAGS) -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_FORK_START_SRC) $(USER_FORK_SRC)
 
-$(USER_BUILD_DIR)/qemu_preempt.elf: $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC) $(INC_DIR)/syscall.h | $(USER_BUILD_DIR)
+$(USER_BUILD_DIR)/qemu_preempt.elf: $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC) $(USER_API_HEADERS) | $(USER_BUILD_DIR)
 	$(CC) $(QEMU_CFLAGS) -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC)
 
-$(USER_BUILD_DIR)/qemu_threads.elf: $(USER_THREADS_SRCS) $(USER_THREADS_HEADERS) | $(USER_BUILD_DIR)
+$(USER_BUILD_DIR)/qemu_threads.elf: $(USER_THREADS_SRCS) $(USER_API_HEADERS) | $(USER_BUILD_DIR)
 	$(CC) $(QEMU_CFLAGS) -msmall-data-limit=0 -mno-relax -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_THREADS_SRCS)
 
 $(USER_BUILD_DIR)/qemu_%.bin: $(USER_BUILD_DIR)/qemu_%.elf

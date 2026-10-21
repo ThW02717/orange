@@ -1,11 +1,16 @@
+/*
+ * UART byte I/O and bounded IRQ work. Start at uart_send()/uart_recv()
+ * or uart_irq_top(); RX/TX callbacks drain the rings. Demo payloads live elsewhere.
+ */
+#include "irqflags.h"
 #include "uart.h"
-#include "demo.h"
-#include "fdt.h"
+#include "uart_regs.h"
+#include "trace.h"
 #include "ringbuf.h"
 #include "trap.h"
 #include "plic.h"
 #include "utils.h"
-#include "irq_task.h"
+#include "deferred_work.h"
 #include "memory.h"
 
 static struct ringbuf g_uart_rx_buf;
@@ -13,12 +18,6 @@ static struct ringbuf g_uart_tx_buf;
 static uintptr_t g_uart_mmio_base =
 #ifdef QEMU
     0x10000000UL;
-#else
-    0UL;
-#endif
-static uintptr_t g_plic_mmio_base =
-#ifdef QEMU
-    0x0c000000UL;
 #else
     0UL;
 #endif
@@ -30,70 +29,31 @@ static volatile unsigned long g_uart_rx_irq_count = 0;
 static volatile unsigned long g_uart_tx_irq_count = 0;
 static volatile unsigned long g_uart_rx_fallback_count = 0;
 static volatile unsigned long g_uart_tx_poll_count = 0;
-static uint64_t g_uart_stress_next = 0;
-static uint64_t g_uart_stress_remaining = 0;
-static unsigned long g_uart_timer_marker_ids[16];
-static unsigned int g_uart_timer_marker_head = 0U;
-static unsigned int g_uart_timer_marker_tail = 0U;
-static struct irq_task g_uart_rx_task = {
-    .type = IRQ_TASK_UART_RX,
+static void (*g_uart_tx_refill)(void);
+
+static int uart_rx_work_run(struct deferred_work *task);
+static int uart_tx_work_run(struct deferred_work *task);
+
+static struct deferred_work g_uart_rx_work = {
+    .type = DEFERRED_WORK_UART_RX,
     .prio = 0,
-    .state = IRQ_TASK_IDLE,
+    .state = DEFERRED_WORK_IDLE,
     .next = 0,
-    .run = uart_rx_task_run,
+    .run = uart_rx_work_run,
 };
-static struct irq_task g_uart_tx_task = {
-    .type = IRQ_TASK_UART_TX,
+static struct deferred_work g_uart_tx_work = {
+    .type = DEFERRED_WORK_UART_TX,
     .prio = 0,
-    .state = IRQ_TASK_IDLE,
+    .state = DEFERRED_WORK_IDLE,
     .next = 0,
-    .run = uart_tx_task_run,
+    .run = uart_tx_work_run,
 };
 
-#define UART_IRQ_TASK_BUDGET 16U
-#define UART_STRESS_CHUNK_UNITS 64U
-
-int uart_platform_init_from_fdt(const void *fdt)
-{
-    int uart_node;
-    int plic_node;
-    uint64_t uart_base;
-    uint64_t plic_base;
-    uint32_t irq;
-
-    if (fdt == 0) {
-        return -1;
-    }
-
-#ifdef QEMU
-    uart_node = fdt_find_compatible(fdt, "ns16550a");
-#else
-    uart_node = fdt_find_compatible(fdt, "ky,pxa-uart");
-#endif
-    plic_node = fdt_find_compatible(fdt, "riscv,plic0");
-    if (uart_node < 0 || plic_node < 0) {
-        return -1;
-    }
-    if (fdt_get_reg_base(fdt, uart_node, &uart_base) != 0 ||
-        fdt_get_interrupt_id(fdt, uart_node, &irq) != 0 ||
-        fdt_get_reg_base(fdt, plic_node, &plic_base) != 0) {
-        return -1;
-    }
-
-    g_uart_mmio_base = (uintptr_t)uart_base;
-    g_uart_irq_id = irq;
-    g_plic_mmio_base = (uintptr_t)plic_base;
-    return 0;
-}
+#define UART_DEFERRED_WORK_BUDGET 16U
 
 uintptr_t uart_mmio_base(void)
 {
     return g_uart_mmio_base;
-}
-
-uintptr_t plic_mmio_base(void)
-{
-    return g_plic_mmio_base;
 }
 
 uint32_t uart_irq_id(void)
@@ -101,7 +61,8 @@ uint32_t uart_irq_id(void)
     return g_uart_irq_id;
 }
 
-/* Read or write one UART MMIO register.
+/*
+ * Read or write one UART MMIO register.
  * OrangePi RV2 exposes 32-bit MMIO registers, while QEMU uses byte access.
  */
 static inline uint32_t uart_reg_read(uintptr_t reg)
@@ -122,57 +83,36 @@ static inline void uart_reg_write(uintptr_t reg, uint32_t value)
 #endif
 }
 
-static inline uint64_t uart_irq_save(void)
-{
-    uint64_t sstatus;
-
-    asm volatile("csrrc %0, sstatus, %1" : "=r"(sstatus) : "r"(SSTATUS_SIE) : "memory");
-    return sstatus;
-}
-
-static inline void uart_irq_restore(uint64_t sstatus)
-{
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus) : "memory");
-}
-
-static inline int uart_global_irqs_enabled(void)
-{
-    uint64_t sstatus;
-
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    return (sstatus & SSTATUS_SIE) != 0U;
-}
-
 static void uart_ier_set_bits(uint32_t bits)
 {
-    uint64_t status = uart_irq_save();
+    uint64_t status = local_irq_save();
     uart_reg_write(UART_IER_REG, uart_reg_read(UART_IER_REG) | bits);
-    uart_irq_restore(status);
+    local_irq_restore(status);
 }
 
 static void uart_ier_clear_bits(uint32_t bits)
 {
-    uint64_t status = uart_irq_save();
+    uint64_t status = local_irq_save();
     uart_reg_write(UART_IER_REG, uart_reg_read(UART_IER_REG) & ~bits);
-    uart_irq_restore(status);
+    local_irq_restore(status);
 }
 
-void uart_rx_mask(void)
+static void uart_rx_mask(void)
 {
     uart_ier_clear_bits(UART_IER_RX_ENABLE | UART_IER_LINE_ENABLE | UART_IER_RTO_ENABLE);
 }
 
-void uart_rx_unmask(void)
+static void uart_rx_unmask(void)
 {
     uart_ier_set_bits(UART_IER_RX_ENABLE | UART_IER_LINE_ENABLE | UART_IER_RTO_ENABLE);
 }
 
-void uart_tx_mask(void)
+static void uart_tx_mask(void)
 {
     uart_ier_clear_bits(UART_IER_TX_ENABLE);
 }
 
-void uart_tx_unmask(void)
+static void uart_tx_unmask(void)
 {
     uart_ier_set_bits(UART_IER_TX_ENABLE);
 }
@@ -195,7 +135,8 @@ static int uart_tx_ready_from_status(uint32_t status)
     return ((status & LSR_TX_IDLE) != 0U) && ((ier & UART_IER_TX_ENABLE) != 0U);
 }
 
-/* RX/TX ring buffers are shared between interrupt context and normal shell
+/*
+ * RX/TX ring buffers are shared between interrupt context and normal shell
  * code. Keep every head/tail/count update inside a tiny local critical
  * section so concurrent push/pop pairs cannot corrupt the FIFO state.
  */
@@ -204,9 +145,9 @@ static int uart_rx_push_char(char c)
     uint64_t sstatus;
     int ret;
 
-    sstatus = uart_irq_save();
+    sstatus = local_irq_save();
     ret = ringbuf_push(&g_uart_rx_buf, c);
-    uart_irq_restore(sstatus);
+    local_irq_restore(sstatus);
     return ret;
 }
 
@@ -215,9 +156,9 @@ static int uart_rx_pop_char(char *out)
     uint64_t sstatus;
     int ret;
 
-    sstatus = uart_irq_save();
+    sstatus = local_irq_save();
     ret = ringbuf_pop(&g_uart_rx_buf, out);
-    uart_irq_restore(sstatus);
+    local_irq_restore(sstatus);
     return ret;
 }
 
@@ -226,9 +167,9 @@ static int uart_tx_push_char(char c)
     uint64_t sstatus;
     int ret;
 
-    sstatus = uart_irq_save();
+    sstatus = local_irq_save();
     ret = ringbuf_push(&g_uart_tx_buf, c);
-    uart_irq_restore(sstatus);
+    local_irq_restore(sstatus);
     return ret;
 }
 
@@ -237,20 +178,9 @@ static int uart_tx_pop_char(char *out)
     uint64_t sstatus;
     int ret;
 
-    sstatus = uart_irq_save();
+    sstatus = local_irq_save();
     ret = ringbuf_pop(&g_uart_tx_buf, out);
-    uart_irq_restore(sstatus);
-    return ret;
-}
-
-static int uart_tx_buf_is_full(void)
-{
-    uint64_t sstatus;
-    int ret;
-
-    sstatus = uart_irq_save();
-    ret = ringbuf_is_full(&g_uart_tx_buf);
-    uart_irq_restore(sstatus);
+    local_irq_restore(sstatus);
     return ret;
 }
 
@@ -259,9 +189,9 @@ static int uart_tx_buf_is_empty(void)
     uint64_t sstatus;
     int ret;
 
-    sstatus = uart_irq_save();
+    sstatus = local_irq_save();
     ret = ringbuf_is_empty(&g_uart_tx_buf);
-    uart_irq_restore(sstatus);
+    local_irq_restore(sstatus);
     return ret;
 }
 
@@ -283,190 +213,32 @@ void uart_tx_wait_idle(void)
 static int uart_tx_try_drain_one(void)
 {
     char c;
-    uint64_t status = uart_irq_save();
+    uint64_t status = local_irq_save();
 
     /* Only feed THR when the transmitter can accept a new byte. */
     if ((uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) == 0U) {
-        uart_irq_restore(status);
+        local_irq_restore(status);
         return 0;
     }
 
     if (uart_tx_pop_char(&c) != 0) {
-        uart_irq_restore(status);
+        local_irq_restore(status);
         return 0;
     }
 
-    /* THR is the transmit holding register: writing one byte starts the next
+    /*
+     * THR is the transmit holding register: writing one byte starts the next
      * piece of serial output.
      */
     uart_reg_write(UART_THR_REG, (uint32_t)(uint8_t)c);
-    uart_irq_restore(status);
+    local_irq_restore(status);
     return 1;
-}
-
-static unsigned int uart_tx_queue_chars(const char *s, unsigned int len)
-{
-    unsigned int i = 0;
-
-    while (i < len && !uart_tx_buf_is_full()) {
-        (void)uart_tx_push_char(s[i]);
-        i++;
-    }
-    return i;
-}
-
-static unsigned int uart_tx_queue_stress_marker(void)
-{
-    char buf[32];
-    unsigned int len = 0;
-    uint64_t value;
-    char rev[24];
-    unsigned int rev_len = 0;
-    unsigned int i;
-    uint64_t marker;
-
-    if (g_uart_stress_remaining == 0U) {
-        return 0;
-    }
-
-    marker = g_uart_stress_next;
-
-    buf[len++] = '[';
-    buf[len++] = 'U';
-
-    value = marker;
-    if (value == 0U) {
-        rev[rev_len++] = '0';
-    } else {
-        while (value > 0U && rev_len < sizeof(rev)) {
-            rev[rev_len++] = (char)('0' + (value % 10U));
-            value /= 10U;
-        }
-    }
-
-    for (i = 0; i < rev_len; i++) {
-        buf[len++] = rev[rev_len - 1U - i];
-    }
-
-    buf[len++] = ']';
-    if (((marker + 1U) % 8U) == 0U) {
-        buf[len++] = '\r';
-        buf[len++] = '\n';
-    } else {
-        buf[len++] = ' ';
-    }
-
-    if (uart_tx_buf_is_full()) {
-        return 0;
-    }
-    if ((RINGBUF_CAPACITY - g_uart_tx_buf.count) < len) {
-        return 0;
-    }
-
-    (void)uart_tx_queue_chars(buf, len);
-    g_uart_stress_next++;
-    g_uart_stress_remaining--;
-    return 1;
-}
-
-static int uart_timer_marker_pending(void)
-{
-    return g_uart_timer_marker_head != g_uart_timer_marker_tail;
-}
-
-static int uart_queue_timer_marker(unsigned long id)
-{
-    unsigned int next_tail;
-    unsigned int capacity = (unsigned int)(sizeof(g_uart_timer_marker_ids) /
-                                           sizeof(g_uart_timer_marker_ids[0]));
-
-    next_tail = (g_uart_timer_marker_tail + 1U) % capacity;
-    if (next_tail == g_uart_timer_marker_head) {
-        return -1;
-    }
-
-    g_uart_timer_marker_ids[g_uart_timer_marker_tail] = id;
-    g_uart_timer_marker_tail = next_tail;
-    return 0;
-}
-
-static int uart_tx_queue_pending_timer_marker(void)
-{
-    char buf[32];
-    char rev[24];
-    unsigned int len = 0;
-    unsigned int rev_len = 0;
-    unsigned int i;
-    unsigned int capacity = (unsigned int)(sizeof(g_uart_timer_marker_ids) /
-                                           sizeof(g_uart_timer_marker_ids[0]));
-    unsigned long id;
-    unsigned long value;
-
-    if (!uart_timer_marker_pending()) {
-        return 0;
-    }
-
-    id = g_uart_timer_marker_ids[g_uart_timer_marker_head];
-
-    buf[len++] = '\r';
-    buf[len++] = '\n';
-    buf[len++] = '[';
-    buf[len++] = 'T';
-
-    value = id;
-    if (value == 0UL) {
-        rev[rev_len++] = '0';
-    } else {
-        while (value > 0UL && rev_len < sizeof(rev)) {
-            rev[rev_len++] = (char)('0' + (value % 10UL));
-            value /= 10UL;
-        }
-    }
-
-    for (i = 0; i < rev_len; i++) {
-        buf[len++] = rev[rev_len - 1U - i];
-    }
-
-    buf[len++] = ']';
-    buf[len++] = '\r';
-    buf[len++] = '\n';
-
-    if ((RINGBUF_CAPACITY - g_uart_tx_buf.count) < len) {
-        return 0;
-    }
-
-    (void)uart_tx_queue_chars(buf, len);
-    g_uart_timer_marker_head = (g_uart_timer_marker_head + 1U) % capacity;
-    return 1;
-}
-
-static void uart_tx_fill_stress_markers(unsigned int budget_markers)
-{
-    /* A timer callback may also fill this queue while TX work is paused.
-     * Reserve space, append the marker, and advance its ID together.
-     */
-    uint64_t status = uart_irq_save();
-    while (budget_markers > 0U) {
-        if (uart_timer_marker_pending()) {
-            if (uart_tx_queue_pending_timer_marker() == 0U) {
-                break;
-            }
-            continue;
-        }
-        if (g_uart_stress_remaining == 0U) {
-            break;
-        }
-        if (uart_tx_queue_stress_marker() == 0U) {
-            break;
-        }
-        budget_markers--;
-    }
-    uart_irq_restore(status);
 }
 
 static void uart_tx_kick(void)
 {
-    /* TX interrupts stay disabled while the queue is empty. Once new data is
+    /*
+     * TX interrupts stay disabled while the queue is empty. Once new data is
      * queued, enable TX-ready interrupts and opportunistically push one byte
      * so the hardware pipeline starts moving immediately.
      */
@@ -476,7 +248,8 @@ static void uart_tx_kick(void)
 
 static void uart_irq_ack_stale_status(void)
 {
-    /* Boot ROM / firmware may leave old UART status pending. Read the common
+    /*
+     * Boot ROM / firmware may leave old UART status pending. Read the common
      * status registers once so interrupt-driven I/O starts from a clean slate.
      */
     (void)uart_reg_read(UART_LSR_REG);
@@ -485,7 +258,8 @@ static void uart_irq_ack_stale_status(void)
     (void)uart_reg_read(UART_MSR_REG);
 }
 
-/* Drop any software-side backlog from a previous demo run and drain stale
+/*
+ * Drop any software-side backlog from a previous demo run and drain stale
  * hardware RX state before re-arming the interrupt-driven console path.
  */
 static void uart_reset_runtime_state(void)
@@ -494,16 +268,13 @@ static void uart_reset_runtime_state(void)
     ringbuf_init(&g_uart_tx_buf);
 
     g_uart_async_ready = 0;
-    g_uart_rx_task.state = IRQ_TASK_IDLE;
-    g_uart_rx_task.next = 0;
-    g_uart_tx_task.state = IRQ_TASK_IDLE;
-    g_uart_tx_task.next = 0;
-    g_uart_stress_next = 0;
-    g_uart_stress_remaining = 0;
-    g_uart_timer_marker_head = 0U;
-    g_uart_timer_marker_tail = 0U;
+    g_uart_rx_work.state = DEFERRED_WORK_IDLE;
+    g_uart_rx_work.next = 0;
+    g_uart_tx_work.state = DEFERRED_WORK_IDLE;
+    g_uart_tx_work.next = 0;
+    g_uart_tx_refill = 0;
 
-    uart_demo_reset_stats();
+    uart_reset_stats();
 }
 
 static void uart_flush_hardware_rx_fifo(void)
@@ -533,7 +304,8 @@ void uart_init(void)
 
 void uart_irq_init(void)
 {
-    /* Start from a clean console state every boot/load so an earlier stress
+    /*
+     * Start from a clean console state every boot/load so an earlier stress
      * run cannot leave backlog in the software rings or deferred-task state.
      */
     uart_reset_runtime_state();
@@ -543,7 +315,8 @@ void uart_irq_init(void)
     plic_enable_irq(uart_irq_id());
     plic_set_threshold(0U);
 
-    /* This UART block is DT-compatible with pxa-uart. Besides the basic RX
+    /*
+     * This UART block is DT-compatible with pxa-uart. Besides the basic RX
      * enable bit, it also needs:
      * - FIFO enabled and cleared,
      * - OUT2 asserted so the IRQ output line is driven,
@@ -568,18 +341,20 @@ void uart_irq_init(void)
     /* Finally allow supervisor external interrupts to reach trap_entry. */
     g_uart_irq_enabled = 1;
     asm volatile("csrs sie, %0" : : "r"(SIE_SEIE) : "memory");
-    asm volatile("csrs sstatus, %0" : : "r"(SSTATUS_SIE) : "memory");
+    local_irq_enable();
 }
 
 void uart_send(char c)
 {
-    /* Once the first real UART IRQ is observed, all output is queued and
+    /*
+     * Once the first real UART IRQ is observed, all output is queued and
      * drained by TX-ready interrupts.
      */
     if (g_uart_async_ready) {
-        if (uart_global_irqs_enabled()) {
+        if (local_irqs_enabled()) {
             while (uart_tx_push_char(c) != 0) {
-                /* A deferred callback may be the current producer. It cannot
+                /*
+                 * A deferred callback may be the current producer. It cannot
                  * wait for its own runner to return and service TX work.
                  */
                 (void)uart_tx_try_drain_one();
@@ -588,7 +363,8 @@ void uart_send(char c)
             return;
         }
 
-        /* Preserve FIFO order before IRQ-off direct output. Otherwise newer
+        /*
+         * Preserve FIFO order before IRQ-off direct output. Otherwise newer
          * syscall/log bytes would overtake text already queued by the shell.
          */
         while (!uart_tx_buf_is_empty()) {
@@ -596,7 +372,8 @@ void uart_send(char c)
         }
     }
 
-    /* Early boot fallback: keep console output alive until the first real
+    /*
+     * Early boot fallback: keep console output alive until the first real
      * UART interrupt proves that the asynchronous path is active.
      */
     while ((uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) == 0U) {
@@ -607,10 +384,11 @@ void uart_send(char c)
 
 char uart_recv(void)
 {
-    /* Once IRQ delivery is confirmed, input is consumed purely from the RX
+    /*
+     * Once IRQ delivery is confirmed, input is consumed purely from the RX
      * ring buffer that the ISR fills.
      */
-    if (g_uart_async_ready && uart_global_irqs_enabled()) {
+    if (g_uart_async_ready && local_irqs_enabled()) {
         char c;
 
         while (1) {
@@ -620,7 +398,8 @@ char uart_recv(void)
         }
     }
 
-    /* Syscalls enter with SIE clear. Consume buffered input first, then poll
+    /*
+     * Syscalls enter with SIE clear. Consume buffered input first, then poll
      * hardware instead of waiting for an RX bottom half that cannot run.
      */
     {
@@ -630,11 +409,12 @@ char uart_recv(void)
         }
     }
 
-    /* Bring-up fallback: briefly wait for an RX IRQ before polling the UART
+    /*
+     * Bring-up fallback: briefly wait for an RX IRQ before polling the UART
      * directly. This keeps the shell usable even if the interrupt route is
      * not live yet during early boot.
      */
-    if (g_uart_irq_enabled && uart_global_irqs_enabled()) {
+    if (g_uart_irq_enabled && local_irqs_enabled()) {
         unsigned long wait = 500000UL;
         char c;
 
@@ -711,26 +491,26 @@ void uart_irq_top(void)
     }
 
     if (uart_rx_ready_from_status(status)) {
-        demo_trace_record(DEMO_TRACE_UART_TOP_RX, 0U);
+        trace_record(TRACE_UART_TOP_RX, 0U);
         uart_rx_mask();
         /* Preserve a bounded batch before deferring the remaining RX work. */
-        uart_rx_drain(UART_IRQ_TASK_BUDGET);
-        (void)irq_task_enqueue(&g_uart_rx_task);
+        uart_rx_drain(UART_DEFERRED_WORK_BUDGET);
+        (void)deferred_work_enqueue(&g_uart_rx_work);
     }
 
     if (uart_tx_ready_from_status(status)) {
-        demo_trace_record(DEMO_TRACE_UART_TOP_TX, (uint32_t)uart_stress_progress());
+        trace_record(TRACE_UART_TOP_TX, (uint32_t)g_uart_tx_buf.count);
         uart_tx_mask();
-        (void)irq_task_enqueue(&g_uart_tx_task);
+        (void)deferred_work_enqueue(&g_uart_tx_work);
     }
 }
 
-int uart_rx_task_run(struct irq_task *task)
+static int uart_rx_work_run(struct deferred_work *task)
 {
-    unsigned int budget = UART_IRQ_TASK_BUDGET;
+    unsigned int budget = UART_DEFERRED_WORK_BUDGET;
 
     (void)task;
-    demo_trace_record(DEMO_TRACE_UART_RX_BOTTOM, budget);
+    trace_record(TRACE_UART_RX_BOTTOM, budget);
 
     uart_rx_drain(budget);
 
@@ -742,131 +522,52 @@ int uart_rx_task_run(struct irq_task *task)
     return 0;
 }
 
-int uart_tx_task_run(struct irq_task *task)
+static int uart_tx_work_run(struct deferred_work *task)
 {
-    unsigned int budget = UART_IRQ_TASK_BUDGET;
+    unsigned int budget = UART_DEFERRED_WORK_BUDGET;
 
     (void)task;
-    demo_trace_record(DEMO_TRACE_UART_TX_BOTTOM, (uint32_t)uart_stress_progress());
-
-    if (uart_tx_buf_is_empty() && g_uart_stress_remaining != 0U) {
-        uart_tx_fill_stress_markers(UART_IRQ_TASK_BUDGET);
+    trace_record(TRACE_UART_TX_BOTTOM, g_uart_tx_buf.count);
+    if (uart_tx_buf_is_empty() && g_uart_tx_refill != 0) {
+        g_uart_tx_refill();
     }
-
     while (budget > 0U && uart_tx_try_drain_one()) {
         g_uart_tx_irq_count++;
         budget--;
     }
-
-    if (uart_tx_buf_is_empty() && g_uart_stress_remaining != 0U) {
-        uart_tx_fill_stress_markers(UART_IRQ_TASK_BUDGET);
+    if (uart_tx_buf_is_empty() && g_uart_tx_refill != 0) {
+        g_uart_tx_refill();
     }
-
-    if (!uart_tx_buf_is_empty() || g_uart_stress_remaining != 0U ||
-        uart_timer_marker_pending()) {
+    if (!uart_tx_buf_is_empty()) {
         uart_tx_unmask();
-        return 1;
+        /* Wait for TX-ready rather than spinning the runner on a busy device. */
+        return (uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) != 0;
     }
-
     uart_tx_mask();
     return 0;
 }
 
-void uart_irq_isr(void)
-{
-    uart_irq_top();
-}
-
-int uart_stress_start(uint64_t count)
-{
-    uint64_t sstatus;
-
-    if (count == 0U || g_uart_irq_enabled == 0) {
-        return -1;
-    }
-
-    sstatus = uart_irq_save();
-    if (g_uart_stress_remaining != 0U) {
-        uart_irq_restore(sstatus);
-        return -1;
-    }
-    g_uart_stress_next = 0;
-    g_uart_stress_remaining = count;
-    g_uart_timer_marker_head = 0U;
-    g_uart_timer_marker_tail = 0U;
-    uart_tx_fill_stress_markers(UART_IRQ_TASK_BUDGET);
-    uart_irq_restore(sstatus);
-
-    uart_tx_kick();
-    return 0;
-}
-
-uint64_t uart_stress_progress(void)
-{
-    uint64_t sstatus;
-    uint64_t progress;
-
-    sstatus = uart_irq_save();
-    progress = g_uart_stress_next;
-    uart_irq_restore(sstatus);
-    return progress;
-}
-
-int uart_stress_active(void)
-{
-    uint64_t sstatus;
-    int active;
-
-    sstatus = uart_irq_save();
-    active = (g_uart_stress_remaining != 0U) ||
-             uart_timer_marker_pending();
-    uart_irq_restore(sstatus);
-    return active;
-}
-
-int uart_stress_note_timer(unsigned long id)
-{
-    uint64_t sstatus;
-    int ret;
-
-    sstatus = uart_irq_save();
-    if (g_uart_stress_remaining == 0U && !uart_timer_marker_pending()) {
-        uart_irq_restore(sstatus);
-        return -1;
-    }
-    ret = uart_queue_timer_marker(id);
-    if (ret == 0) {
-        uart_tx_fill_stress_markers(UART_IRQ_TASK_BUDGET);
-    }
-    uart_irq_restore(sstatus);
-
-    if (ret == 0) {
-        uart_tx_kick();
-    }
-    return ret;
-}
-
-void uart_demo_note_external_irq(uint32_t irq)
+void uart_note_external_irq(uint32_t irq)
 {
     if (irq == uart_irq_id()) {
         g_uart_ext_irq_count++;
     }
 }
 
-void uart_demo_reset_stats(void)
+void uart_reset_stats(void)
 {
     uint64_t sstatus;
 
-    sstatus = uart_irq_save();
+    sstatus = local_irq_save();
     g_uart_ext_irq_count = 0;
     g_uart_rx_irq_count = 0;
     g_uart_tx_irq_count = 0;
     g_uart_rx_fallback_count = 0;
     g_uart_tx_poll_count = 0;
-    uart_irq_restore(sstatus);
+    local_irq_restore(sstatus);
 }
 
-void uart_demo_get_stats(struct uart_demo_stats *stats)
+void uart_get_stats(struct uart_stats *stats)
 {
     if (stats == 0) {
         return;
@@ -880,9 +581,55 @@ void uart_demo_get_stats(struct uart_demo_stats *stats)
     stats->tx_poll_count = g_uart_tx_poll_count;
 }
 
-/* Compatibility wrappers */
-void uart_putc(char c) { uart_send(c); }
-void uart_puts(const char *s) { uart_send_string(s); }
-char uart_getc(void) { return uart_recv(); }
-void uart_hex(unsigned long value) { uart_send_hex(value); }
-void uart_dec(unsigned long value) { uart_send_dec(value); }
+void uart_set_platform(uintptr_t base, uint32_t irq)
+{
+    g_uart_mmio_base = base;
+    g_uart_irq_id = irq;
+}
+
+/* Queue the whole buffer or return -1. Never wait for room in the TX ring. */
+int uart_write_async(const char *buf, unsigned int size)
+{
+    uint64_t status = local_irq_save();
+
+    if (buf == 0 || !g_uart_irq_enabled || size > RINGBUF_CAPACITY - g_uart_tx_buf.count) {
+        local_irq_restore(status);
+        return -1;
+    }
+    for (unsigned int i = 0; i < size; i++) {
+        ringbuf_push(&g_uart_tx_buf, buf[i]);
+    }
+    if (size != 0) {
+        uart_tx_kick();
+    }
+    local_irq_restore(status);
+    return 0;
+}
+
+/* One streaming producer may refill an empty TX ring from the bottom half. */
+int uart_tx_set_refill(void (*refill)(void))
+{
+    uint64_t status = local_irq_save();
+
+    if (refill != 0 && (!g_uart_irq_enabled ||
+        (g_uart_tx_refill != 0 && g_uart_tx_refill != refill))) {
+        local_irq_restore(status);
+        return -1;
+    }
+    g_uart_tx_refill = refill;
+    local_irq_restore(status);
+    return 0;
+}
+
+#ifdef KERNEL_TEST
+void uart_test_async(int enabled)
+{
+    g_uart_async_ready = enabled;
+    g_uart_irq_enabled = enabled;
+}
+
+unsigned int uart_test_tx_count(void)
+{
+    return g_uart_tx_buf.count;
+}
+#endif

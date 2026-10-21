@@ -1,3 +1,12 @@
+/*
+ * Kernel console: shell_run() -> shell_readline() -> shell_execute().
+ * Commands use kernel APIs directly. exec.c owns user-image loading.
+ */
+#include "demo_uart.h"
+#include "platform.h"
+#include "exec.h"
+#include "sched.h"
+#include "user_layout.h"
 #include <stdint.h>
 #include "shell.h"
 #include "uart.h"
@@ -14,80 +23,24 @@
 #include "user.h"
 
 /* Interactive UART shell with initramfs-backed file commands and user-program launch. */
-/* Shell-global boot context and initramfs location discovered during startup. */
-static unsigned long g_hartid = 0;
-static unsigned long g_dtb = 0;
-static uint64_t g_initrd_start = 0;
-static uint64_t g_initrd_end = 0;
-static uint64_t g_initrd_hint_start = 0;
-static uint64_t g_initrd_hint_end = 0;
 
 #define CPIO_MODE_TYPE_MASK 0170000U
 #define CPIO_MODE_REGULAR   0100000U
 
-/* Timer callbacks may print while the REPL is blocked in uart_recv(), so keep
+/*
+ * Timer callbacks may print while the REPL is blocked in uart_recv(), so keep
  * the prompt string in one place and redraw it after asynchronous messages.
  */
 static const char g_shell_prompt[] = "> ";
 
-/* Validate fallback initrd hints before using them in place of DT-provided data. */
-static int initrd_hint_valid(uint64_t start, uint64_t end) {
-    if (start == 0 || end <= start) {
-        return 0;
-    }
-    if ((end - start) > (256UL * 1024UL * 1024UL)) {
-        return 0;
-    }
-    return 1;
-}
-
-/* Record shell-visible boot context and resolve the initramfs address range once. */
-void shell_set_context(unsigned long hartid, unsigned long dtb_addr,
-                       uint64_t initrd_start_hint, uint64_t initrd_end_hint) {
-    g_hartid = hartid;
-    g_dtb = dtb_addr;
-    g_initrd_hint_start = initrd_start_hint;
-    g_initrd_hint_end = initrd_end_hint;
-    g_initrd_start = 0;
-    g_initrd_end = 0;
-    if (g_dtb != 0) {
-        if (fdt_get_initrd_range((const void *)g_dtb, &g_initrd_start, &g_initrd_end) != 0) {
-            g_initrd_start = 0;
-            g_initrd_end = 0;
-        }
-    }
-    if ((g_initrd_start == 0 || g_initrd_end <= g_initrd_start) &&
-        initrd_hint_valid(g_initrd_hint_start, g_initrd_hint_end)) {
-        g_initrd_start = g_initrd_hint_start;
-        g_initrd_end = g_initrd_hint_end;
-    }
-}
-
 /* Small local helpers used by the shell parser and loader commands. */
-static int is_space(char c) {
+static int is_space(char c)
+{
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
-static unsigned int str_len(const char *s) {
-    unsigned int n = 0;
-    while (s[n] != '\0') {
-        n++;
-    }
-    return n;
-}
-
-static int streq(const char *a, const char *b) {
-    while (*a != '\0' && *b != '\0') {
-        if (*a != *b) {
-            return 0;
-        }
-        a++;
-        b++;
-    }
-    return *a == *b;
-}
-
-/* Parse decimal seconds into timer ticks using fixed-point arithmetic.
+/*
+ * Parse decimal seconds into timer ticks using fixed-point arithmetic.
  * Accepts forms like "1", "1.5", and "0.125" without pulling in libgcc
  * floating-point helpers in the freestanding kernel build.
  */
@@ -149,94 +102,9 @@ static int parse_seconds_to_ticks(const char *s, uint64_t *ticks_out, uint64_t *
     return 0;
 }
 
-/* Minimal memcpy replacement for the freestanding kernel build. */
-static void copy_bytes(void *dst, const void *src, unsigned long size) {
-    unsigned long i;
-    uint8_t *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
-
-    for (i = 0; i < size; i++) {
-        d[i] = s[i];
-    }
-}
-
-/* Build the initramfs path used by runu: bin/<name>.bin. */
-static int build_user_program_path(const char *name, char *out, unsigned int out_size) {
-    static const char prefix[] = "bin/";
-    static const char suffix[] = ".bin";
-    unsigned int pos = 0;
-    unsigned int i = 0;
-
-    if (name == 0 || out == 0 || out_size == 0) {
-        return -1;
-    }
-
-    while (prefix[i] != '\0') {
-        if (pos + 1 >= out_size) {
-            return -1;
-        }
-        out[pos++] = prefix[i++];
-    }
-
-    i = 0;
-    while (name[i] != '\0') {
-        if (pos + 1 >= out_size) {
-            return -1;
-        }
-        out[pos++] = name[i++];
-    }
-
-    i = 0;
-    while (suffix[i] != '\0') {
-        if (pos + 1 >= out_size) {
-            return -1;
-        }
-        out[pos++] = suffix[i++];
-    }
-
-    out[pos] = '\0';
-    return 0;
-}
-
-int shell_load_user_program_named(const char *name, uintptr_t *entry_out, unsigned long *size_out)
-{
-    const void *data;
-    unsigned long size;
-    unsigned int mode;
-    char path[64];
-
-    if (name == 0 || entry_out == 0 || size_out == 0) {
-        return -1;
-    }
-    if (g_initrd_start == 0 || g_initrd_end <= g_initrd_start) {
-        return -1;
-    }
-    if (build_user_program_path(name, path, sizeof(path)) != 0) {
-        return -1;
-    }
-    if (cpio_find((const void *)g_initrd_start, (const void *)g_initrd_end,
-                  path, &data, &size, &mode) != 0) {
-        return -1;
-    }
-    if ((mode & CPIO_MODE_TYPE_MASK) != CPIO_MODE_REGULAR) {
-        return -1;
-    }
-    if (size == 0 || size > USER_CODE_SIZE) {
-        return -1;
-    }
-    if (thread_user_image_busy(thread_current())) {
-        return -1;
-    }
-
-    copy_bytes((void *)(uintptr_t)USER_CODE_BASE, data, size);
-    asm volatile(".word 0x0000100f" ::: "memory");
-    *entry_out = (uintptr_t)USER_CODE_BASE;
-    *size_out = size;
-    return 0;
-}
-
 /* Normalize leading and trailing shell input whitespace in place. */
-static void trim_in_place(char *s) {
+static void trim_in_place(char *s)
+{
     char *p = s;
     while (is_space(*p)) {
         p++;
@@ -249,7 +117,7 @@ static void trim_in_place(char *s) {
         *dst = '\0';
     }
 
-    unsigned int len = str_len(s);
+    unsigned int len = strlen(s);
     while (len > 0 && is_space(s[len - 1])) {
         s[len - 1] = '\0';
         len--;
@@ -257,7 +125,8 @@ static void trim_in_place(char *s) {
 }
 
 /* Read a single command line from UART with basic editing support. */
-static void getCommand(char* buffer, int max_len) {
+static void shell_readline(char* buffer, int max_len)
+{
     int idx = 0;
     int ignore_next_lf = 0;
 
@@ -299,7 +168,9 @@ static void getCommand(char* buffer, int max_len) {
 }
 
 /* Shell info commands. */
-static void print_info(void) {
+static void print_info(void)
+{
+    const struct boot_info *boot = platform_boot_info();
     unsigned long spec = (unsigned long)sbi_get_spec_version();
     unsigned long impl_id = (unsigned long)sbi_get_impl_id();
     unsigned long impl_ver = (unsigned long)sbi_get_impl_version();
@@ -314,8 +185,8 @@ static void print_info(void) {
     int mem_count = 0;
     int i;
 
-    if (g_dtb != 0) {
-        mem_count = fdt_get_memory_regions((const void *)g_dtb, mem_regions, FDT_MAX_MEM_REGIONS);
+    if (boot->dtb != 0) {
+        mem_count = fdt_get_memory_regions((const void *)boot->dtb, mem_regions, FDT_MAX_MEM_REGIONS);
         if (mem_count < 0) {
             mem_count = 0;
         }
@@ -325,21 +196,21 @@ static void print_info(void) {
     }
 
     uart_send_string("core id: ");
-    uart_send_dec(g_hartid);
+    uart_send_dec(boot->hartid);
     uart_send_string("\n");
 
     uart_send_string("dtb addr: ");
-    uart_send_hex(g_dtb);
+    uart_send_hex(boot->dtb);
     uart_send_string("\n");
 
     uart_send_string("initrd: ");
-    if (g_initrd_start != 0 && g_initrd_end > g_initrd_start) {
+    if (boot->initrd_start != 0 && boot->initrd_end > boot->initrd_start) {
         uart_send_string("start=");
-        uart_send_hex((unsigned long)g_initrd_start);
+        uart_send_hex((unsigned long)boot->initrd_start);
         uart_send_string(" end=");
-        uart_send_hex((unsigned long)g_initrd_end);
+        uart_send_hex((unsigned long)boot->initrd_end);
         uart_send_string(" size=");
-        uart_send_hex((unsigned long)(g_initrd_end - g_initrd_start));
+        uart_send_hex((unsigned long)(boot->initrd_end - boot->initrd_start));
     } else {
         uart_send_string("none");
     }
@@ -395,7 +266,8 @@ static void print_info(void) {
 }
 
 /* Translate SBI HSM hart states into short shell-visible names. */
-static const char* hsm_state_name(long st) {
+static const char* hsm_state_name(long st)
+{
     switch (st) {
         case SBI_HSM_STATE_STARTED: return "started";
         case SBI_HSM_STATE_STOPPED: return "stopped";
@@ -409,7 +281,8 @@ static const char* hsm_state_name(long st) {
 }
 
 /* Query SBI HSM state for each hart and print a compact summary. */
-static void print_cores(void) {
+static void print_cores(void)
+{
     unsigned long core;
     long hsm = sbi_probe_extension(SBI_EXT_HSM);
     uart_send_string("sbi hsm support: ");
@@ -435,7 +308,8 @@ static void print_cores(void) {
 }
 
 /* Split the command line into the first token and the remaining argument string. */
-static void split_first_arg(char *line, char **cmd, char **arg) {
+static void split_first_arg(char *line, char **cmd, char **arg)
+{
     char *p = line;
     while (is_space(*p)) {
         p++;
@@ -454,7 +328,8 @@ static void split_first_arg(char *line, char **cmd, char **arg) {
 }
 
 /* Emit raw initramfs file bytes to UART, preserving terminal newlines. */
-static void uart_send_bytes(const uint8_t *data, unsigned long size) {
+static void uart_send_bytes(const uint8_t *data, unsigned long size)
+{
     unsigned long i;
     for (i = 0; i < size; i++) {
         char c = (char)data[i];
@@ -471,7 +346,8 @@ struct ls_ctx {
 
 /* initramfs-backed shell commands. */
 static void ls_cb(const char *name, const void *data, unsigned long size,
-                  unsigned int mode, void *ctx) {
+                  unsigned int mode, void *ctx)
+{
     struct ls_ctx *st = (struct ls_ctx *)ctx;
     unsigned int type = mode & 0170000U;
     const char *print_name = name;
@@ -492,14 +368,16 @@ static void ls_cb(const char *name, const void *data, unsigned long size,
 }
 
 /* List every visible initramfs entry once the archive has been validated. */
-static void cmd_ls(void) {
+static void cmd_ls(void)
+{
+    const struct boot_info *boot = platform_boot_info();
     struct ls_ctx st;
     st.count = 0;
-    if (g_initrd_start == 0 || g_initrd_end <= g_initrd_start) {
+    if (boot->initrd_start == 0 || boot->initrd_end <= boot->initrd_start) {
         uart_send_string("initrd not available\n");
         return;
     }
-    if (cpio_iterate((const void *)g_initrd_start, (const void *)g_initrd_end,
+    if (cpio_iterate((const void *)boot->initrd_start, (const void *)boot->initrd_end,
                      ls_cb, &st) != 0) {
         uart_send_string("cpio parse error\n");
         return;
@@ -510,13 +388,15 @@ static void cmd_ls(void) {
 }
 
 /* Print a regular initramfs file to UART. */
-static void cmd_cat(const char *arg) {
+static void cmd_cat(const char *arg)
+{
+    const struct boot_info *boot = platform_boot_info();
     const void *data = 0;
     unsigned long size = 0;
     unsigned int mode = 0;
     char alt[128];
 
-    if (g_initrd_start == 0 || g_initrd_end <= g_initrd_start) {
+    if (boot->initrd_start == 0 || boot->initrd_end <= boot->initrd_start) {
         uart_send_string("initrd not available\n");
         return;
     }
@@ -525,7 +405,7 @@ static void cmd_cat(const char *arg) {
         return;
     }
 
-    if (cpio_find((const void *)g_initrd_start, (const void *)g_initrd_end,
+    if (cpio_find((const void *)boot->initrd_start, (const void *)boot->initrd_end,
                   arg, &data, &size, &mode) != 0) {
         if (arg[0] != '.' || arg[1] != '/') {
             unsigned int i = 0;
@@ -536,7 +416,7 @@ static void cmd_cat(const char *arg) {
                 alt[i++] = arg[j++];
             }
             alt[i] = '\0';
-            if (cpio_find((const void *)g_initrd_start, (const void *)g_initrd_end,
+            if (cpio_find((const void *)boot->initrd_start, (const void *)boot->initrd_end,
                           alt, &data, &size, &mode) != 0) {
                 uart_send_string("file not found\n");
                 return;
@@ -559,7 +439,8 @@ static void cmd_cat(const char *arg) {
 }
 
 /* Single timer status command: basic counters plus the pending queue. */
-static void cmd_timer(void) {
+static void cmd_timer(void)
+{
     uint64_t now;
     uint64_t uptime;
 
@@ -598,55 +479,22 @@ static void cmd_timer(void) {
     timer_dump_queue();
 }
 
-/* Minimal shell-facing callback used to prove that software timer events are
- * really leaving the pending list and executing at interrupt time.
- */
+/* Print a one-shot marker, or let the UART stress stream insert it. */
 static void shell_timer_callback(void *arg)
 {
     unsigned long id = (unsigned long)(uintptr_t)arg;
 
-    if (uart_stress_note_timer(id) == 0) {
+    if (demo_uart_stress_note_timer(id) == 0) {
         return;
     }
 
     uart_send_string("\n[T");
     uart_send_dec(id);
     uart_send_string("]\n");
-}
-
-/* Timer callbacks and allocator frees both print asynchronously while the
- * REPL is blocked in uart_recv(). Redraw the prompt only after the whole timer
- * interrupt path has finished, with a tiny delay to avoid landing on the same
- * line as the allocator free trace.
- */
-void shell_redraw_prompt_delayed(void)
-{
-    uint64_t start;
-    uint64_t wait_ticks;
-
-    if (g_timebase_freq == 0) {
-        uart_send_string(g_shell_prompt);
-        return;
-    }
-
-    start = timer_read();
-    wait_ticks = g_timebase_freq / 200U;
-    if (wait_ticks == 0) {
-        wait_ticks = 1;
-    }
-
-    while ((timer_read() - start) < wait_ticks) {
-        asm volatile("" ::: "memory");
-    }
-
     uart_send_string(g_shell_prompt);
 }
 
-/* Shell test entry only:
- * - parse seconds
- * - translate to timer ticks
- * - hand the real work to add_timer()
- */
+/* Convert shell seconds to the timer API's tick count. */
 static void cmd_addtimer(const char *arg)
 {
     static unsigned long next_timer_id = 1;
@@ -695,8 +543,12 @@ static void shell_print_time(uint64_t ticks)
 
     uart_send_dec((unsigned long)(elapsed / g_timebase_freq));
     uart_send('.');
-    if (ms < 100UL) { uart_send('0'); }
-    if (ms < 10UL) { uart_send('0'); }
+    if (ms < 100UL) {
+        uart_send('0');
+    }
+    if (ms < 10UL) {
+        uart_send('0');
+    }
     uart_send_dec(ms);
 }
 
@@ -712,6 +564,7 @@ static void shell_timeout_callback(void *arg)
     uart_send_string("s message=");
     uart_send_string(timeout->message);
     uart_send_string("\n");
+    uart_send_string(g_shell_prompt);
 }
 
 static void cmd_set_timeout(char *arg)
@@ -732,17 +585,18 @@ static void cmd_set_timeout(char *arg)
         goto usage;
     }
 
-    length = str_len(message) + 1U;
+    length = strlen(message) + 1U;
     timeout = kmalloc(sizeof(*timeout) + length);
     if (timeout == 0) {
         uart_send_string("setTimeout: allocation failed\n");
         return;
     }
     timeout->submitted = submitted;
-    /* The next shell command reuses its stack buffer. Keep our own message
+    /*
+     * The next shell command reuses its stack buffer. Keep our own message
      * until this event fires or timer_stop cancels it.
      */
-    copy_bytes(timeout->message, message, length);
+    memcpy(timeout->message, message, length);
     if (add_timer_with_cleanup(shell_timeout_callback, timeout, ticks, kfree) != 0) {
         kfree(timeout);
         uart_send_string("setTimeout: timer registration failed\n");
@@ -766,18 +620,14 @@ static void cmd_mem(void)
     memory_print_buddyinfo();
 }
 
-/* Emit enough text to force the TX path to queue and drain asynchronously. */
-/* One-shot UART demo:
- * - emits enough output to exercise the TX interrupt path
- * - asks the user for one input character to prove RX interrupts feed the
- *   shell path
- * - prints a compact pass/fail summary based on the UART driver counters
- */
-static void cmd_uartdemo(void) {
+/* Compatibility command for demo uart. */
+static void cmd_uartdemo(void)
+{
     (void)demo_run("uart");
 }
 
-/* Queue many small TX chunks so timer markers have a clear chance to
+/*
+ * Queue many small TX chunks so timer markers have a clear chance to
  * interleave with UART bottom-half work.
  */
 static void cmd_uartstress(const char *arg)
@@ -808,26 +658,13 @@ static int shell_launch_user_program_instances(const char *name,
                                                int verbose,
                                                int lab_ecalls)
 {
-    unsigned long size;
-    uintptr_t entry;
-    unsigned int i;
-    int created_pids[2];
+    struct exec_result result;
 
-    if (name == 0 || label == 0 || instances == 0U || instances > 2U) {
-        return -1;
-    }
-
-    if (g_initrd_start == 0 || g_initrd_end <= g_initrd_start) {
+    if (exec_spawn(name, instances, &result) != 0) {
         uart_send_string(label);
-        uart_send_string(": initramfs unavailable\n");
+        uart_send_string(": failed to load or create user task\n");
         return -1;
     }
-    if (shell_load_user_program_named(name, &entry, &size) != 0) {
-        uart_send_string(label);
-        uart_send_string(": failed to load user program\n");
-        return -1;
-    }
-
     if (verbose != 0) {
         uart_send_string(label);
         uart_send_string(": found file bin/");
@@ -835,15 +672,15 @@ static int shell_launch_user_program_instances(const char *name,
         uart_send_string(".bin\n");
         uart_send_string(label);
         uart_send_string(": copied to ");
-        uart_send_hex((unsigned long)entry);
+        uart_send_hex((unsigned long)result.entry);
         uart_send_string("\n");
         uart_send_string(label);
         uart_send_string(": size = ");
-        uart_send_dec(size);
+        uart_send_dec(result.size);
         uart_send_string("\n");
         uart_send_string(label);
         uart_send_string(": entry = ");
-        uart_send_hex((unsigned long)entry);
+        uart_send_hex((unsigned long)result.entry);
         uart_send_string("\n");
         uart_send_string(label);
         uart_send_string(": requested name = ");
@@ -851,71 +688,24 @@ static int shell_launch_user_program_instances(const char *name,
         uart_send_string("\n");
     }
 
-    if (!thread_system_active()) {
-        uart_send_string(label);
-        uart_send_string(": bootstrap shell as idle\n");
-        thread_system_bootstrap_init();
+    if (lab_ecalls) {
+        trap_set_ecall_demo(result.tids[0]);
     }
-
-    for (i = 0; i < instances; i++) {
-        uintptr_t user_stack_base;
-        uintptr_t user_stack_top;
-
-        user_stack_base = (uintptr_t)kmalloc(USER_STACK_SIZE);
-        if (user_stack_base == 0) {
-            uart_send_string(label);
-            uart_send_string(": failed to allocate user stack\n");
-            goto launch_failed;
-        }
-        user_stack_top = (user_stack_base + USER_STACK_SIZE) & ~0xFUL;
-
-        if (verbose != 0) {
-            uart_send_string(label);
-            uart_send_string(": user stack top = ");
-            uart_send_hex((unsigned long)user_stack_top);
-            uart_send_string("\n");
-        }
-
-        created_pids[i] = user_process_create(entry, user_stack_base, user_stack_top);
-        if (created_pids[i] < 0) {
-            kfree((void *)(uintptr_t)user_stack_base);
-            uart_send_string(label);
-            uart_send_string(": failed to create user task\n");
-            goto launch_failed;
-        }
-        if (lab_ecalls) {
-            trap_set_ecall_demo(created_pids[i]);
-        }
-    }
-
-    if (instances == 1U) {
-        uart_send_string(label);
-        uart_send_string(": enqueue user task and schedule\n");
-    } else {
-        uart_send_string(label);
-        uart_send_string(": enqueue ");
-        uart_send_dec(instances);
-        uart_send_string(" user tasks and schedule\n");
-    }
+    uart_send_string(label);
+    uart_send_string(": enqueue user task and schedule\n");
     uart_tx_wait_idle();
     thread_run_until_idle();
-    if (lab_ecalls) { trap_set_ecall_demo(-1); }
+    if (lab_ecalls) {
+        trap_set_ecall_demo(-1);
+    }
     uart_send_string(label);
     uart_send_string(": user task finished, back to shell\n");
     return 0;
-
-launch_failed:
-    if (lab_ecalls) { trap_set_ecall_demo(-1); }
-    /* Do not leave a partly created batch runnable after reporting failure. */
-    while (i > 0U) {
-        (void)thread_stop_tid(created_pids[--i], -1);
-    }
-    thread_run_until_idle();
-    return -1;
 }
 
 /* Load a raw user binary from initramfs into the reserved execution window. */
-static void cmd_runu(const char *arg) {
+static void cmd_runu(const char *arg)
+{
     if (arg == 0) {
         uart_send_string("usage: runu <name>\n");
         return;
@@ -932,10 +722,10 @@ static void cmd_exec(const char *arg)
     }
     /* The basic trap exercise prints CSR snapshots for each user ecall. */
     previous_trace = trap_trace_ecalls(1);
-    if (streq(arg, "prog")) {
+    if (strcmp(arg, "prog") == 0) {
         uart_send_string("exec: lab diagnostic image; final U-mode loop runs until reset\n");
     }
-    (void)shell_launch_user_program_instances(arg, "exec", 1U, 1, streq(arg, "prog"));
+    (void)shell_launch_user_program_instances(arg, "exec", 1U, 1, (strcmp(arg, "prog") == 0));
     (void)trap_trace_ecalls(previous_trace);
 }
 
@@ -949,18 +739,59 @@ static void cmd_preempt_test(void)
     (void)shell_launch_user_program_instances("preempt", "preempt_test", 2U, 0, 0);
 }
 
+/* A generation token makes an old callback harmless after off/on. */
+static unsigned long g_periodic_generation;
+static int g_periodic_enabled;
+
+static void shell_periodic_timer(void *arg)
+{
+    unsigned long generation = (uintptr_t)arg;
+
+    if (!g_periodic_enabled || generation != g_periodic_generation) {
+        return;
+    }
+    uart_send_string("\n[timer] uptime=");
+    uart_send_dec((timer_read() - g_boot_time) / g_timebase_freq);
+    uart_send_string(" seconds\n");
+    uart_send_string(g_shell_prompt);
+    if (add_timer(shell_periodic_timer, arg, 2ULL * g_timebase_freq) != 0) {
+        g_periodic_enabled = 0;
+    }
+}
+
+static int shell_periodic_enable(int enabled)
+{
+    if (!timer_is_running() || g_timebase_freq == 0) {
+        return -1;
+    }
+    if (enabled && g_periodic_enabled) {
+        return 0;
+    }
+    g_periodic_enabled = 0;
+    g_periodic_generation++;
+    if (enabled) {
+        if (add_timer(shell_periodic_timer, (void *)(uintptr_t)g_periodic_generation,
+                      2ULL * g_timebase_freq) != 0) {
+            return -1;
+        }
+        g_periodic_enabled = 1;
+    }
+    return 0;
+}
+
 /* Main command dispatcher for the interactive shell. */
-void processCommand(shell_t* shell) {
+static void shell_execute(char *line)
+{
     char *cmd;
     char *arg;
 
-    if (shell->command[0] == '\0') {
+    if (line[0] == '\0') {
         return;
     }
 
-    split_first_arg(shell->command, &cmd, &arg);
+    split_first_arg(line, &cmd, &arg);
 
-    if (streq(cmd, "help")) {
+    if (strcmp(cmd, "help") == 0) {
         uart_send_string("Available commands:\n");
         uart_send_string("  help   - Show this message\n");
         uart_send_string("  hello  - Print Hello World!\n");
@@ -981,32 +812,32 @@ void processCommand(shell_t* shell) {
         return;
     }
 
-    if (streq(cmd, "hello")) {
+    if (strcmp(cmd, "hello") == 0) {
         uart_send_string("Hello World!\n");
         return;
     }
 
-    if (streq(cmd, "info")) {
+    if (strcmp(cmd, "info") == 0) {
         print_info();
         return;
     }
 
-    if (streq(cmd, "cores")) {
+    if (strcmp(cmd, "cores") == 0) {
         print_cores();
         return;
     }
 
-    if (streq(cmd, "ls")) {
+    if (strcmp(cmd, "ls") == 0) {
         cmd_ls();
         return;
     }
 
-    if (streq(cmd, "cat")) {
+    if (strcmp(cmd, "cat") == 0) {
         cmd_cat(arg);
         return;
     }
 
-    if (streq(cmd, "memtest") || streq(cmd, "kmtest")) {
+    if (strcmp(cmd, "memtest") == 0 || strcmp(cmd, "kmtest") == 0) {
         char buf[64];
         unsigned int i = 0;
         static const char prefix[] = "mem";
@@ -1028,22 +859,22 @@ void processCommand(shell_t* shell) {
         return;
     }
 
-    if (streq(cmd, "demo")) {
+    if (strcmp(cmd, "demo") == 0) {
         demo_run(arg);
         return;
     }
 
-    if (streq(cmd, "mem")) {
+    if (strcmp(cmd, "mem") == 0) {
         cmd_mem();
         return;
     }
 
-    if (streq(cmd, "timer")) {
+    if (strcmp(cmd, "timer") == 0) {
         if (arg == 0) {
             cmd_timer();
-        } else if (streq(arg, "periodic on") || streq(arg, "periodic off")) {
-            int enabled = streq(arg, "periodic on");
-            if (timer_periodic_demo(enabled) != 0) {
+        } else if (strcmp(arg, "periodic on") == 0 || strcmp(arg, "periodic off") == 0) {
+            int enabled = (strcmp(arg, "periodic on") == 0);
+            if (shell_periodic_enable(enabled) != 0) {
                 uart_send_string("timer: subsystem unavailable\n");
             } else {
                 uart_send_string(enabled ? "timer: periodic on\n" : "timer: periodic off\n");
@@ -1054,42 +885,42 @@ void processCommand(shell_t* shell) {
         return;
     }
 
-    if (streq(cmd, "setTimeout")) {
+    if (strcmp(cmd, "setTimeout") == 0) {
         cmd_set_timeout(arg);
         return;
     }
 
-    if (streq(cmd, "exec")) {
+    if (strcmp(cmd, "exec") == 0) {
         cmd_exec(arg);
         return;
     }
 
-    if (streq(cmd, "addtimer")) {
+    if (strcmp(cmd, "addtimer") == 0) {
         cmd_addtimer(arg);
         return;
     }
 
-    if (streq(cmd, "uartdemo")) {
+    if (strcmp(cmd, "uartdemo") == 0) {
         cmd_uartdemo();
         return;
     }
 
-    if (streq(cmd, "uartstress")) {
+    if (strcmp(cmd, "uartstress") == 0) {
         cmd_uartstress(arg);
         return;
     }
 
-    if (streq(cmd, "runu")) {
+    if (strcmp(cmd, "runu") == 0) {
         cmd_runu(arg);
         return;
     }
 
-    if (streq(cmd, "fork_test")) {
+    if (strcmp(cmd, "fork_test") == 0) {
         cmd_fork_test();
         return;
     }
 
-    if (streq(cmd, "preempt_test")) {
+    if (strcmp(cmd, "preempt_test") == 0) {
         cmd_preempt_test();
         return;
     }
@@ -1099,17 +930,15 @@ void processCommand(shell_t* shell) {
     uart_send_string("\n");
 }
 
-/* Single-command REPL wrapper used by kernel_main. */
-void runAShell(int32_t pid) {
-    shell_t shell;
-    char command_buffer[128];
-    shell.pid = pid;
-    uart_send_string(g_shell_prompt);
+/* The same kernel flow owns every prompt; commands do not create a shell task. */
+void shell_run(void)
+{
+    char line[128];
 
-    getCommand(command_buffer, 128);
-    trim_in_place(command_buffer);
-
-    shell.command = command_buffer;
-
-    processCommand(&shell);
+    for (;;) {
+        uart_send_string("> ");
+        shell_readline(line, sizeof(line));
+        trim_in_place(line);
+        shell_execute(line);
+    }
 }

@@ -4,55 +4,8 @@
 #include <stdint.h>
 #include "syscall.h"
 
-/* sstatus bits used by the minimal S-mode <-> U-mode path.
- * SPP  : privilege level restored by sret (0 = U-mode, 1 = S-mode)
- * SPIE : interrupt-enable state restored by sret
- * SIE  : current supervisor interrupt-enable bit
- */
-#define SSTATUS_SIE            (1UL << 1)
-#define SSTATUS_SPIE           (1UL << 5)
-#define SSTATUS_SPP            (1UL << 8)
-
-/* sie selects which supervisor interrupt sources are individually enabled.
- * STIE specifically enables the supervisor timer interrupt source.
- */
-#define SIE_STIE               (1UL << 5)
-#define SIE_SEIE               (1UL << 9)
-
-/* scause encoding: top bit distinguishes interrupt from exception. */
-#define SCAUSE_INTERRUPT_BIT   (1UL << 63)
-
-/* Minimal exception causes used by Basic Exercise 1. */
-#define SCAUSE_U_ECALL         8UL
-#define SCAUSE_ILLEGAL_INST    2UL
-#define SCAUSE_INST_FAULT      1UL
-#define SCAUSE_LOAD_FAULT      5UL
-#define SCAUSE_STORE_FAULT     7UL
-
-/* Supervisor timer interrupt cause code used by Exercise 2. */
-#define SCAUSE_S_TIMER_INT     5UL
-#define SCAUSE_S_EXT_INT       9UL
-
-/* User memory layout.
- * Keep board addresses aligned with the OrangePi RV2 plan.
- * QEMU uses a different RAM map, so the test layout must live in QEMU RAM.
- */
-#ifdef QEMU
-#define USER_CODE_BASE         0x83000000UL
-#define USER_CODE_SIZE         0x00100000UL
-#define USER_STACK_SIZE        0x00010000UL
-#define USER_STACK_TOP         0x83200000UL
-#else
-#define USER_CODE_BASE         0x32000000UL
-#define USER_CODE_SIZE         0x00100000UL
-#define USER_STACK_SIZE        0x00010000UL
-#define USER_STACK_TOP         0x32200000UL
-#endif
-
-#define USER_KSTACK_SIZE       0x00010000UL
-
-#define USER_CODE_LIMIT        (USER_CODE_BASE + USER_CODE_SIZE)
-#define USER_STACK_BASE        (USER_STACK_TOP - USER_STACK_SIZE)
+#include "csr.h"
+#include "context_offsets.h"
 
 /* Fixed trap context layout shared by trap_entry.S and the C handlers.
  * General registers capture the interrupted CPU context.
@@ -98,45 +51,6 @@ struct trap_context {
     uint64_t scause;
     uint64_t stval;
 };
-
-#define TC_RA                0UL
-#define TC_SP                8UL
-#define TC_GP                16UL
-#define TC_TP                24UL
-#define TC_T0                32UL
-#define TC_T1                40UL
-#define TC_T2                48UL
-#define TC_S0                56UL
-#define TC_S1                64UL
-#define TC_A0                72UL
-#define TC_A1                80UL
-#define TC_A2                88UL
-#define TC_A3                96UL
-#define TC_A4                104UL
-#define TC_A5                112UL
-#define TC_A6                120UL
-#define TC_A7                128UL
-#define TC_S2                136UL
-#define TC_S3                144UL
-#define TC_S4                152UL
-#define TC_S5                160UL
-#define TC_S6                168UL
-#define TC_S7                176UL
-#define TC_S8                184UL
-#define TC_S9                192UL
-#define TC_S10               200UL
-#define TC_S11               208UL
-#define TC_T3                216UL
-#define TC_T4                224UL
-#define TC_T5                232UL
-#define TC_T6                240UL
-#define TC_SEPC              248UL
-#define TC_SSTATUS           256UL
-#define TC_SCAUSE            264UL
-#define TC_STVAL             272UL
-
-#define TRAP_CONTEXT_SIZE         ((uint64_t)sizeof(struct trap_context))
-#define TRAP_CONTEXT_ALLOC_SIZE   ((TRAP_CONTEXT_SIZE + 15UL) & ~15UL)
 
 extern void trap_entry(void);
 extern void trap_return(struct trap_context *tc);

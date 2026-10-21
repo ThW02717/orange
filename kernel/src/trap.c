@@ -1,3 +1,4 @@
+#include "sched.h"
 #include <stdint.h>
 #include "trap.h"
 #include "syscall_dispatch.h"
@@ -7,7 +8,8 @@
 #include "thread.h"
 #include "user.h"
 
-/* Assembly saves/restores CPU state. This file classifies the trap and
+/*
+ * Assembly saves/restores CPU state. This file classifies the trap and
  * forwards user ecalls to syscall.c, interrupts to their handlers, and faults
  * to the kernel/user fault paths.
  */
@@ -78,7 +80,7 @@ void trap_dispatch(struct trap_context *tc)
 
             irq = plic_claim();
             if (irq == uart_irq_id()) {
-                uart_demo_note_external_irq(irq);
+                uart_note_external_irq(irq);
                 uart_irq_top();
             }
             if (irq != 0U) {
@@ -92,13 +94,12 @@ void trap_dispatch(struct trap_context *tc)
         return;
     }
 
-    /* Basic Exercise 1 only expects U-mode ecall plus a generic user fault
-     * fallback for every other exception.
-     */
+    /* U-mode ecall is a syscall; other user exceptions terminate the task. */
     if (trap_scause_code(tc->scause) == SCAUSE_U_ECALL) {
         struct thread *task = thread_current();
 
-        /* The supplied Lab 4 image counts down a7, before any syscall ABI is
+        /*
+         * The supplied Lab 4 image counts down a7, before any syscall ABI is
          * defined. Only its explicitly selected task uses this exercise path.
          */
         if (task != 0 && task->tid == g_ecall_demo_tid) {
@@ -117,7 +118,8 @@ void trap_dispatch(struct trap_context *tc)
     }
 
     if ((tc->sstatus & SSTATUS_SPP) != 0) {
-        /* Retrying a faulting kernel instruction would trap forever. A
+        /*
+         * Retrying a faulting kernel instruction would trap forever. A
          * kernel fault is not an ordinary user-task termination.
          */
         asm volatile("csrci sstatus, 2" ::: "memory");

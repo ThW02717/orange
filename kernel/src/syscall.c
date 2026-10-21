@@ -1,3 +1,6 @@
+#include "thread_internal.h"
+#include "sched.h"
+#include "user_layout.h"
 #include <stdint.h>
 #include "syscall_dispatch.h"
 #include "syscall.h"
@@ -5,10 +8,12 @@
 #include "uart.h"
 #include "memory.h"
 #include "thread.h"
-#include "shell.h"
+#include "exec.h"
+#include "irqflags.h"
 #include "user.h"
 
-/* User ecall handlers and register dispatch live together here.
+/*
+ * User ecall handlers and register dispatch live together here.
  * Keep user-buffer checks here too; trap.c only identifies and routes the trap.
  */
 
@@ -78,14 +83,14 @@ static long sys_uart_write(const char *buf, long count)
     if (!user_range_ok(task, (uintptr_t)buf, (uint64_t)count, 0)) {
         return -1;
     }
-    asm volatile("csrrc %0, sstatus, %1" : "=r"(sstatus) : "r"(SSTATUS_SIE) : "memory");
+    sstatus = local_irq_save();
     for (i = 0; i < count; i++) {
         if (buf[i] == '\n') {
             uart_send('\r');
         }
         uart_send(buf[i]);
     }
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus) : "memory");
+    local_irq_restore(sstatus);
     return count;
 }
 
@@ -118,7 +123,8 @@ static long sys_exec(const char *path, struct trap_context *tc)
     if (task == 0 || tc == 0 || path == 0) {
         return -1;
     }
-    /* We do not replace a group's image while its siblings are running.
+    /*
+     * We do not replace a group's image while its siblings are running.
      * The loader also rejects any other process using the fixed window.
      */
     if (thread_user_group_size(task) != 1) {
@@ -142,7 +148,7 @@ static long sys_exec(const char *path, struct trap_context *tc)
     if (!terminated || name[0] == '\0') {
         return -1;
     }
-    if (shell_load_user_program_named(name, &entry, &size) != 0) {
+    if (exec_load_image(name, &entry, &size) != 0) {
         return -1;
     }
 
@@ -169,7 +175,8 @@ static long sys_fork(struct trap_context *parent_tc)
     if (parent == 0 || parent_tc == 0) {
         return -1;
     }
-    /* Fork is still the single-threaded, no-MMU stack-copy demo. Do not copy
+    /*
+     * Fork is still the single-threaded, no-MMU stack-copy demo. Do not copy
      * a multithreaded process while leaving sibling stack pointers behind.
      */
     if (thread_user_group_size(parent) != 1) {
@@ -193,7 +200,8 @@ static long sys_fork(struct trap_context *parent_tc)
         dst[i] = src[i];
     }
 
-    /* The copied user stack still contains saved frame pointers and other
+    /*
+     * The copied user stack still contains saved frame pointers and other
      * stack-local addresses that point back into the parent's stack image.
      * For this minimal no-MMU process model, remap any 64-bit word that falls
      * inside the parent stack range to the corresponding child stack address.
@@ -229,7 +237,8 @@ static long sys_fork(struct trap_context *parent_tc)
     child_sp = child->user_stack_base + stack_off;
     child->tc->sp = child_sp;
 
-    /* Any saved GPR that still points into the parent's user stack must be
+    /*
+     * Any saved GPR that still points into the parent's user stack must be
      * remapped to the corresponding address in the child's private stack.
      * Otherwise locals accessed via frame pointers (for example &cnt in the
      * fork test) still alias the parent's stack even though sp was fixed.
@@ -274,7 +283,7 @@ static long sys_fork(struct trap_context *parent_tc)
 #undef REMAP_STACK_FIELD
 
     /* New process: keep child->tgid == child->tid. Only now can it run. */
-    thread_publish_user(child);
+    thread_publish(child);
     return child->tgid;
 }
 

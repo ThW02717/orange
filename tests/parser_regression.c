@@ -5,6 +5,22 @@
 #include <string.h>
 #include "cpio.h"
 #include "fdt.h"
+#include "platform.h"
+
+static uintptr_t configured_uart;
+static uintptr_t configured_plic;
+static uint32_t configured_irq;
+
+void uart_set_platform(uintptr_t base, uint32_t irq)
+{
+    configured_uart = base;
+    configured_irq = irq;
+}
+
+void plic_set_base(uintptr_t base)
+{
+    configured_plic = base;
+}
 
 static void hex_field(unsigned char *p, uint32_t v)
 {
@@ -143,8 +159,28 @@ int main(int argc, char **argv)
         assert(fdt_get_reg_base(dtb, uart, &base) == 0 && base != 0);
         assert(fdt_get_interrupt_id(dtb, uart, &irq) == 0 && irq != 0);
         assert(fdt_get_reg_base(dtb, plic, &base) == 0 && base != 0);
+        {
+            const struct boot_info *boot;
+            uint64_t dt_start, dt_end;
+            int has_initrd = fdt_get_initrd_range(dtb, &dt_start, &dt_end) == 0 &&
+                            dt_start != 0 && dt_end > dt_start;
+
+            assert(platform_init(0, (uintptr_t)dtb, 0x46100000, 0x46101000) == 0);
+            boot = platform_boot_info();
+            assert(boot->dtb == (uintptr_t)dtb && boot->hartid == 0);
+            assert(configured_plic == base && configured_irq == irq);
+            assert(fdt_get_reg_base(dtb, uart, &base) == 0 && configured_uart == base);
+            assert(boot->initrd_start == (has_initrd ? dt_start : 0x46100000));
+            assert(boot->initrd_end == (has_initrd ? dt_end : 0x46101000));
+            assert(platform_init(0, (uintptr_t)dtb, 0x46101000, 0x46100000) == 0);
+            assert(boot->initrd_start == (has_initrd ? dt_start : 0));
+            assert(platform_init(0, (uintptr_t)dtb, 1, 0x20000000) == 0);
+            assert(boot->initrd_start == (has_initrd ? dt_start : 0));
+            assert(platform_init(0, 0, 1, 5) == -1);
+        }
         free(dtb);
         puts("[REGRESSION] supplied OrangePi RV2 DTB discovery: PASS");
+        puts("[REGRESSION] platform driver configuration and initrd hint validation: PASS");
     }
     return 0;
 }

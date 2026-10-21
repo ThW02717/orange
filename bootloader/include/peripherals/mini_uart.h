@@ -39,12 +39,6 @@ void uart_send_string(const char *str);
 void uart_send_hex(unsigned long value);
 void uart_send_dec(unsigned long value);
 
-/* Compatibility wrappers for existing code. */
-void uart_putc(char c);
-void uart_puts(const char *s);
-char uart_getc(void);
-void uart_hex(unsigned long value);
-void uart_dec(unsigned long value);
 
 #define KEY_ENTER 13
 #define KEY_BACKSPACE 127

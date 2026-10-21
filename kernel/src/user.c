@@ -1,40 +1,29 @@
+/*
+ * User entry and exit. user_reset_trap_context() seeds a fresh U-mode image;
+ * user_task_entry() enters it through trap_return().
+ */
+#include "irqflags.h"
+#include "sched.h"
 #include <stdint.h>
 #include "thread.h"
 #include "trap.h"
 #include "uart.h"
 #include "user.h"
 
-/* Current-aware user-mode entry for the BE2 transition.
- *
- * The old Basic Exercise 1 path used one global user stack and one global
- * "user exited" flag. The new path starts from the currently scheduled task
- * instead: each schedulable user task owns its own kernel stack and its own
- * trap_context location on that stack.
+/*
+ * Fresh execution starts in U-mode, with interrupts enabled after sret.
+ * Do not inherit kernel-only sstatus bits or the previous program's registers.
  */
-
 void user_reset_trap_context(struct thread *task)
 {
-    uint64_t sstatus;
-    unsigned int i;
-    uint64_t *raw;
-
     if (task == 0 || task->tc == 0) {
         return;
     }
-
-    raw = (uint64_t *)task->tc;
-    for (i = 0; i < (sizeof(*task->tc) / sizeof(uint64_t)); i++) {
-        raw[i] = 0;
-    }
-
-    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
-    sstatus &= ~(SSTATUS_SPP | SSTATUS_SIE);
-    sstatus |= SSTATUS_SPIE;
-
+    *task->tc = (struct trap_context){0};
     task->tc->sp = task->user_stack_top;
-    task->tc->tp = (uint64_t)(uintptr_t)task;
+    task->tc->tp = (uintptr_t)task;
     task->tc->sepc = task->user_entry;
-    task->tc->sstatus = sstatus;
+    task->tc->sstatus = SSTATUS_SPIE;
 }
 
 static void user_enter_current_task(void)
@@ -49,21 +38,11 @@ static void user_enter_current_task(void)
         }
     }
 
-    trap_init();
     trap_return(task->tc);
 
     for (;;) {
         asm volatile("wfi");
     }
-}
-
-/* Legacy name kept temporarily while the BE2 path is migrating away from the
- * old singleton user state. It now enters the current user task rather than a
- * global one-shot user context.
- */
-void enter_user_mode(void)
-{
-    user_enter_current_task();
 }
 
 /* Common bootstrap for a new user process or a same-process user thread. */
@@ -96,14 +75,10 @@ int user_has_exited(void)
     return task->state == THREAD_ZOMBIE;
 }
 
-/* User exit/fault no longer jumps directly back into the shell loop. Instead,
- * mark the current task dead and let the scheduler switch back to idle. That
- * returns control to the original shell-side caller naturally once the user
- * task is gone.
- */
+/* Switch away from a finished user task. Reclamation must use another stack. */
 void user_schedule_after_exit(void)
 {
-    asm volatile("csrs sstatus, %0" : : "r"(SSTATUS_SIE) : "memory");
+    local_irq_enable();
 
     schedule();
 

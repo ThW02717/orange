@@ -2,7 +2,6 @@
 #define PLIC_H
 
 #include <stdint.h>
-#include "uart.h"
 
 /* Minimal PLIC layout for OrangePi RV2 bring-up.
  * The UART path currently runs on hart0 in S-mode, so this helper only
@@ -40,6 +39,7 @@
 #define PLIC_THRESHOLD_OFFSET      0x0UL
 #define PLIC_CLAIM_COMPLETE_OFFSET 0x4UL
 
+void plic_set_base(uintptr_t base);
 void plic_set_priority(uint32_t irq, uint32_t priority);
 void plic_enable_irq(uint32_t irq);
 void plic_disable_irq(uint32_t irq);

@@ -29,8 +29,8 @@ struct memory_slab_class_snapshot {
     unsigned int cached_empty_count;
 };
 
-/* Initialize the allocator from the devicetree and bootloader initrd hints. */
-void memory_init(const void *fdt, uint64_t initrd_start_hint, uint64_t initrd_end_hint);
+/* Initialize from DT RAM and the archive range resolved by platform_init(). */
+void memory_init(const void *fdt, uint64_t initrd_start, uint64_t initrd_end);
 
 /* Mark a physical range unavailable before buddy free lists are built. */
 void memory_reserve(uint64_t start, uint64_t size);

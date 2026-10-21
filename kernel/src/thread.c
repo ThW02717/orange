@@ -1,62 +1,37 @@
+/*
+ * Thread creation and lifetime.
+ * Creation: thread_create_kernel(), user_process_create(), thread_create_user().
+ * First run: switch_to() enters thread_bootstrap(), then calls entry(arg).
+ * Exit: mark a zombie now; thread_reap_zombies() frees it after switching away.
+ */
 #include "thread.h"
+#include "thread_internal.h"
+#include "sched.h"
+#include "irqflags.h"
 #include "memory.h"
 #include "trap.h"
 #include "user.h"
+#include "user_layout.h"
 
-/* Kernel calls and deferred callbacks share this stack with trap contexts.
- * Hardware IRQs may still nest while a callback is running.
- */
+/* Kernel calls and nested traps share this stack. */
 #define THREAD_STACK_SIZE 16384UL
 
-/* Single-hart round-robin scheduling. Kernel workers yield cooperatively;
- * user tasks may also be preempted at the outer user-trap boundary.
- */
-
-static struct thread *g_zombie_head = 0;
-static struct thread *g_all_threads = 0;
-static struct thread g_boot_idle_thread;
-static struct thread *g_thread_current = 0;
+static struct thread *g_zombie_head;
+static struct thread *g_all_threads;
 static uint32_t g_next_tid = 1;
-static int g_threading_started = 0;
-static int g_need_resched = 0;
 
-struct runqueue {
-    struct thread *head;
-    struct thread *tail;
-    struct thread *current;
-    struct thread *idle;
-};
-
-static struct runqueue g_rq;
-
-/* This thread code still runs on a single hart, but shared scheduler data can
- * still be observed from interrupt context. Keep queue/state updates inside a
- * short IRQ-off critical section so the data structure never becomes half-
- * updated if a timer/UART interrupt lands in the middle.
- */
-static uint64_t thread_irq_save(void)
-{
-    uint64_t sstatus;
-
-    asm volatile("csrrc %0, sstatus, %1" : "=r"(sstatus) : "r"(SSTATUS_SIE) : "memory");
-    return sstatus;
-}
-
-static void thread_irq_restore(uint64_t sstatus)
-{
-    asm volatile("csrw sstatus, %0" : : "r"(sstatus) : "memory");
-}
+static void thread_bootstrap(void);
 
 static int32_t thread_next_tid(void)
 {
-    uint64_t status = thread_irq_save();
+    uint64_t status = local_irq_save();
     int32_t tid = -1;
 
     /* Do not wrap an ID into an existing task or a negative error value. */
     if (g_next_tid <= INT32_MAX) {
         tid = (int32_t)g_next_tid++;
     }
-    thread_irq_restore(status);
+    local_irq_restore(status);
     return tid;
 }
 
@@ -64,10 +39,10 @@ static void thread_list_add(struct thread *t)
 {
     uint64_t sstatus;
 
-    sstatus = thread_irq_save();
+    sstatus = local_irq_save();
     t->all_next = g_all_threads;
     g_all_threads = t;
-    thread_irq_restore(sstatus);
+    local_irq_restore(sstatus);
 }
 
 static void thread_list_remove(struct thread *t)
@@ -76,7 +51,7 @@ static void thread_list_remove(struct thread *t)
     struct thread *prev = 0;
     struct thread *cur;
 
-    sstatus = thread_irq_save();
+    sstatus = local_irq_save();
     cur = g_all_threads;
     while (cur != 0) {
         if (cur == t) {
@@ -91,419 +66,98 @@ static void thread_list_remove(struct thread *t)
         prev = cur;
         cur = cur->all_next;
     }
-    thread_irq_restore(sstatus);
+    local_irq_restore(sstatus);
 }
 
-static inline struct thread *thread_current_from_tp(void)
+void thread_register_boot(struct thread *task)
 {
-    struct thread *t;
-
-    asm volatile("mv %0, tp" : "=r"(t));
-    return t;
-}
-
-static inline void thread_set_tp(struct thread *t)
-{
-    asm volatile("mv tp, %0" : : "r"(t));
-}
-
-/* FIFO runnable queue:
- * - only THREAD_RUNNABLE workers are stored here
- * - THREAD_RUNNING stays off-queue
- * - THREAD_ZOMBIE stays on the zombie list instead
- */
-static void runq_push(struct thread *t)
-{
-    uint64_t sstatus;
-
-    sstatus = thread_irq_save();
-    t->next = 0;
-    if (g_rq.tail == 0) {
-        g_rq.head = t;
-        g_rq.tail = t;
-        thread_irq_restore(sstatus);
-        return;
-    }
-    g_rq.tail->next = t;
-    g_rq.tail = t;
-    thread_irq_restore(sstatus);
-}
-
-static struct thread *runq_pop(void)
-{
-    uint64_t sstatus;
-    struct thread *t;
-
-    sstatus = thread_irq_save();
-    t = g_rq.head;
-    if (t == 0) {
-        thread_irq_restore(sstatus);
-        return 0;
-    }
-
-    g_rq.head = t->next;
-    if (g_rq.head == 0) {
-        g_rq.tail = 0;
-    }
-    t->next = 0;
-    thread_irq_restore(sstatus);
-    return t;
-}
-
-/* Caller holds the scheduler IRQ-off section. Stopped tasks must be removed
- * before idle can free them; otherwise the run queue retains a dangling node.
- */
-static void runq_remove(struct thread *target)
-{
-    struct thread *prev = 0;
-    struct thread *cur = g_rq.head;
-
-    while (cur != 0) {
-        if (cur == target) {
-            if (prev == 0) {
-                g_rq.head = cur->next;
-            } else {
-                prev->next = cur->next;
-            }
-            if (g_rq.tail == cur) {
-                g_rq.tail = prev;
-            }
-            cur->next = 0;
-            return;
-        }
-        prev = cur;
-        cur = cur->next;
-    }
-}
-
-static void kill_zombies(void)
-{
-    for (;;) {
-        struct thread *z;
-        uint64_t sstatus;
-
-        sstatus = thread_irq_save();
-        z = g_zombie_head;
-        if (z != 0) {
-            g_zombie_head = z->znext;
-        }
-        thread_irq_restore(sstatus);
-
-        if (z == 0) {
-            break;
-        }
-
-        if (z->is_idle != 0) {
-            continue;
-        }
-        thread_list_remove(z);
-        if (z->kind == THREAD_USER && z->user_stack_base != 0) {
-            kfree((void *)(uintptr_t)z->user_stack_base);
-        }
-        if (z->kstack_base != 0) {
-            kfree(z->kstack_base);
-        }
-        kfree(z);
-    }
-}
-
-/* First entry point for a brand-new thread.
- *
- * Both kernel and user constructors seed thread_context.ra with this address.
- * The first switch_to() returns here, then calls the task's kernel-side entry.
- * A user task proceeds to sret; a returning kernel worker calls thread_exit().
- */
-static void thread_bootstrap(void)
-{
-    struct thread *cur = thread_current();
-
-    /* switch_to runs with IRQs masked. A new task has no suspended schedule()
-     * call that could restore its interrupt state, so enable it here.
-     */
-    asm volatile("csrs sstatus, %0" : : "r"(SSTATUS_SIE) : "memory");
-
-    if (cur == 0 || cur->entry == 0) {
-        for (;;) {
-            asm volatile("wfi");
-        }
-    }
-
-    cur->entry(cur->arg);
-    thread_exit();
-
-    for (;;) {
-        asm volatile("wfi");
-    }
-}
-
-/* Return the currently running cooperative thread.
- *
- * Once threading is bootstrapped, tp always points at the current thread
- * control block. Before that point, fall back to the early global used by the
- * shell-only execution model.
- */
-struct thread *thread_current(void)
-{
-    if (g_threading_started != 0) {
-        return thread_current_from_tp();
-    }
-    return g_thread_current;
-}
-
-int thread_system_active(void)
-{
-    return g_threading_started;
-}
-
-/* Reset global scheduler state. This does not yet claim the current shell
- * execution flow as a thread; that happens in thread_system_bootstrap_init().
- */
-void thread_init(void)
-{
-    uint64_t sstatus;
-
-    sstatus = thread_irq_save();
-    g_rq.head = 0;
-    g_rq.tail = 0;
-    g_rq.current = 0;
-    g_rq.idle = 0;
-    g_zombie_head = 0;
-
-    g_boot_idle_thread.thread_context.ra = 0;
-    g_boot_idle_thread.thread_context.sp = 0;
-    g_boot_idle_thread.thread_context.s0 = 0;
-    g_boot_idle_thread.thread_context.s1 = 0;
-    g_boot_idle_thread.thread_context.s2 = 0;
-    g_boot_idle_thread.thread_context.s3 = 0;
-    g_boot_idle_thread.thread_context.s4 = 0;
-    g_boot_idle_thread.thread_context.s5 = 0;
-    g_boot_idle_thread.thread_context.s6 = 0;
-    g_boot_idle_thread.thread_context.s7 = 0;
-    g_boot_idle_thread.thread_context.s8 = 0;
-    g_boot_idle_thread.thread_context.s9 = 0;
-    g_boot_idle_thread.thread_context.s10 = 0;
-    g_boot_idle_thread.thread_context.s11 = 0;
-    g_boot_idle_thread.tid = 0;
-    g_boot_idle_thread.tgid = 0;
-    g_boot_idle_thread.kind = THREAD_KERNEL;
-    g_boot_idle_thread.state = THREAD_RUNNING;
-    g_boot_idle_thread.entry = 0;
-    g_boot_idle_thread.arg = 0;
-    g_boot_idle_thread.kstack_base = 0;
-    g_boot_idle_thread.kstack_top = 0;
-    g_boot_idle_thread.next = 0;
-    g_boot_idle_thread.znext = 0;
-    g_boot_idle_thread.all_next = 0;
-    g_boot_idle_thread.is_idle = 1;
-    g_boot_idle_thread.user_entry = 0;
-    g_boot_idle_thread.user_stack_base = 0;
-    g_boot_idle_thread.user_stack_top = 0;
-    g_boot_idle_thread.exit_status = 0;
-    g_boot_idle_thread.tc = 0;
-
-    g_thread_current = 0;
-    g_all_threads = 0;
-    g_next_tid = 1;
-    g_threading_started = 0;
-    g_need_resched = 0;
-    thread_irq_restore(sstatus);
-}
-
-/* Claim the current shell execution flow as the bootstrap idle thread.
- *
- * This is the key "do not overbuild it" step for the first version: instead
- * of manufacturing a separate bootstrap stack, the existing shell context
- * becomes the idle thread. Its saved context is still empty here; the first
- * switch away from idle will naturally populate thread_context.ra/sp/s0-s11.
- */
-void thread_system_bootstrap_init(void)
-{
-    uint64_t sp_now;
-    uint64_t sstatus;
-
-    thread_init();
-
-    asm volatile("mv %0, sp" : "=r"(sp_now));
-    sstatus = thread_irq_save();
-    g_boot_idle_thread.kstack_top = sp_now;
-    g_thread_current = &g_boot_idle_thread;
-    g_rq.current = &g_boot_idle_thread;
-    g_rq.idle = &g_boot_idle_thread;
-    g_all_threads = &g_boot_idle_thread;
-    thread_set_tp(&g_boot_idle_thread);
-    g_threading_started = 1;
-    thread_irq_restore(sstatus);
-}
-
-/* Allocate a runnable worker thread and seed its initial context.
- *
- * A brand-new thread has never executed before, so build its first saved
- * context by hand:
- * - thread_context.sp starts at the top of the new kernel stack
- * - thread_context.ra starts at thread_bootstrap()
- *
- * After that, the scheduler can switch to the worker exactly like any other
- * saved context.
- */
-int thread_create_kernel(void (*entry)(void *arg), void *arg, int is_idle)
-{
-    struct thread *th;
-    uint64_t top;
-    int32_t tid;
-
-    if (entry == 0 || is_idle != 0) {
-        return -1;
-    }
-    tid = thread_next_tid();
-    if (tid < 0) {
-        return -1;
-    }
-
-    th = (struct thread *)kmalloc(sizeof(*th));
-    if (th == 0) {
-        return -1;
-    }
-
-    th->kstack_base = kmalloc(THREAD_STACK_SIZE);
-    if (th->kstack_base == 0) {
-        kfree(th);
-        return -1;
-    }
-
-    top = (uint64_t)(uintptr_t)th->kstack_base + THREAD_STACK_SIZE;
-    top &= ~0xFUL;
-
-    th->thread_context.ra = (uint64_t)(uintptr_t)thread_bootstrap;
-    th->thread_context.sp = top;
-    th->thread_context.s0 = 0;
-    th->thread_context.s1 = 0;
-    th->thread_context.s2 = 0;
-    th->thread_context.s3 = 0;
-    th->thread_context.s4 = 0;
-    th->thread_context.s5 = 0;
-    th->thread_context.s6 = 0;
-    th->thread_context.s7 = 0;
-    th->thread_context.s8 = 0;
-    th->thread_context.s9 = 0;
-    th->thread_context.s10 = 0;
-    th->thread_context.s11 = 0;
-
-    th->tid = tid;
-    th->tgid = tid;
-    th->kind = THREAD_KERNEL;
-    th->state = THREAD_RUNNABLE;
-    th->entry = entry;
-    th->arg = arg;
-    th->kstack_top = top;
-    th->next = 0;
-    th->znext = 0;
-    th->all_next = 0;
-    th->is_idle = 0;
-    th->user_entry = 0;
-    th->user_stack_base = 0;
-    th->user_stack_top = 0;
-    th->exit_status = 0;
-    th->tc = 0;
-
-    thread_list_add(th);
-    runq_push(th);
-    return th->tid;
-}
-
-/* Build the common user task, but keep it off every scheduler list for now.
- * The caller still needs to choose its process and finish the trap context.
- */
-struct thread *thread_prepare_user(uintptr_t user_entry, uintptr_t user_stack_base, uintptr_t user_stack_top)
-{
-    struct thread *th;
-    uint64_t top;
-    int32_t tid;
-    unsigned int i;
-    uint64_t *raw;
-
-    if (user_entry < USER_CODE_BASE || user_entry >= USER_CODE_LIMIT ||
-        (user_entry & 1U) != 0 || user_stack_base == 0 ||
-        user_stack_top <= user_stack_base || (user_stack_top & 15U) != 0) {
-        return 0;
-    }
-    tid = thread_next_tid();
-    if (tid < 0) {
-        return 0;
-    }
-
-    th = (struct thread *)kmalloc(sizeof(*th));
-    if (th == 0) {
-        return 0;
-    }
-
-    th->kstack_base = kmalloc(THREAD_STACK_SIZE);
-    if (th->kstack_base == 0) {
-        kfree(th);
-        return 0;
-    }
-
-    top = (uint64_t)(uintptr_t)th->kstack_base + THREAD_STACK_SIZE;
-    top &= ~0xFUL;
-
-    th->thread_context.ra = (uint64_t)(uintptr_t)thread_bootstrap;
-    /* Keep the top-of-kstack trap_context slot untouched until the first
-     * U-mode entry. The user bootstrap call chain runs just below it.
-     */
-    th->thread_context.sp = top - TRAP_CONTEXT_ALLOC_SIZE;
-    th->thread_context.s0 = 0;
-    th->thread_context.s1 = 0;
-    th->thread_context.s2 = 0;
-    th->thread_context.s3 = 0;
-    th->thread_context.s4 = 0;
-    th->thread_context.s5 = 0;
-    th->thread_context.s6 = 0;
-    th->thread_context.s7 = 0;
-    th->thread_context.s8 = 0;
-    th->thread_context.s9 = 0;
-    th->thread_context.s10 = 0;
-    th->thread_context.s11 = 0;
-
-    th->tid = tid;
-    th->tgid = tid;
-    th->kind = THREAD_USER;
-    th->state = THREAD_BLOCKED;
-    th->entry = user_task_entry;
-    th->arg = 0;
-    th->kstack_top = top;
-    th->next = 0;
-    th->znext = 0;
-    th->all_next = 0;
-    th->is_idle = 0;
-    th->user_entry = user_entry;
-    th->user_stack_base = user_stack_base;
-    th->user_stack_top = user_stack_top;
-    th->exit_status = 0;
-    th->tc = (struct trap_context *)(uintptr_t)(top - TRAP_CONTEXT_ALLOC_SIZE);
-
-    raw = (uint64_t *)th->tc;
-    for (i = 0; i < (sizeof(*th->tc) / sizeof(uint64_t)); i++) {
-        raw[i] = 0;
-    }
-    th->tc->sp = th->user_stack_top;
-    /* Keep the current-task pointer live across the first U-mode entry so a
-     * later trap from U-mode can still identify which schedulable user task
-     * owns the fault/syscall.
-     */
-    th->tc->tp = (uint64_t)(uintptr_t)th;
-    th->tc->sepc = th->user_entry;
-    th->tc->sstatus = SSTATUS_SPIE;
-
-    return th;
-}
-
-void thread_publish_user(struct thread *task)
-{
-    uint64_t status = thread_irq_save();
-
-    task->state = THREAD_RUNNABLE;
     thread_list_add(task);
-    runq_push(task);
-    thread_irq_restore(status);
+}
+
+/* Leave the task private until its entry and context are ready. */
+static struct thread *thread_alloc(void)
+{
+    struct thread *task;
+    int32_t tid = thread_next_tid();
+
+    if (tid < 0) {
+        return 0;
+    }
+    task = kmalloc(sizeof(*task));
+    if (task == 0) {
+        return 0;
+    }
+    *task = (struct thread){0};
+    task->kstack_base = kmalloc(THREAD_STACK_SIZE);
+    if (task->kstack_base == 0) {
+        kfree(task);
+        return 0;
+    }
+    task->kstack_top = ((uintptr_t)task->kstack_base + THREAD_STACK_SIZE) & ~15UL;
+    task->thread_context.ra = (uintptr_t)thread_bootstrap;
+    task->thread_context.sp = task->kstack_top;
+    task->tid = tid;
+    task->tgid = tid;
+    task->state = THREAD_NEW;
+    return task;
+}
+
+/* Publish exactly once, after all state needed by the first run is set. */
+void thread_publish(struct thread *task)
+{
+    uint64_t status = local_irq_save();
+
+    if (task != 0 && task->state == THREAD_NEW) {
+        task->state = THREAD_RUNNABLE;
+        thread_list_add(task);
+        sched_enqueue(task);
+    }
+    local_irq_restore(status);
+}
+
+/* Create a kernel worker; the scheduler decides when it starts. */
+int thread_create_kernel(void (*entry)(void *), void *arg)
+{
+    struct thread *task;
+
+    if (entry == 0) {
+        return -1;
+    }
+    task = thread_alloc();
+    if (task == 0) {
+        return -1;
+    }
+    task->kind = THREAD_KERNEL;
+    task->entry = entry;
+    task->arg = arg;
+    thread_publish(task);
+    return task->tid;
+}
+
+/* The caller owns the supplied user stack on failure. */
+struct thread *thread_prepare_user(uintptr_t entry, uintptr_t stack_base,
+                                   uintptr_t stack_top)
+{
+    struct thread *task;
+
+    if (entry < USER_CODE_BASE || entry >= USER_CODE_LIMIT || (entry & 1U) ||
+        stack_base == 0 || stack_top <= stack_base || (stack_top & 15U)) {
+        return 0;
+    }
+    task = thread_alloc();
+    if (task == 0) {
+        return 0;
+    }
+    task->kind = THREAD_USER;
+    task->entry = user_task_entry;
+    task->user_entry = entry;
+    task->user_stack_base = stack_base;
+    task->user_stack_top = stack_top;
+    task->tc = (struct trap_context *)(task->kstack_top - TRAP_CONTEXT_ALLOC_SIZE);
+    /* Bootstrap calls use the space below the prepared trap context. */
+    task->thread_context.sp = (uintptr_t)task->tc;
+    user_reset_trap_context(task);
+    return task;
 }
 
 int user_process_create(uintptr_t entry, uintptr_t stack_base, uintptr_t stack_top)
@@ -514,7 +168,7 @@ int user_process_create(uintptr_t entry, uintptr_t stack_base, uintptr_t stack_t
         return -1;
     }
     /* This is a new process, so keep the default tgid == tid. */
-    thread_publish_user(task);
+    thread_publish(task);
     return task->tid;
 }
 
@@ -544,57 +198,47 @@ int thread_create_user(uintptr_t entry, uintptr_t arg, uintptr_t return_pc)
     child->tc->a0 = arg;
     child->tc->ra = return_pc;
     child->tc->gp = parent->tc->gp;
-    thread_publish_user(child);
+    thread_publish(child);
     return child->tid;
 }
 
-int thread_user_group_size(const struct thread *task)
+/*
+ * First entry point for a brand-new thread.
+ *
+ * Both kernel and user constructors seed thread_context.ra with this address.
+ * The first switch_to() returns here, then calls the task's kernel-side entry.
+ * A user task proceeds to sret; a returning kernel worker calls thread_exit().
+ */
+static void thread_bootstrap(void)
 {
-    uint64_t status = thread_irq_save();
-    struct thread *cur;
-    int count = 0;
+    struct thread *cur = thread_current();
 
-    if (task != 0 && task->kind == THREAD_USER) {
-        for (cur = g_all_threads; cur != 0; cur = cur->all_next) {
-            if (cur->kind == THREAD_USER && cur->tgid == task->tgid &&
-                cur->state != THREAD_ZOMBIE) {
-                count++;
-            }
-        }
-    }
-    thread_irq_restore(status);
-    return count;
-}
-
-int thread_user_stack_contains(const struct thread *task, uintptr_t start, uintptr_t end)
-{
-    uint64_t status = thread_irq_save();
-    struct thread *cur;
-    int found = 0;
-
-    /* A sibling may pass a pointer into a live thread's stack. Its lifetime
-     * still ends with the owner: detached thread stacks are not shared heaps.
+    /*
+     * switch_to runs with IRQs masked. A new task has no suspended schedule()
+     * call that could restore its interrupt state, so enable it here.
      */
-    if (task != 0 && task->kind == THREAD_USER && end > start) {
-        for (cur = g_all_threads; cur != 0; cur = cur->all_next) {
-            if (cur->kind == THREAD_USER && cur->tgid == task->tgid &&
-                cur->state != THREAD_ZOMBIE && start >= cur->user_stack_base &&
-                end <= cur->user_stack_top) {
-                found = 1;
-                break;
-            }
+    local_irq_enable();
+
+    if (cur == 0 || cur->entry == 0) {
+        for (;;) {
+            asm volatile("wfi");
         }
     }
-    thread_irq_restore(status);
-    return found;
+
+    cur->entry(cur->arg);
+    thread_exit();
+
+    for (;;) {
+        asm volatile("wfi");
+    }
 }
 
-struct thread *thread_find_by_tid(int32_t tid)
+static struct thread *thread_find_by_tid(int32_t tid)
 {
     struct thread *cur;
     uint64_t sstatus;
 
-    sstatus = thread_irq_save();
+    sstatus = local_irq_save();
     cur = g_all_threads;
     while (cur != 0) {
         if (cur->tid == tid) {
@@ -602,104 +246,8 @@ struct thread *thread_find_by_tid(int32_t tid)
         }
         cur = cur->all_next;
     }
-    thread_irq_restore(sstatus);
+    local_irq_restore(sstatus);
     return cur;
-}
-
-/* This no-MMU kernel has one shared user-code window. Replacing that image
- * is unsafe while another live user task can still execute from it.
- */
-int thread_user_image_busy(const struct thread *except)
-{
-    uint64_t status = thread_irq_save();
-    struct thread *cur = g_all_threads;
-    int busy = 0;
-    while (cur != 0) {
-        if (cur != except && cur->kind == THREAD_USER && cur->state != THREAD_ZOMBIE) {
-            busy = 1;
-            break;
-        }
-        cur = cur->all_next;
-    }
-    thread_irq_restore(status);
-    return busy;
-}
-
-/* Cooperative round-robin scheduler.
- *
- * - runnable workers live in the FIFO run queue
- * - the bootstrap shell context acts as idle
- * - idle is not kept on the run queue
- * - zombies are never scheduled again
- */
-void schedule(void)
-{
-    uint64_t sstatus;
-    struct thread *prev;
-    struct thread *next;
-
-    if (g_threading_started == 0) {
-        return;
-    }
-
-    prev = thread_current();
-    if (prev == 0) {
-        return;
-    }
-
-    /* Keep current-thread state, queue membership and the actual stack/tp
-     * switch atomic. A timer must never see next as current while prev's
-     * stack and tp are still executing.
-     */
-    sstatus = thread_irq_save();
-
-    /* RR policy is just FIFO: pop the head, and later push the yielding
-     * previous worker to the tail.
-     */
-    next = runq_pop();
-    while (next != 0 && next->state != THREAD_RUNNABLE) {
-        next = runq_pop();
-    }
-    if (next == 0) {
-        if (prev->is_idle != 0) {
-            thread_irq_restore(sstatus);
-            return;
-        }
-        next = g_rq.idle;
-    }
-
-    if (prev == next) {
-        prev->state = THREAD_RUNNING;
-        g_thread_current = prev;
-        g_rq.current = prev;
-        thread_irq_restore(sstatus);
-        return;
-    }
-
-    if (prev->state == THREAD_RUNNING) {
-        prev->state = THREAD_RUNNABLE;
-    }
-    next->state = THREAD_RUNNING;
-    g_thread_current = next;
-    g_rq.current = next;
-
-    /* Only non-idle runnable workers go back to the run queue tail. */
-    if (prev->state == THREAD_RUNNABLE && prev->is_idle == 0) {
-        runq_push(prev);
-    }
-    switch_to(prev, next);
-    g_thread_current = thread_current();
-    g_rq.current = g_thread_current;
-    thread_irq_restore(sstatus);
-}
-
-/* Yield explicitly from the current cooperative worker. The scheduler itself
- * decides whether the current thread goes back to the queue or falls back to
- * idle.
- */
-void thread_yield(void)
-{
-    schedule();
 }
 
 void thread_mark_current_zombie(int exit_status)
@@ -711,16 +259,16 @@ void thread_mark_current_zombie(int exit_status)
         return;
     }
 
-    sstatus = thread_irq_save();
+    sstatus = local_irq_save();
     if (cur->state == THREAD_ZOMBIE) {
-        thread_irq_restore(sstatus);
+        local_irq_restore(sstatus);
         return;
     }
     cur->state = THREAD_ZOMBIE;
     cur->exit_status = exit_status;
     cur->znext = g_zombie_head;
     g_zombie_head = cur;
-    thread_irq_restore(sstatus);
+    local_irq_restore(sstatus);
 }
 
 int thread_stop_tid(int32_t tid, int exit_status)
@@ -737,23 +285,23 @@ int thread_stop_tid(int32_t tid, int exit_status)
         return 0;
     }
 
-    sstatus = thread_irq_save();
+    sstatus = local_irq_save();
     if (target->state == THREAD_ZOMBIE) {
-        thread_irq_restore(sstatus);
+        local_irq_restore(sstatus);
         return 0;
     }
-    runq_remove(target);
+    sched_remove(target);
     target->state = THREAD_ZOMBIE;
     target->exit_status = exit_status;
     target->znext = g_zombie_head;
     g_zombie_head = target;
-    thread_irq_restore(sstatus);
+    local_irq_restore(sstatus);
     return 0;
 }
 
 int thread_stop_process(int32_t tgid, int exit_status)
 {
-    uint64_t status = thread_irq_save();
+    uint64_t status = local_irq_save();
     struct thread *cur;
     int found = 0;
 
@@ -764,43 +312,12 @@ int thread_stop_process(int32_t tgid, int exit_status)
             found = 1;
         }
     }
-    thread_irq_restore(status);
+    local_irq_restore(status);
     return found ? 0 : -1;
 }
 
-int thread_has_runnable_tasks(void)
-{
-    uint64_t sstatus;
-    int has_runnable;
-
-    sstatus = thread_irq_save();
-    has_runnable = (g_rq.head != 0);
-    thread_irq_restore(sstatus);
-    return has_runnable;
-}
-
-void thread_request_resched(void)
-{
-    uint64_t sstatus;
-
-    sstatus = thread_irq_save();
-    g_need_resched = 1;
-    thread_irq_restore(sstatus);
-}
-
-int thread_consume_resched_request(void)
-{
-    uint64_t sstatus;
-    int requested;
-
-    sstatus = thread_irq_save();
-    requested = g_need_resched;
-    g_need_resched = 0;
-    thread_irq_restore(sstatus);
-    return requested;
-}
-
-/* Mark the current worker as dead and hand control back to the scheduler.
+/*
+ * Mark the current worker as dead and hand control back to the scheduler.
  *
  * The exiting thread is pushed onto a zombie list so the idle side can recycle
  * its stack and thread object later, outside the switched-away context.
@@ -813,7 +330,8 @@ void thread_exit(void)
         }
     }
 
-    /* After the current worker marks itself ZOMBIE, it must never re-enter the
+    /*
+     * After the current worker marks itself ZOMBIE, it must never re-enter the
      * runnable queue. The idle side later frees the detached stack/object.
      */
     thread_mark_current_zombie(0);
@@ -824,50 +342,109 @@ void thread_exit(void)
     }
 }
 
-/* Demo-mode idle loop.
- *
- * This is the long-lived fallback thread. It keeps reclaiming zombies and
- * gives control back to the scheduler. When no worker is runnable,
- * schedule() simply returns and idle loops again.
- */
-void thread_enter_idle(void)
+void thread_reap_zombies(void)
 {
-    if (g_threading_started == 0) {
-        return;
-    }
-
     for (;;) {
-        kill_zombies();
-        schedule();
-    }
-}
-
-/* Shell-side BE2 helper: keep running the scheduler until control naturally
- * falls back to idle with no runnable tasks left. This lets runu launch a
- * schedulable user task and still return to the shell afterward.
- */
-void thread_run_until_idle(void)
-{
-    if (g_threading_started == 0) {
-        return;
-    }
-
-    for (;;) {
+        struct thread *z;
         uint64_t sstatus;
-        struct thread *cur;
-        int has_runnable;
 
-        kill_zombies();
+        sstatus = local_irq_save();
+        z = g_zombie_head;
+        if (z != 0 && z != thread_current()) {
+            g_zombie_head = z->znext;
+        }
+        local_irq_restore(sstatus);
 
-        sstatus = thread_irq_save();
-        cur = g_rq.current;
-        has_runnable = (g_rq.head != 0);
-        thread_irq_restore(sstatus);
-
-        if (cur != 0 && cur->is_idle != 0 && !has_runnable) {
-            return;
+        if (z == 0 || z == thread_current()) {
+            break;
         }
 
-        schedule();
+        if (z->is_idle != 0) {
+            continue;
+        }
+        thread_list_remove(z);
+        if (z->kind == THREAD_USER && z->user_stack_base != 0) {
+            kfree((void *)(uintptr_t)z->user_stack_base);
+        }
+        if (z->kstack_base != 0) {
+            kfree(z->kstack_base);
+        }
+        kfree(z);
     }
 }
+
+int thread_user_group_size(const struct thread *task)
+{
+    uint64_t status = local_irq_save();
+    struct thread *cur;
+    int count = 0;
+
+    if (task != 0 && task->kind == THREAD_USER) {
+        for (cur = g_all_threads; cur != 0; cur = cur->all_next) {
+            if (cur->kind == THREAD_USER && cur->tgid == task->tgid &&
+                cur->state != THREAD_ZOMBIE) {
+                count++;
+            }
+        }
+    }
+    local_irq_restore(status);
+    return count;
+}
+
+int thread_user_stack_contains(const struct thread *task, uintptr_t start, uintptr_t end)
+{
+    uint64_t status = local_irq_save();
+    struct thread *cur;
+    int found = 0;
+
+    /*
+     * A sibling may pass a pointer into a live thread's stack. Its lifetime
+     * still ends with the owner: detached thread stacks are not shared heaps.
+     */
+    if (task != 0 && task->kind == THREAD_USER && end > start) {
+        for (cur = g_all_threads; cur != 0; cur = cur->all_next) {
+            if (cur->kind == THREAD_USER && cur->tgid == task->tgid &&
+                cur->state != THREAD_ZOMBIE && start >= cur->user_stack_base &&
+                end <= cur->user_stack_top) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    local_irq_restore(status);
+    return found;
+}
+
+/*
+ * This no-MMU kernel has one shared user-code window. Replacing that image
+ * is unsafe while another live user task can still execute from it.
+ */
+int thread_user_image_busy(const struct thread *except)
+{
+    uint64_t status = local_irq_save();
+    struct thread *cur = g_all_threads;
+    int busy = 0;
+    while (cur != 0) {
+        if (cur != except && cur->kind == THREAD_USER && cur->state != THREAD_ZOMBIE) {
+            busy = 1;
+            break;
+        }
+        cur = cur->all_next;
+    }
+    local_irq_restore(status);
+    return busy;
+}
+
+#ifdef KERNEL_TEST
+struct thread *thread_test_find(int32_t tid)
+{
+    return thread_find_by_tid(tid);
+}
+
+uint32_t thread_test_next_tid(uint32_t next)
+{
+    uint32_t old = g_next_tid;
+    g_next_tid = next;
+    return old;
+}
+#endif

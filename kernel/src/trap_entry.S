@@ -1,48 +1,11 @@
+#include "csr.h"
+#include "context_offsets.h"
+
 .section .text
 .align 2
 
 .global trap_entry
 .global trap_return
-
-.equ SSTATUS_SPP, (1 << 8)
-
-/* Match struct trap_context in trap.h; reserve 16-byte-aligned stack space. */
-.equ TC_RA, 0
-.equ TC_SP, 8
-.equ TC_GP, 16
-.equ TC_TP, 24
-.equ TC_T0, 32
-.equ TC_T1, 40
-.equ TC_T2, 48
-.equ TC_S0, 56
-.equ TC_S1, 64
-.equ TC_A0, 72
-.equ TC_A1, 80
-.equ TC_A2, 88
-.equ TC_A3, 96
-.equ TC_A4, 104
-.equ TC_A5, 112
-.equ TC_A6, 120
-.equ TC_A7, 128
-.equ TC_S2, 136
-.equ TC_S3, 144
-.equ TC_S4, 152
-.equ TC_S5, 160
-.equ TC_S6, 168
-.equ TC_S7, 176
-.equ TC_S8, 184
-.equ TC_S9, 192
-.equ TC_S10, 200
-.equ TC_S11, 208
-.equ TC_T3, 216
-.equ TC_T4, 224
-.equ TC_T5, 232
-.equ TC_T6, 240
-.equ TC_SEPC, 248
-.equ TC_SSTATUS, 256
-.equ TC_SCAUSE, 264
-.equ TC_STVAL, 272
-.equ TRAP_CONTEXT_ALLOC_SIZE, 288
 
 /*
  * Enter an S-mode trap without clobbering the interrupted registers.

@@ -1,3 +1,5 @@
+#include "context_offsets.h"
+
     .section .text
     .globl switch_to
 
@@ -10,35 +12,35 @@
  * are saved separately in trap_context.
  */
 switch_to:
-    sd ra,   0(a0)
-    sd sp,   8(a0)
-    sd s0,  16(a0)
-    sd s1,  24(a0)
-    sd s2,  32(a0)
-    sd s3,  40(a0)
-    sd s4,  48(a0)
-    sd s5,  56(a0)
-    sd s6,  64(a0)
-    sd s7,  72(a0)
-    sd s8,  80(a0)
-    sd s9,  88(a0)
-    sd s10, 96(a0)
-    sd s11, 104(a0)
+    sd ra, THREAD_RA(a0)
+    sd sp, THREAD_SP(a0)
+    sd s0, THREAD_S0(a0)
+    sd s1, THREAD_S1(a0)
+    sd s2, THREAD_S2(a0)
+    sd s3, THREAD_S3(a0)
+    sd s4, THREAD_S4(a0)
+    sd s5, THREAD_S5(a0)
+    sd s6, THREAD_S6(a0)
+    sd s7, THREAD_S7(a0)
+    sd s8, THREAD_S8(a0)
+    sd s9, THREAD_S9(a0)
+    sd s10, THREAD_S10(a0)
+    sd s11, THREAD_S11(a0)
 
-    ld ra,   0(a1)
-    ld sp,   8(a1)
-    ld s0,  16(a1)
-    ld s1,  24(a1)
-    ld s2,  32(a1)
-    ld s3,  40(a1)
-    ld s4,  48(a1)
-    ld s5,  56(a1)
-    ld s6,  64(a1)
-    ld s7,  72(a1)
-    ld s8,  80(a1)
-    ld s9,  88(a1)
-    ld s10, 96(a1)
-    ld s11, 104(a1)
+    ld ra, THREAD_RA(a1)
+    ld sp, THREAD_SP(a1)
+    ld s0, THREAD_S0(a1)
+    ld s1, THREAD_S1(a1)
+    ld s2, THREAD_S2(a1)
+    ld s3, THREAD_S3(a1)
+    ld s4, THREAD_S4(a1)
+    ld s5, THREAD_S5(a1)
+    ld s6, THREAD_S6(a1)
+    ld s7, THREAD_S7(a1)
+    ld s8, THREAD_S8(a1)
+    ld s9, THREAD_S9(a1)
+    ld s10, THREAD_S10(a1)
+    ld s11, THREAD_S11(a1)
 
     /* Both user and kernel code reserve tp for the running thread. */
     mv tp, a1
