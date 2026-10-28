@@ -10,7 +10,7 @@
 #include "trap.h"
 #include "plic.h"
 #include "utils.h"
-#include "deferred_work.h"
+#include "bottom_half.h"
 #include "memory.h"
 
 static struct ringbuf uart_rx_buf;
@@ -30,24 +30,6 @@ static volatile unsigned long uart_tx_irq_count = 0;
 static volatile unsigned long uart_rx_fallback_count = 0;
 static volatile unsigned long uart_tx_poll_count = 0;
 static void (*uart_tx_refill)(void);
-
-static int uart_rx_work_run(struct deferred_work *task);
-static int uart_tx_work_run(struct deferred_work *task);
-
-static struct deferred_work uart_rx_work = {
-    .type = DEFERRED_WORK_UART_RX,
-    .prio = 0,
-    .state = DEFERRED_WORK_IDLE,
-    .next = 0,
-    .run = uart_rx_work_run,
-};
-static struct deferred_work uart_tx_work = {
-    .type = DEFERRED_WORK_UART_TX,
-    .prio = 0,
-    .state = DEFERRED_WORK_IDLE,
-    .next = 0,
-    .run = uart_tx_work_run,
-};
 
 #define UART_DEFERRED_WORK_BUDGET 16U
 
@@ -268,10 +250,8 @@ static void uart_reset_runtime_state(void)
     ringbuf_init(&uart_tx_buf);
 
     uart_async_ready = 0;
-    uart_rx_work.state = DEFERRED_WORK_IDLE;
-    uart_rx_work.next = 0;
-    uart_tx_work.state = DEFERRED_WORK_IDLE;
-    uart_tx_work.next = 0;
+    clear_bottom_half(BH_UART_RX);
+    clear_bottom_half(BH_UART_TX);
     uart_tx_refill = 0;
 
     uart_reset_stats();
@@ -495,38 +475,36 @@ void uart_irq_top(void)
         uart_rx_mask();
         /* Preserve a bounded batch before deferring the remaining RX work. */
         uart_rx_drain(UART_DEFERRED_WORK_BUDGET);
-        (void)deferred_work_enqueue(&uart_rx_work);
+        raise_bottom_half(BH_UART_RX);
     }
 
     if (uart_tx_ready_from_status(status)) {
         trace_record(TRACE_UART_TOP_TX, (uint32_t)uart_tx_buf.count);
         uart_tx_mask();
-        (void)deferred_work_enqueue(&uart_tx_work);
+        raise_bottom_half(BH_UART_TX);
     }
 }
 
-static int uart_rx_work_run(struct deferred_work *task)
+void uart_rx_run_bottom_half(void)
 {
     unsigned int budget = UART_DEFERRED_WORK_BUDGET;
 
-    (void)task;
     trace_record(TRACE_UART_RX_BOTTOM, budget);
 
     uart_rx_drain(budget);
 
     if ((uart_reg_read(UART_LSR_REG) & LSR_RX_READY) != 0U) {
-        return 1;
+        raise_bottom_half(BH_UART_RX);
+        return;
     }
 
     uart_rx_unmask();
-    return 0;
 }
 
-static int uart_tx_work_run(struct deferred_work *task)
+void uart_tx_run_bottom_half(void)
 {
     unsigned int budget = UART_DEFERRED_WORK_BUDGET;
 
-    (void)task;
     trace_record(TRACE_UART_TX_BOTTOM, uart_tx_buf.count);
     if (uart_tx_buf_is_empty() && uart_tx_refill != 0) {
         uart_tx_refill();
@@ -541,10 +519,11 @@ static int uart_tx_work_run(struct deferred_work *task)
     if (!uart_tx_buf_is_empty()) {
         uart_tx_unmask();
         /* Wait for TX-ready rather than spinning the runner on a busy device. */
-        return (uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) != 0;
+        if ((uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) != 0)
+            raise_bottom_half(BH_UART_TX);
+        return;
     }
     uart_tx_mask();
-    return 0;
 }
 
 void uart_note_external_irq(uint32_t irq)

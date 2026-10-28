@@ -44,12 +44,16 @@ def main() -> int:
         sources += [ROOT / "kernel/src" / name for name in (
             "switch_to.S", "context_layout.c", "thread.c", "sched.c", "user.c",
             "syscall.c", "trap.c", "exec.c", "demo.c", "demo_uart.c", "trace.c",
-            "timer.c", "uart.c", "deferred_work.c", "ringbuf.c", "sbi.c", "string.c", "plic.c",
+            "timer.c", "uart.c", "bottom_half.c", "custom_work.c", "ringbuf.c", "sbi.c", "string.c", "plic.c",
         )]
         objects = []
         for index, source in enumerate(sources):
             obj = Path(directory) / f"module-{index}.o"
             overrides = []
+            if source.name == "bottom_half.c":
+                overrides += ["-Dtimer_run_bottom_half=test_timer_bottom_half",
+                              "-Duart_rx_run_bottom_half=test_uart_rx_bottom_half",
+                              "-Duart_tx_run_bottom_half=test_uart_tx_bottom_half"]
             if source.name == "trap.c":
                 overrides.append("-Dtrap_dispatch=production_trap_dispatch")
             if source.name == "user.c":

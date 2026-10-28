@@ -31,6 +31,7 @@ void timer_init_state(uint32_t timebase_freq);
 
 void timer_init(void);
 void timer_irq_top(void);
+void timer_run_bottom_half(void);
 void timer_source_mask(void);
 void timer_source_unmask(void);
 void timer_stop(void);

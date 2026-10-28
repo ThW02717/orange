@@ -108,7 +108,7 @@ def main() -> int:
         cases = [
             ("demo test", b"[test]: done", b"pid="),
             ("exec test", b"user task finished, back to shell", b"[trap] scause="),
-            ("demo tasks", b"[tasks] PASS", b"low:start -> timer:top -> low:resume -> timer:bottom -> high -> equal -> lower"),
+            ("demo tasks", b"[tasks] PASS", b"outer:start -> timer:top -> outer:resume -> timer:bottom -> first -> second -> third"),
             ("demo badinst", b"[badinst]: done", b"[trap] user fault, terminate"),
             ("demo fork", b"[fork]: done", b"child2:"),
             ("demo preempt", b"[preempt]: done", b"busy: pid="),

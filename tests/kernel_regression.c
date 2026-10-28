@@ -4,7 +4,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "trap.h"
-#include "deferred_work.h"
+#include "bottom_half.h"
+#include "custom_work.h"
 #include "demo.h"
 
 #include "kernel_test.h"
@@ -18,8 +19,8 @@
 #include "syscall_dispatch.h"
 #include "irqflags.h"
 
-/* Link production modules normally. Only allocation, archive input and the
- * register-roundtrip trap dispatcher are fixtures.
+/* Link production modules normally. Allocation, archive input, the trap
+ * dispatcher and optional bottom-half arrival probes are fixtures.
  */
 static unsigned char heap[4194304] __attribute__((aligned(4096)));
 static unsigned int heap_used;
@@ -33,8 +34,8 @@ static unsigned int callback_b_done;
 static unsigned int reruns;
 static unsigned int expected_final_s_traps;
 static volatile int hardware_task_test;
-static volatile int hardware_low_running;
-static volatile int hardware_high_ran;
+static volatile int hardware_outer_running;
+static volatile int hardware_queued_ran;
 static unsigned int hardware_irq_count;
 static unsigned char user_stack[4096] __attribute__((aligned(16)));
 static unsigned char user_kstack[16384] __attribute__((aligned(16)));
@@ -122,12 +123,12 @@ static void start_test_timer(void)
     local_irq_disable();
 }
 
-static void hardware_high_callback(void *arg)
+static void hardware_queued_callback(void *arg)
 {
     (void)arg;
-    check(!hardware_low_running && hardware_irq_count == 1,
-          "high task ran before interrupted callback returned");
-    hardware_high_ran = 1;
+    check(!hardware_outer_running && hardware_irq_count == 1,
+          "queued callback ran before interrupted callback returned");
+    hardware_queued_ran = 1;
 }
 
 /* Field order follows trap_context; x2/sp is checked separately. The second
@@ -140,7 +141,7 @@ void trap_dispatch(struct trap_context *tc)
         timer_source_mask();
         (void)sbi_set_timer(UINT64_MAX);
         hardware_irq_count++;
-        check(deferred_work_add(hardware_high_callback, 0, 0) == 0, "IRQ enqueue failed");
+        check(defer_callback(hardware_queued_callback, 0) == 0, "IRQ enqueue failed");
         return;
     }
     const uint64_t expected[] = {
@@ -182,32 +183,29 @@ static void worker(void *arg)
     for (unsigned int i = 0; i < 4; i++) { workers++; thread_yield(); }
 }
 
-static int callback_b(struct deferred_work *task)
+static void callback_b(void *arg)
 {
-    (void)task;
+    (void)arg;
     check(callback_a_done, "nested runner executed callback before outer completion");
     callback_b_done++;
-    return 0;
 }
 
-static struct deferred_work task_b = { .type = DEFERRED_WORK_UART_RX, .run = callback_b };
-
-static int callback_a(struct deferred_work *task)
+static void callback_a(void *arg)
 {
-    (void)task;
-    deferred_work_enqueue(&task_b);
-    irq_run_bottom_halves();
+    (void)arg;
+    check(defer_callback(callback_b, 0) == 0, "enqueue callback B");
+    run_bottom_halves();
     check(callback_b_done == 0, "deferred runner reentered");
     supervisor_roundtrip();
     check(callback_b_done == 0, "nested trap ran deferred callback recursively");
     callback_a_done = 1;
-    return 0;
 }
 
-static int rerun_callback(struct deferred_work *task)
+static void rerun_callback(void *arg)
 {
-    if (++reruns == 1) { deferred_work_enqueue(task); }
-    return 0;
+    (void)arg;
+    if (++reruns == 1)
+        check(defer_callback(rerun_callback, 0) == 0, "enqueue successor");
 }
 
 static unsigned int task_events[64];
@@ -222,34 +220,33 @@ static void record_task(void *arg)
     task_events[task_event_count++] = (unsigned int)(uintptr_t)arg;
 }
 
-static void priority_low_callback(void *arg)
+static void outer_callback(void *arg)
 {
     (void)arg;
     record_task((void *)10);
-    check(deferred_work_add(record_task, (void *)13, 5) == 0, "enqueue equal task");
-    check(deferred_work_add(record_task, (void *)14, 7) == 0, "enqueue lower task");
-    check(deferred_work_add(record_task, (void *)12, 1) == 0, "enqueue higher task");
-    irq_run_bottom_halves();
+    check(defer_callback(record_task, (void *)13) == 0, "enqueue first callback");
+    check(defer_callback(record_task, (void *)14) == 0, "enqueue second callback");
+    check(defer_callback(record_task, (void *)12) == 0, "enqueue third callback");
+    run_bottom_halves();
     check(task_event_count == 1, "explicit nested runner executed a callback");
     supervisor_roundtrip();
-    check(task_event_count == 1, "nested trap executed a higher-priority callback");
+    check(task_event_count == 1, "nested trap executed a later callback");
     record_task((void *)11);
 }
 
-static void sequential_rank_callback(void *arg)
+static void sequential_callback(void *arg)
 {
-    unsigned int rank = (unsigned int)(uintptr_t)arg;
+    unsigned int step = (unsigned int)(uintptr_t)arg;
     unsigned int before;
 
-    record_task((void *)(uintptr_t)rank);
+    record_task((void *)(uintptr_t)step);
     before = task_event_count;
-    if (rank != 0) {
-        check(deferred_work_add(sequential_rank_callback, (void *)(uintptr_t)(rank - 1),
-                       (int)rank - 1) == 0, "enqueue next rank");
+    if (step != 0) {
+        check(defer_callback(sequential_callback, (void *)(uintptr_t)(step - 1)) == 0, "enqueue next step");
         supervisor_roundtrip();
-        check(task_event_count == before, "rank callback ran recursively");
+        check(task_event_count == before, "step callback ran recursively");
     }
-    record_task((void *)(uintptr_t)(rank + 8));
+    record_task((void *)(uintptr_t)(step + 8));
 }
 
 static void task_stack_worker(void *arg)
@@ -258,82 +255,182 @@ static void task_stack_worker(void *arg)
     volatile unsigned char *guard = self->kstack_base;
     (void)arg;
     for (unsigned int i = 0; i < 32; i++) { guard[i] = 0xa5; }
-    check(deferred_work_add(sequential_rank_callback, (void *)7, 7) == 0, "enqueue rank ladder");
-    irq_run_bottom_halves();
+    check(defer_callback(sequential_callback, (void *)7) == 0, "enqueue step ladder");
+    run_bottom_halves();
     for (unsigned int i = 0; i < 32; i++) {
         check(guard[i] == 0xa5, "tasks exhausted the thread kernel stack");
     }
 }
 
-static void hardware_low_callback(void *arg)
+static void hardware_outer_callback(void *arg)
 {
     uint64_t start = timer_read();
     (void)arg;
-    hardware_low_running = 1;
+    hardware_outer_running = 1;
     (void)sbi_set_timer(start + 10000);
     asm volatile("csrs sie, %0" : : "r"(SIE_STIE) : "memory");
     while (hardware_irq_count == 0 && timer_read() - start < 10000000) {
         asm volatile("" ::: "memory");
     }
-    check(!hardware_high_ran && hardware_irq_count == 1,
+    check(!hardware_queued_ran && hardware_irq_count == 1,
           "top half was blocked or bottom half ran recursively");
-    hardware_low_running = 0;
+    hardware_outer_running = 0;
 }
 
-static void test_priority_tasks(void)
+/* Test the production bitmap runner with controlled subsystem arrivals. */
+static int bitmap_probe;
+static unsigned int bitmap_timer_runs;
+
+void test_timer_bottom_half(void)
+{
+    if (!bitmap_probe) {
+        timer_run_bottom_half();
+        return;
+    }
+    record_task((void *)20);
+    if (++bitmap_timer_runs < 3) {
+        raise_bottom_half(BH_TIMER);
+        raise_bottom_half(BH_TIMER);
+        run_bottom_halves();
+        check(bitmap_timer_runs < 3, "nested runner consumed next round");
+    }
+}
+
+void test_uart_rx_bottom_half(void)
+{
+    if (bitmap_probe)
+        record_task((void *)21);
+    else
+        uart_rx_run_bottom_half();
+}
+
+void test_uart_tx_bottom_half(void)
+{
+    if (bitmap_probe)
+        record_task((void *)22);
+    else
+        uart_tx_run_bottom_half();
+}
+
+static void submit_next_batch(void *arg)
+{
+    (void)arg;
+    record_task((void *)30);
+    raise_bottom_half(BH_TIMER);
+    check(defer_callback(record_task, (void *)32) == 0, "submit next batch");
+}
+
+static void test_bitmap_rounds(void)
+{
+    static const unsigned int expected[] = {20, 21, 22, 23, 20, 20};
+    static const unsigned int batches[] = {30, 31, 20, 32};
+
+    bitmap_probe = 1;
+    bitmap_timer_runs = 0;
+    task_event_count = 0;
+    raise_bottom_half(BH_TIMER);
+    raise_bottom_half(BH_TIMER);
+    raise_bottom_half(BH_UART_RX);
+    raise_bottom_half(BH_UART_TX);
+    raise_bottom_half(BH_COUNT);
+    raise_bottom_half((enum bottom_half)-1);
+    check(defer_callback(record_task, (void *)23) == 0, "submit custom bit");
+    run_bottom_halves();
+    check(task_event_count == 6, "bitmap duplicated or lost a type");
+    for (unsigned int i = 0; i < 6; i++)
+        check(task_events[i] == expected[i], "new TIMER overtook this round's UART/custom");
+    check(!bottom_halves_pending(), "bitmap did not drain");
+
+    task_event_count = 0;
+    check(defer_callback(submit_next_batch, 0) == 0, "submit batch producer");
+    check(defer_callback(record_task, (void *)31) == 0, "submit batch tail");
+    run_bottom_halves();
+    check(task_event_count == 4, "custom batch lost work");
+    for (unsigned int i = 0; i < 4; i++)
+        check(task_events[i] == batches[i], "custom appended work to current batch");
+
+    raise_bottom_half(BH_TIMER);
+    raise_bottom_half(BH_UART_RX);
+    clear_bottom_half(BH_TIMER);
+    task_event_count = 0;
+    local_irq_enable();
+    run_bottom_halves();
+    check(local_irqs_enabled(), "runner lost caller's enabled SIE");
+    local_irq_disable();
+    check(task_event_count == 1 && task_events[0] == 21, "clear affected another bit");
+    bitmap_probe = 0;
+    puts_raw("[REGRESSION] bitmap coalescing, rounds, UART fairness, custom snapshots, SIE restore: PASS\n");
+}
+
+static void fill_pool_while_running(void *arg)
+{
+    (void)arg;
+    for (unsigned int i = 0; i < CUSTOM_WORK_CAPACITY - 1; i++)
+        check(defer_callback(record_task, (void *)(uintptr_t)i) == 0,
+              "running slot test filled early");
+    check(defer_callback(record_task, 0) == -1, "running slot reused before return");
+    run_bottom_halves();
+    check(task_event_count == 0, "new custom batch ran recursively");
+}
+
+static void test_custom_tasks(void)
 {
     uint64_t status;
     unsigned int before;
 
     task_event_count = 0;
-    check(deferred_work_add(record_task, (void *)1, 3) == 0 &&
-          deferred_work_add(record_task, (void *)2, 3) == 0 &&
-          deferred_work_add(record_task, (void *)0, 1) == 0, "queue sorted callbacks");
-    irq_run_bottom_halves();
-    check(task_event_count == 3 && task_events[0] == 0 &&
-          task_events[1] == 1 && task_events[2] == 2, "priority/FIFO order");
+    check(defer_callback(record_task, (void *)1) == 0 &&
+          defer_callback(record_task, (void *)2) == 0 &&
+          defer_callback(record_task, (void *)0) == 0, "queue FIFO callbacks");
+    run_bottom_halves();
+    check(task_event_count == 3 && task_events[0] == 1 &&
+          task_events[1] == 2 && task_events[2] == 0, "custom FIFO order");
 
     task_event_count = 0;
-    check(deferred_work_add(priority_low_callback, 0, 5) == 0, "enqueue low callback");
-    irq_run_bottom_halves();
-    check(task_event_count == 5, "missing priority task");
+    check(defer_callback(outer_callback, 0) == 0, "enqueue outer callback");
+    run_bottom_halves();
+    check(task_event_count == 5, "missing custom callback");
     for (unsigned int i = 0; i < 5; i++) {
-        check(task_events[i] == 10 + i, "priority task resume order");
+        check(task_events[i] == (unsigned int[]){10, 11, 13, 14, 12}[i], "custom batch order");
     }
 
     task_event_count = 0;
-    for (unsigned int i = 0; i < DEFERRED_CALLBACK_CAPACITY; i++) {
-        check(deferred_work_add(record_task, (void *)(uintptr_t)i, 3) == 0, "pool filled early");
+    for (unsigned int i = 0; i < CUSTOM_WORK_CAPACITY; i++) {
+        check(defer_callback(record_task, (void *)(uintptr_t)i) == 0, "pool filled early");
     }
-    check(deferred_work_add(record_task, 0, 3) == -1, "pool overflow accepted");
-    check(deferred_work_add(0, 0, 3) == -1 && deferred_work_add(record_task, 0, -1) == -1 &&
-          deferred_work_add(record_task, 0, DEFERRED_WORK_PRIORITY_LEVELS) == -1, "invalid callback accepted");
-    irq_run_bottom_halves();
-    check(task_event_count == DEFERRED_CALLBACK_CAPACITY, "pool lost callbacks");
-    check(deferred_work_add(record_task, 0, 3) == 0, "pool slot was not released");
-    irq_run_bottom_halves();
+    check(defer_callback(record_task, 0) == -1, "pool overflow accepted");
+    check(defer_callback(0, 0) == -1, "invalid callback accepted");
+    run_bottom_halves();
+    check(task_event_count == CUSTOM_WORK_CAPACITY, "pool lost callbacks");
+    check(defer_callback(record_task, 0) == 0, "pool slot was not released");
+    run_bottom_halves();
     asm volatile("csrr %0, sstatus" : "=r"(status));
     check(!(status & SSTATUS_SIE), "runner changed caller's disabled SIE");
 
     task_event_count = 0;
-    /* Every rank must return before a higher rank can run on this stack. */
+    check(defer_callback(fill_pool_while_running, 0) == 0, "queue running slot test");
+    run_bottom_halves();
+    check(task_event_count == CUSTOM_WORK_CAPACITY - 1, "next batch lost callbacks");
+
+    task_event_count = 0;
+    /* Each callback returns before its successor runs on this stack. */
     before = thread_test_next_tid(1000);
     check(thread_create_kernel(task_stack_worker, 0) > 0, "create stack test worker");
     thread_run_until_idle();
     (void)thread_test_next_tid(before);
-    check(task_event_count == 16, "missing rank callback");
+    check(task_event_count == 16, "missing step callback");
     for (unsigned int i = 0; i < 8; i++) {
         check(task_events[2 * i] == 7 - i && task_events[2 * i + 1] == 15 - i,
-              "rank callback did not finish before its successor");
+              "step callback did not finish before its successor");
     }
 
     hardware_task_test = 1;
-    check(deferred_work_add(hardware_low_callback, 0, 5) == 0, "enqueue hardware test");
-    irq_run_bottom_halves();
+    check(defer_callback(hardware_outer_callback, 0) == 0, "enqueue hardware test");
+    run_bottom_halves();
     hardware_task_test = 0;
     timer_source_mask();
-    check(hardware_high_ran && deferred_work_queue_empty(), "queued high task was lost");
-    puts_raw("[REGRESSION] task priority/FIFO, non-reentrant callbacks, pool reuse, nested timer top half: PASS\n");
+    check(hardware_queued_ran && !bottom_halves_pending(), "queued queued callback was lost");
+    puts_raw("[REGRESSION] custom FIFO/batches, non-reentrant callbacks, pool reuse, nested timer top half: PASS\n");
 }
 
 static unsigned int timer_cleanup_count;
@@ -357,7 +454,7 @@ static void stop_timer_task(void *arg)
 static void timer_deferred_stop_callback(void *arg)
 {
     (*(unsigned int *)arg)++;
-    check(deferred_work_add(stop_timer_task, 0, 0) == 0, "enqueue higher-priority stop");
+    check(defer_callback(stop_timer_task, 0) == 0, "enqueue timer stop");
     supervisor_roundtrip();
     check(timer_is_running() && timer_cleanup_count == 0,
           "queued stop ran before timer callback returned");
@@ -372,7 +469,7 @@ static void test_timer_ownership(void)
     check(add_timer_with_cleanup(timer_test_callback, &fired, 10000000,
                                  timer_test_cleanup) == 0, "queue owned future timer");
     timer_irq_top();
-    irq_run_bottom_halves();
+    run_bottom_halves();
     check(fired == 1 && timer_cleanup_count == 1, "fired payload not released once");
     timer_stop();
     check(fired == 1 && timer_cleanup_count == 2, "cancelled payload not released once");
@@ -388,9 +485,9 @@ static void test_timer_ownership(void)
     check(add_timer_with_cleanup(timer_test_callback, &fired, 10000000,
                                  timer_test_cleanup) == 0, "queue cancelled future timer");
     timer_irq_top();
-    irq_run_bottom_halves();
+    run_bottom_halves();
     check(fired == 1 && timer_cleanup_count == 2 && !timer_is_running() &&
-          deferred_work_queue_empty(), "deferred stop leaked/repeated a callback or cleanup");
+          !bottom_halves_pending(), "deferred stop leaked/repeated a callback or cleanup");
     puts_raw("[REGRESSION] timer fire/cancel/failure/deferred-stop payload ownership: PASS\n");
 }
 
@@ -399,6 +496,28 @@ static void stop_from_callback(void *arg)
     unsigned int *called = (unsigned int *)arg;
     (*called)++;
     timer_stop();
+}
+
+static void test_timer_budget(void)
+{
+    unsigned int fired = 0;
+    unsigned int before = frees;
+
+    start_test_timer();
+    for (unsigned int i = 0; i < 20; i++)
+        check(add_timer(timer_test_callback, &fired, 0) == 0, "queue budget events");
+    /* Drive the real handler with IRQs off to inspect the boundary between
+     * batches before the next hardware timer notification can arrive.
+     */
+    timer_run_bottom_half();
+    check(fired == 16 && timer_pending_count() == 4 && bottom_halves_pending(),
+          "timer failed to yield after its event budget");
+    clear_bottom_half(BH_TIMER);
+    timer_run_bottom_half();
+    check(fired == 20 && timer_pending_count() == 0 && frees - before == 20,
+          "timer budget lost events or cleanup");
+    timer_stop();
+    puts_raw("[REGRESSION] real timer event budget and continuation: PASS\n");
 }
 
 static void test_user_groups(void)
@@ -552,8 +671,6 @@ void regression_main(void)
 {
     int pid;
     struct exec_result result;
-    struct deferred_work task_a = { .type = DEFERRED_WORK_TIMER, .run = callback_a };
-    struct deferred_work task_rerun = { .type = DEFERRED_WORK_UART_TX, .run = rerun_callback };
     struct trap_context *tc;
     unsigned int timer_called = 0;
     asm volatile("csrw stvec, %0" : : "r"(trap_entry));
@@ -604,34 +721,35 @@ void regression_main(void)
     test_user_groups();
 
     supervisor_roundtrip();
-    deferred_work_init();
-    deferred_work_enqueue(&task_a);
-    irq_run_bottom_halves();
-    check(callback_a_done && callback_b_done == 1 && deferred_work_queue_empty(), "deferred completion");
-    deferred_work_enqueue(&task_rerun);
-    irq_run_bottom_halves();
-    check(reruns == 2 && task_rerun.state == DEFERRED_WORK_IDLE, "running task lost new work");
-    deferred_work_enqueue(&task_rerun);
-    deferred_work_enqueue(&task_b);
-    deferred_work_cancel(&task_rerun);
-    check(task_rerun.state == DEFERRED_WORK_IDLE && task_rerun.next == 0, "cancel queued task");
-    irq_run_bottom_halves();
-    check(reruns == 2 && callback_b_done == 2 && deferred_work_queue_empty(), "cancel preserved other queued tasks");
-    puts_raw("[REGRESSION] deferred runner nesting: PASS\n");
-    test_priority_tasks();
+    bottom_half_init();
+    check(defer_callback(callback_a, 0) == 0, "enqueue callback A");
+    run_bottom_halves();
+    check(callback_a_done && callback_b_done == 1 && !bottom_halves_pending(), "deferred completion");
+    check(defer_callback(rerun_callback, 0) == 0, "enqueue successor test");
+    run_bottom_halves();
+    check(reruns == 2 && !bottom_halves_pending(), "callback submission lost");
+    /* Clearing one type must leave the other pending types intact. */
+    raise_bottom_half(BH_TIMER);
+    check(defer_callback(callback_b, 0) == 0, "enqueue callback B");
+    clear_bottom_half(BH_TIMER);
+    run_bottom_halves();
+    check(callback_b_done == 2 && !bottom_halves_pending(), "clear lost another type");
+    puts_raw("[REGRESSION] bottom-half runner nesting: PASS\n");
+    test_custom_tasks();
+    test_bitmap_rounds();
 
     timer_init_state(10000000);
     start_test_timer();
     timer_irq_top();
-    deferred_work_enqueue(&task_b);
+    check(defer_callback(callback_b, 0) == 0, "enqueue callback B");
     timer_stop();
-    irq_run_bottom_halves();
-    check(callback_b_done == 3 && deferred_work_queue_empty(),
+    run_bottom_halves();
+    check(callback_b_done == 3 && !bottom_halves_pending(),
           "timer stop corrupted deferred queue");
     start_test_timer();
     check(add_timer(stop_from_callback, &timer_called, 0) == 0, "create callback timer");
     timer_irq_top();
-    irq_run_bottom_halves();
+    run_bottom_halves();
     {
         uint64_t enabled_sources;
         asm volatile("csrr %0, sie" : "=r"(enabled_sources));
@@ -640,6 +758,7 @@ void regression_main(void)
     }
     puts_raw("[REGRESSION] timer queued-stop/callback-stop: PASS\n");
     test_timer_ownership();
+    test_timer_budget();
 
     asm volatile("csrci sstatus, 2" ::: "memory");
     uart_test_async(1);

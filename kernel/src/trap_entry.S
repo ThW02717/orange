@@ -75,7 +75,7 @@ trap_save_context:
     mv a0, sp /* trap_context */
     call trap_dispatch
 
-    call irq_run_bottom_halves
+    call run_bottom_halves
 
     /*
      * Saved SPP: 0 = U-mode, 1 = S-mode.

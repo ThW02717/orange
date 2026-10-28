@@ -18,7 +18,8 @@
 #include "thread.h"
 #include "timer.h"
 #include "uart.h"
-#include "deferred_work.h"
+#include "bottom_half.h"
+#include "custom_work.h"
 
 struct demo_thread_arg {
     char tag;
@@ -115,7 +116,7 @@ static int demo_nested(void)
 static struct {
     unsigned long generation;
     volatile int active;
-    volatile int high_done;
+    volatile int first_done;
     int failed;
     unsigned int count;
     unsigned int events[8];
@@ -133,20 +134,20 @@ static void demo_task_event(unsigned int event)
     local_irq_restore(status);
 }
 
-static void demo_task_high(void *arg)
+static void demo_task_first(void *arg)
 {
     (void)arg;
     demo_task_event(5);
-    task_demo.high_done = 1;
+    task_demo.first_done = 1;
 }
 
-static void demo_task_equal(void *arg)
+static void demo_task_second(void *arg)
 {
     (void)arg;
     demo_task_event(6);
 }
 
-static void demo_task_lower(void *arg)
+static void demo_task_third(void *arg)
 {
     (void)arg;
     demo_task_event(7);
@@ -159,14 +160,14 @@ static void demo_task_timer(void *arg)
         return;
     }
     demo_task_event(4);
-    if (deferred_work_add(demo_task_high, 0, 0) != 0 ||
-        deferred_work_add(demo_task_equal, 0, 5) != 0 ||
-        deferred_work_add(demo_task_lower, 0, 7) != 0) {
+    if (defer_callback(demo_task_first, 0) != 0 ||
+        defer_callback(demo_task_second, 0) != 0 ||
+        defer_callback(demo_task_third, 0) != 0) {
         task_demo.failed = 1;
     }
 }
 
-static void demo_task_low(void *arg)
+static void demo_task_outer(void *arg)
 {
     uint64_t start = timer_read();
     uint64_t delay = timebase_frequency / 100U;
@@ -188,7 +189,7 @@ static void demo_task_low(void *arg)
     } else {
         task_demo.failed = 1;
     }
-    if (task_demo.high_done) {
+    if (task_demo.first_done) {
         task_demo.failed = 1;
     }
     demo_task_event(3);
@@ -197,8 +198,8 @@ static void demo_task_low(void *arg)
 static int demo_tasks(void)
 {
     static const char *const names[] = {
-        "?", "low:start", "timer:top", "low:resume", "timer:bottom",
-        "high", "equal", "lower"
+        "?", "outer:start", "timer:top", "outer:resume", "timer:bottom",
+        "first", "second", "third"
     };
 
     if (timebase_frequency == 0) {
@@ -207,16 +208,16 @@ static int demo_tasks(void)
     }
     task_demo.generation++;
     task_demo.active = 1;
-    task_demo.high_done = 0;
+    task_demo.first_done = 0;
     task_demo.failed = 0;
     task_demo.count = 0;
     trace_reset();
-    if (deferred_work_add(demo_task_low, (void *)(uintptr_t)task_demo.generation, 5) != 0) {
+    if (defer_callback(demo_task_outer, (void *)(uintptr_t)task_demo.generation) != 0) {
         task_demo.active = 0;
         uart_send_string("[tasks] callback queue full\n");
         return -1;
     }
-    irq_run_bottom_halves();
+    run_bottom_halves();
     task_demo.active = 0;
 
     uart_send_string("[tasks] ");
@@ -229,7 +230,7 @@ static int demo_tasks(void)
         }
     }
     uart_send_string("\n");
-    if (task_demo.failed || task_demo.count != 7U || !task_demo.high_done) {
+    if (task_demo.failed || task_demo.count != 7U || !task_demo.first_done) {
         uart_send_string("[tasks] FAIL\n");
         return -1;
     }

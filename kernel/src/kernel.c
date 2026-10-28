@@ -8,7 +8,7 @@
 #include "memory.h"
 #include "timer.h"
 #include "trap.h"
-#include "deferred_work.h"
+#include "bottom_half.h"
 
 /*
  * Bootstrap-core-only kernel entry. Secondary harts are started after the
@@ -200,7 +200,7 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
     timer_probe_readout();
     timer_probe_sbi_support();
 
-    deferred_work_init();
+    bottom_half_init();
 
     /* One SBI timer serves scheduler ticks and queued timeout events. */
     timer_init();

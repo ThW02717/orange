@@ -27,6 +27,8 @@ void uart_tx_wait_idle(void);
 /* Bring up the UART0 -> PLIC -> S-mode external-interrupt path. */
 void uart_irq_init(void);
 void uart_irq_top(void);
+void uart_rx_run_bottom_half(void);
+void uart_tx_run_bottom_half(void);
 void uart_note_external_irq(uint32_t irq);
 void uart_reset_stats(void);
 void uart_get_stats(struct uart_stats *stats);

@@ -1,6 +1,6 @@
 /*
  * Software timers: add_timer() inserts a deadline; timer_irq_top() defers it.
- * timer_work_run() runs due callbacks and rearms the shared SBI timer.
+ * timer_run_bottom_half() runs due callbacks and rearms the shared SBI timer.
  */
 #include "irqflags.h"
 #include "timer.h"
@@ -8,7 +8,7 @@
 #include "csr.h"
 #include "uart.h"
 #include "memory.h"
-#include "deferred_work.h"
+#include "bottom_half.h"
 
 /*
  * Shared timer subsystem state.
@@ -39,15 +39,7 @@ static struct timer_event *timer_head = 0;
 static int timer_enabled = 0;
 static uint64_t sched_tick_interval = 0;
 static uint64_t sched_tick_deadline = 0;
-static int timer_work_run(struct deferred_work *task);
-
-static struct deferred_work timer_work = {
-    .type = DEFERRED_WORK_TIMER,
-    .prio = 0,
-    .state = DEFERRED_WORK_IDLE,
-    .next = 0,
-    .run = timer_work_run,
-};
+#define TIMER_EVENT_BUDGET 16U
 /*
  * Invariants for the software-timer queue:
  * 1. timer_head points to a list sorted by expire, smallest first.
@@ -221,27 +213,26 @@ void timer_irq_top(void)
     timer_source_mask();
     /* Do not walk the timeout list while entering the interrupt. */
     trace_record(TRACE_TIMER_TOP, 0U);
-    (void)deferred_work_enqueue(&timer_work);
+    raise_bottom_half(BH_TIMER);
 }
 
-static int timer_work_run(struct deferred_work *task)
+void timer_run_bottom_half(void)
 {
     uint64_t now;
     uint64_t status;
 
-    (void)task;
     if (!timer_enabled) {
-        return 0;
+        return;
     }
     trace_record(TRACE_TIMER_BOTTOM, timer_pending_count());
 
     if (timebase_frequency == 0) {
         timer_source_unmask();
-        return 0;
+        return;
     }
 
     timer_irq_count++;
-    for (;;) {
+    for (unsigned int done = 0; done < TIMER_EVENT_BUDGET; done++) {
         struct timer_event *event;
 
         status = local_irq_save();
@@ -278,11 +269,13 @@ static int timer_work_run(struct deferred_work *task)
 
     status = local_irq_save();
     if (timer_enabled) {
+        /* Leave the remaining due events for the next dispatch round. */
+        if (timer_head != 0 && timer_head->expire <= timer_read())
+            raise_bottom_half(BH_TIMER);
         timer_reprogram_locked();
         asm volatile("csrs sie, %0" : : "r"(SIE_STIE) : "memory");
     }
     local_irq_restore(status);
-    return 0;
 }
 
 void timer_stop(void)
@@ -293,7 +286,7 @@ void timer_stop(void)
     sstatus = local_irq_save();
     timer_source_mask();
     timer_enabled = 0;
-    deferred_work_cancel(&timer_work);
+    clear_bottom_half(BH_TIMER);
     pending = timer_head;
     timer_head = 0;
     next_deadline = 0;
