@@ -20,13 +20,10 @@ struct memory_stats_snapshot {
 
 /* Per-size-class slab state used by tests and debug output. */
 struct memory_slab_class_snapshot {
-    unsigned int class_idx;
     unsigned int obj_size;
-    unsigned int obj_stride;
     unsigned int partial_count;
     unsigned int full_count;
     unsigned int empty_count;
-    unsigned int cached_empty_count;
 };
 
 /* Initialize from DT RAM and the archive range resolved by platform_init(). */

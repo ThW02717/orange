@@ -37,14 +37,10 @@ struct slab_link {
  * It owns three lists of slab blocks:
  * - partial: free objects available, including a freshly built slab
  * - full: no free objects left
- * - empty: no allocated objects; kept for quick reuse up to empty_count limit
+ * - empty: no allocated objects; keep at most one for quick reuse
  */
 struct kmem_cache {
-    unsigned int class_idx; /* Index in g_kmalloc_classes. */
-    unsigned int obj_size; /* Requested class size visible to callers. */
-    unsigned int obj_align; /* Alignment used when laying objects out. */
-    unsigned int obj_stride; /* Actual distance between objects after alignment. */
-    unsigned int empty_count; /* Number of cached empty slab blocks. */
+    unsigned int obj_size; /* Power-of-two size, alignment, and object stride. */
     struct slab_header *slabs_partial;
     struct slab_header *slabs_full;
     struct slab_header *slabs_empty;
@@ -223,7 +219,6 @@ static void cache_add_empty(struct kmem_cache *cache, struct slab_header *slab)
         cache->slabs_empty->link.prev = slab;
     }
     cache->slabs_empty = slab;
-    cache->empty_count++;
 }
 
 static void cache_remove_slab(struct slab_header *slab)
@@ -249,10 +244,6 @@ static void cache_remove_slab(struct slab_header *slab)
 
     if (slab->link.next != 0) {
         slab->link.next->link.prev = slab->link.prev;
-    }
-
-    if (slab->state == SLAB_EMPTY && cache->empty_count > 0) {
-        cache->empty_count--;
     }
 
     slab->link.prev = 0;
@@ -353,27 +344,6 @@ static int size_to_class(unsigned long size)
     return -1;
 }
 
-/* Class index to payload size. */
-static unsigned int class_to_size(unsigned int class_idx)
-{
-    if (class_idx >= KMALLOC_CLASS_COUNT) {
-        return 0;
-    }
-    return (unsigned int)g_kmalloc_classes[class_idx];
-}
-
-/* Round size up to alignment. Current power-of-two classes have stride == size. */
-static unsigned int slab_calc_stride(unsigned int obj_size, unsigned int align)
-{
-    if (obj_size == 0) {
-        return 0;
-    }
-    if (align == 0) {
-        align = 1;
-    }
-    return (unsigned int)align_up_u64((uint64_t)obj_size, (uint64_t)align);
-}
-
 /* Skip the header, then align the first object. */
 static void *slab_object_start(void *page_base, struct kmem_cache *cache)
 {
@@ -385,7 +355,7 @@ static void *slab_object_start(void *page_base, struct kmem_cache *cache)
     }
 
     base = (uint64_t)(uintptr_t)page_base;
-    start = align_up_u64(base + sizeof(struct slab_header), (uint64_t)cache->obj_align);
+    start = align_up_u64(base + sizeof(struct slab_header), (uint64_t)cache->obj_size);
     return (void *)(uintptr_t)start;
 }
 
@@ -396,7 +366,7 @@ static unsigned int slab_calc_capacity(void *page_base, struct kmem_cache *cache
     uint64_t start;
     uint64_t usable;
 
-    if (page_base == 0 || cache == 0 || cache->obj_stride == 0) {
+    if (page_base == 0 || cache == 0 || cache->obj_size == 0) {
         return 0;
     }
 
@@ -407,7 +377,7 @@ static unsigned int slab_calc_capacity(void *page_base, struct kmem_cache *cache
     }
 
     usable = (base + PAGE_SIZE) - start;
-    return (unsigned int)(usable / (uint64_t)cache->obj_stride);
+    return (unsigned int)(usable / (uint64_t)cache->obj_size);
 }
 
 /* Get one buddy page and build its object freelist before publishing the slab. */
@@ -420,7 +390,6 @@ static int kmalloc_refill_class(unsigned int class_idx)
     uint64_t base;
     uint64_t chunks;
     uint64_t i;
-    uint64_t chunk_size;
 
     if (class_idx >= KMALLOC_CLASS_COUNT) {
         return -1;
@@ -445,7 +414,6 @@ static int kmalloc_refill_class(unsigned int class_idx)
     slab->state = SLAB_PARTIAL;
 
     obj_start = slab_object_start(page, cache);
-    chunk_size = (uint64_t)cache->obj_stride;
     chunks = slab->capacity;
     if (chunks == 0) {
         page_set_kind(base, PAGE_KIND_NONE);
@@ -457,7 +425,7 @@ static int kmalloc_refill_class(unsigned int class_idx)
      * onto the slab's LIFO object freelist.
      */
     for (i = 0; i < chunks; i++) {
-        uint64_t caddr = (uint64_t)(uintptr_t)obj_start + i * chunk_size;
+        uint64_t caddr = (uint64_t)(uintptr_t)obj_start + i * (uint64_t)cache->obj_size;
         void *obj = (void *)(uintptr_t)caddr;
         slab_push_free(slab, obj);
     }
@@ -617,7 +585,7 @@ static void kfree_locked(void *ptr)
             return;
         }
         cache = slab->cache;
-        if (cache == 0 || cache->obj_stride == 0) {
+        if (cache == 0 || cache->obj_size == 0) {
             log_prefix();
             uart_send_string("[Error] kfree slab cache metadata invalid at page ");
             log_hex_u64(slab_base);
@@ -626,7 +594,7 @@ static void kfree_locked(void *ptr)
         }
 
         obj_start = (uint64_t)(uintptr_t)slab_object_start((void *)(uintptr_t)slab_base, cache);
-        obj_end = obj_start + (uint64_t)cache->obj_stride * (uint64_t)slab->capacity;
+        obj_end = obj_start + (uint64_t)cache->obj_size * (uint64_t)slab->capacity;
         if (ptr_addr < obj_start || ptr_addr >= obj_end) {
             log_prefix();
             uart_send_string("[Error] kfree slab ptr out of object range: ptr ");
@@ -640,12 +608,12 @@ static void kfree_locked(void *ptr)
         }
 
         offset = ptr_addr - obj_start;
-        if ((offset % (uint64_t)cache->obj_stride) != 0) {
+        if ((offset % (uint64_t)cache->obj_size) != 0) {
             log_prefix();
             uart_send_string("[Error] kfree slab ptr misaligned to object stride: ptr ");
             log_hex_u64(ptr_addr);
             uart_send_string(", stride ");
-            uart_send_dec(cache->obj_stride);
+            uart_send_dec(cache->obj_size);
             uart_send_string("\n");
             return;
         }
@@ -681,7 +649,7 @@ static void kfree_locked(void *ptr)
         }
         if (slab->inuse == 0) {
             cache_remove_slab(slab);
-            if (cache->empty_count < KMEM_CACHE_EMPTY_LIMIT) {
+            if (cache->slabs_empty == 0) {
                 cache_add_empty(cache, slab);
 
                 if (memory_allocator_log_enabled()) {
@@ -800,13 +768,11 @@ void memory_print_slabinfo(void)
     local_irq_restore(status);
 
     uart_send_string("Slab caches:\n");
-    uart_send_string("class size stride partial full empty\n");
+    uart_send_string("class size partial full empty\n");
     for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
         uart_send_dec(i);
         uart_send_string(" ");
         uart_send_dec(snapshot[i].obj_size);
-        uart_send_string(" ");
-        uart_send_dec(snapshot[i].obj_stride);
         uart_send_string(" ");
         uart_send_dec(snapshot[i].partial_count);
         uart_send_string(" ");
@@ -852,13 +818,10 @@ int memory_get_slab_class_snapshot(unsigned int class_idx, struct memory_slab_cl
     status = local_irq_save();
 
     cache = &g_kmem_caches[class_idx];
-    out->class_idx = class_idx;
     out->obj_size = cache->obj_size;
-    out->obj_stride = cache->obj_stride;
     out->partial_count = slab_list_count(cache->slabs_partial);
     out->full_count = slab_list_count(cache->slabs_full);
     out->empty_count = slab_list_count(cache->slabs_empty);
-    out->cached_empty_count = cache->empty_count;
     local_irq_restore(status);
     return 0;
 }
@@ -920,12 +883,7 @@ void slab_init(void)
     unsigned int i;
 
     for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
-        g_kmem_caches[i].class_idx = (unsigned int)i;
-        g_kmem_caches[i].obj_size = class_to_size((unsigned int)i);
-        g_kmem_caches[i].obj_align = g_kmem_caches[i].obj_size;
-        g_kmem_caches[i].obj_stride =
-            slab_calc_stride(g_kmem_caches[i].obj_size, g_kmem_caches[i].obj_align);
-        g_kmem_caches[i].empty_count = 0;
+        g_kmem_caches[i].obj_size = (unsigned int)g_kmalloc_classes[i];
         g_kmem_caches[i].slabs_partial = 0;
         g_kmem_caches[i].slabs_full = 0;
         g_kmem_caches[i].slabs_empty = 0;
