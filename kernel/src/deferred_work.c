@@ -12,8 +12,8 @@
  * Single-hart deferred work. A smaller rank runs first; equal ranks are FIFO.
  * Nested IRQs may queue work, but the current callback finishes before it runs.
  */
-static struct deferred_work *g_deferred_work_head = 0;
-static int g_deferred_work_running = 0;
+static struct deferred_work *deferred_work_head = 0;
+static int deferred_work_running = 0;
 
 /*
  * A fixed pool lets callers queue callbacks without allocating heap memory.
@@ -26,7 +26,7 @@ struct deferred_callback_slot {
     int allocated;
 };
 
-static struct deferred_callback_slot g_deferred_callbacks[DEFERRED_CALLBACK_CAPACITY];
+static struct deferred_callback_slot deferred_callbacks[DEFERRED_CALLBACK_CAPACITY];
 
 /*
  * Queue helper used by both the public enqueue API and the runner requeue
@@ -37,7 +37,7 @@ static void deferred_work_insert_locked(struct deferred_work *task)
     struct deferred_work **link;
 
     task->next = 0;
-    link = &g_deferred_work_head;
+    link = &deferred_work_head;
     while (*link != 0 && (*link)->prio <= task->prio) {
         link = &(*link)->next;
     }
@@ -47,10 +47,10 @@ static void deferred_work_insert_locked(struct deferred_work *task)
 
 void deferred_work_init(void)
 {
-    g_deferred_work_head = 0;
-    g_deferred_work_running = 0;
+    deferred_work_head = 0;
+    deferred_work_running = 0;
     for (unsigned int i = 0; i < DEFERRED_CALLBACK_CAPACITY; i++) {
-        g_deferred_callbacks[i].allocated = 0;
+        deferred_callbacks[i].allocated = 0;
     }
 }
 
@@ -73,7 +73,7 @@ int deferred_work_add(deferred_callback_t callback, void *arg, int priority)
 
     status = local_irq_save();
     for (unsigned int i = 0; i < DEFERRED_CALLBACK_CAPACITY; i++) {
-        struct deferred_callback_slot *work = &g_deferred_callbacks[i];
+        struct deferred_callback_slot *work = &deferred_callbacks[i];
 
         if (work->allocated) {
             continue;
@@ -129,7 +129,7 @@ int deferred_work_enqueue(struct deferred_work *task)
 void deferred_work_cancel(struct deferred_work *task)
 {
     uint64_t status = local_irq_save();
-    struct deferred_work **link = &g_deferred_work_head;
+    struct deferred_work **link = &deferred_work_head;
     if (task != 0 && task->state == DEFERRED_WORK_QUEUED) {
         while (*link != 0 && *link != task) { link = &(*link)->next; }
         if (*link == task) {
@@ -150,7 +150,7 @@ int deferred_work_queue_empty(void)
     int empty;
 
     sstatus = local_irq_save();
-    empty = (g_deferred_work_head == 0);
+    empty = (deferred_work_head == 0);
     local_irq_restore(sstatus);
     return empty;
 }
@@ -163,23 +163,23 @@ void irq_run_bottom_halves(void)
      * A nested IRQ finishes its top half, then resumes the paused callback.
      * Leave all newly queued work for the existing runner, even at rank 0.
      */
-    if (g_deferred_work_running) {
+    if (deferred_work_running) {
         local_irq_restore(entry_status);
         return;
     }
-    g_deferred_work_running = 1;
+    deferred_work_running = 1;
 
     while (1) {
         struct deferred_work *task;
         int action;
 
         /* Priority selects the next callback; it never interrupts this one. */
-        task = g_deferred_work_head;
+        task = deferred_work_head;
         if (task == 0) {
             break;
         }
 
-        g_deferred_work_head = task->next;
+        deferred_work_head = task->next;
         task->next = 0;
         task->state = DEFERRED_WORK_RUNNING;
         task->rerun = 0;
@@ -216,6 +216,6 @@ void irq_run_bottom_halves(void)
             }
         }
     }
-    g_deferred_work_running = 0;
+    deferred_work_running = 0;
     local_irq_restore(entry_status);
 }

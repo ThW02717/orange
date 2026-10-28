@@ -8,11 +8,11 @@
 #include "thread_internal.h"
 #include "irqflags.h"
 
-static struct thread g_boot_idle_thread;
-static struct thread *g_run_head;
-static struct thread *g_run_tail;
-static int g_threading_started;
-static int g_need_resched;
+static struct thread boot_idle_thread;
+static struct thread *run_head;
+static struct thread *run_tail;
+static int threading_started;
+static int need_resched;
 
 static inline struct thread *thread_current_from_tp(void)
 {
@@ -36,27 +36,27 @@ static inline void thread_set_tp(struct thread *t)
 void sched_enqueue(struct thread *t)
 {
     t->next = 0;
-    if (g_run_tail == 0) {
-        g_run_head = t;
-        g_run_tail = t;
+    if (run_tail == 0) {
+        run_head = t;
+        run_tail = t;
         return;
     }
-    g_run_tail->next = t;
-    g_run_tail = t;
+    run_tail->next = t;
+    run_tail = t;
 }
 
 static struct thread *runq_pop(void)
 {
     struct thread *t;
 
-    t = g_run_head;
+    t = run_head;
     if (t == 0) {
         return 0;
     }
 
-    g_run_head = t->next;
-    if (g_run_head == 0) {
-        g_run_tail = 0;
+    run_head = t->next;
+    if (run_head == 0) {
+        run_tail = 0;
     }
     t->next = 0;
     return t;
@@ -69,17 +69,17 @@ static struct thread *runq_pop(void)
 void sched_remove(struct thread *target)
 {
     struct thread *prev = 0;
-    struct thread *cur = g_run_head;
+    struct thread *cur = run_head;
 
     while (cur != 0) {
         if (cur == target) {
             if (prev == 0) {
-                g_run_head = cur->next;
+                run_head = cur->next;
             } else {
                 prev->next = cur->next;
             }
-            if (g_run_tail == cur) {
-                g_run_tail = prev;
+            if (run_tail == cur) {
+                run_tail = prev;
             }
             cur->next = 0;
             return;
@@ -92,12 +92,12 @@ void sched_remove(struct thread *target)
 /* tp is the sole current-thread pointer after bootstrap. */
 struct thread *thread_current(void)
 {
-    return g_threading_started ? thread_current_from_tp() : 0;
+    return threading_started ? thread_current_from_tp() : 0;
 }
 
 int thread_system_active(void)
 {
-    return g_threading_started;
+    return threading_started;
 }
 
 void thread_system_bootstrap_init(void)
@@ -105,18 +105,18 @@ void thread_system_bootstrap_init(void)
     uint64_t status = local_irq_save();
     uint64_t sp;
 
-    if (g_threading_started) {
+    if (threading_started) {
         local_irq_restore(status);
         return;
     }
     asm volatile("mv %0, sp" : "=r"(sp));
-    g_boot_idle_thread.kind = THREAD_KERNEL;
-    g_boot_idle_thread.state = THREAD_RUNNING;
-    g_boot_idle_thread.is_idle = 1;
-    g_boot_idle_thread.kstack_top = sp;
-    thread_register_boot(&g_boot_idle_thread);
-    thread_set_tp(&g_boot_idle_thread);
-    g_threading_started = 1;
+    boot_idle_thread.kind = THREAD_KERNEL;
+    boot_idle_thread.state = THREAD_RUNNING;
+    boot_idle_thread.is_idle = 1;
+    boot_idle_thread.kstack_top = sp;
+    thread_register_boot(&boot_idle_thread);
+    thread_set_tp(&boot_idle_thread);
+    threading_started = 1;
     local_irq_restore(status);
 }
 
@@ -127,7 +127,7 @@ void schedule(void)
     struct thread *prev;
     struct thread *next;
 
-    if (g_threading_started == 0) {
+    if (threading_started == 0) {
         return;
     }
 
@@ -156,7 +156,7 @@ void schedule(void)
             local_irq_restore(sstatus);
             return;
         }
-        next = &g_boot_idle_thread;
+        next = &boot_idle_thread;
     }
 
     if (prev == next) {
@@ -191,7 +191,7 @@ int thread_has_runnable_tasks(void)
     int has_runnable;
 
     sstatus = local_irq_save();
-    has_runnable = (g_run_head != 0);
+    has_runnable = (run_head != 0);
     local_irq_restore(sstatus);
     return has_runnable;
 }
@@ -201,7 +201,7 @@ void thread_request_resched(void)
     uint64_t sstatus;
 
     sstatus = local_irq_save();
-    g_need_resched = 1;
+    need_resched = 1;
     local_irq_restore(sstatus);
 }
 
@@ -211,8 +211,8 @@ int thread_consume_resched_request(void)
     int requested;
 
     sstatus = local_irq_save();
-    requested = g_need_resched;
-    g_need_resched = 0;
+    requested = need_resched;
+    need_resched = 0;
     local_irq_restore(sstatus);
     return requested;
 }
@@ -220,7 +220,7 @@ int thread_consume_resched_request(void)
 /* Permanent demo idle loop: reclaim exited workers and run the next one. */
 void thread_enter_idle(void)
 {
-    if (g_threading_started == 0) {
+    if (threading_started == 0) {
         return;
     }
 
@@ -233,7 +233,7 @@ void thread_enter_idle(void)
 /* Return to the shell after runnable work has finished and zombies are freed. */
 void thread_run_until_idle(void)
 {
-    if (g_threading_started == 0) {
+    if (threading_started == 0) {
         return;
     }
 
@@ -246,7 +246,7 @@ void thread_run_until_idle(void)
 
         sstatus = local_irq_save();
         cur = thread_current();
-        has_runnable = (g_run_head != 0);
+        has_runnable = (run_head != 0);
         local_irq_restore(sstatus);
 
         if (cur != 0 && cur->is_idle != 0 && !has_runnable) {

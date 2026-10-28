@@ -31,7 +31,7 @@
  * Timer callbacks may print while the REPL is blocked in uart_recv(), so keep
  * the prompt string in one place and redraw it after asynchronous messages.
  */
-static const char g_shell_prompt[] = "> ";
+static const char shell_prompt[] = "> ";
 
 /* Small local helpers used by the shell parser and loader commands. */
 static int is_space(char c)
@@ -53,7 +53,7 @@ static int parse_seconds_to_ticks(const char *s, uint64_t *ticks_out, uint64_t *
     int seen_dot = 0;
     int seen_digit = 0;
 
-    if (s == 0 || ticks_out == 0 || whole_out == 0 || s[0] == '\0' || g_timebase_freq == 0U) {
+    if (s == 0 || ticks_out == 0 || whole_out == 0 || s[0] == '\0' || timebase_frequency == 0U) {
         return -1;
     }
 
@@ -92,11 +92,11 @@ static int parse_seconds_to_ticks(const char *s, uint64_t *ticks_out, uint64_t *
         return -1;
     }
     {
-        uint64_t fraction_ticks = (frac * (uint64_t)g_timebase_freq) / frac_scale;
-        if (whole > (UINT64_MAX - fraction_ticks) / (uint64_t)g_timebase_freq) {
+        uint64_t fraction_ticks = (frac * (uint64_t)timebase_frequency) / frac_scale;
+        if (whole > (UINT64_MAX - fraction_ticks) / (uint64_t)timebase_frequency) {
             return -1;
         }
-        *ticks_out = whole * (uint64_t)g_timebase_freq + fraction_ticks;
+        *ticks_out = whole * (uint64_t)timebase_frequency + fraction_ticks;
     }
     *whole_out = whole;
     return 0;
@@ -445,18 +445,18 @@ static void cmd_timer(void)
     uint64_t uptime;
 
     now = timer_read();
-    if (g_timebase_freq != 0) {
-        uptime = (now - g_boot_time) / g_timebase_freq;
+    if (timebase_frequency != 0) {
+        uptime = (now - boot_time) / timebase_frequency;
     } else {
         uptime = 0;
     }
 
     uart_send_string("timer freq: ");
-    uart_send_dec(g_timebase_freq);
+    uart_send_dec(timebase_frequency);
     uart_send_string("\n");
 
     uart_send_string("timer boot: ");
-    uart_send_dec(g_boot_time);
+    uart_send_dec(boot_time);
     uart_send_string("\n");
 
     uart_send_string("timer now: ");
@@ -464,7 +464,7 @@ static void cmd_timer(void)
     uart_send_string("\n");
 
     uart_send_string("timer next: ");
-    uart_send_dec(g_next_deadline);
+    uart_send_dec(next_deadline);
     uart_send_string("\n");
 
     uart_send_string("timer uptime: ");
@@ -474,7 +474,7 @@ static void cmd_timer(void)
     uart_send_dec(timer_pending_count());
     uart_send_string("\n");
     uart_send_string("timer irq_count: ");
-    uart_send_dec(g_timer_irq_count);
+    uart_send_dec(timer_irq_count);
     uart_send_string("\n");
     timer_dump_queue();
 }
@@ -491,7 +491,7 @@ static void shell_timer_callback(void *arg)
     uart_send_string("\n[T");
     uart_send_dec(id);
     uart_send_string("]\n");
-    uart_send_string(g_shell_prompt);
+    uart_send_string(shell_prompt);
 }
 
 /* Convert shell seconds to the timer API's tick count. */
@@ -506,7 +506,7 @@ static void cmd_addtimer(const char *arg)
         uart_send_string("usage: addtimer <seconds>\n");
         return;
     }
-    if (g_timebase_freq == 0) {
+    if (timebase_frequency == 0) {
         uart_send_string("addtimer: timer frequency unavailable\n");
         return;
     }
@@ -537,11 +537,11 @@ struct shell_timeout {
 
 static void shell_print_time(uint64_t ticks)
 {
-    uint64_t elapsed = ticks - g_boot_time;
-    unsigned long ms = (unsigned long)((elapsed % g_timebase_freq) *
-                                       1000ULL / g_timebase_freq);
+    uint64_t elapsed = ticks - boot_time;
+    unsigned long ms = (unsigned long)((elapsed % timebase_frequency) *
+                                       1000ULL / timebase_frequency);
 
-    uart_send_dec((unsigned long)(elapsed / g_timebase_freq));
+    uart_send_dec((unsigned long)(elapsed / timebase_frequency));
     uart_send('.');
     if (ms < 100UL) {
         uart_send('0');
@@ -564,7 +564,7 @@ static void shell_timeout_callback(void *arg)
     uart_send_string("s message=");
     uart_send_string(timeout->message);
     uart_send_string("\n");
-    uart_send_string(g_shell_prompt);
+    uart_send_string(shell_prompt);
 }
 
 static void cmd_set_timeout(char *arg)
@@ -740,41 +740,41 @@ static void cmd_preempt_test(void)
 }
 
 /* A generation token makes an old callback harmless after off/on. */
-static unsigned long g_periodic_generation;
-static int g_periodic_enabled;
+static unsigned long periodic_generation;
+static int periodic_enabled;
 
 static void shell_periodic_timer(void *arg)
 {
     unsigned long generation = (uintptr_t)arg;
 
-    if (!g_periodic_enabled || generation != g_periodic_generation) {
+    if (!periodic_enabled || generation != periodic_generation) {
         return;
     }
     uart_send_string("\n[timer] uptime=");
-    uart_send_dec((timer_read() - g_boot_time) / g_timebase_freq);
+    uart_send_dec((timer_read() - boot_time) / timebase_frequency);
     uart_send_string(" seconds\n");
-    uart_send_string(g_shell_prompt);
-    if (add_timer(shell_periodic_timer, arg, 2ULL * g_timebase_freq) != 0) {
-        g_periodic_enabled = 0;
+    uart_send_string(shell_prompt);
+    if (add_timer(shell_periodic_timer, arg, 2ULL * timebase_frequency) != 0) {
+        periodic_enabled = 0;
     }
 }
 
 static int shell_periodic_enable(int enabled)
 {
-    if (!timer_is_running() || g_timebase_freq == 0) {
+    if (!timer_is_running() || timebase_frequency == 0) {
         return -1;
     }
-    if (enabled && g_periodic_enabled) {
+    if (enabled && periodic_enabled) {
         return 0;
     }
-    g_periodic_enabled = 0;
-    g_periodic_generation++;
+    periodic_enabled = 0;
+    periodic_generation++;
     if (enabled) {
-        if (add_timer(shell_periodic_timer, (void *)(uintptr_t)g_periodic_generation,
-                      2ULL * g_timebase_freq) != 0) {
+        if (add_timer(shell_periodic_timer, (void *)(uintptr_t)periodic_generation,
+                      2ULL * timebase_frequency) != 0) {
             return -1;
         }
-        g_periodic_enabled = 1;
+        periodic_enabled = 1;
     }
     return 0;
 }

@@ -14,18 +14,18 @@
  * to the kernel/user fault paths.
  */
 
-static int g_trace_ecalls;
-static int32_t g_ecall_demo_tid = -1;
+static int trace_ecalls;
+static int32_t ecall_demo_tid = -1;
 
 void trap_set_ecall_demo(int32_t tid)
 {
-    g_ecall_demo_tid = tid;
+    ecall_demo_tid = tid;
 }
 
 int trap_trace_ecalls(int enabled)
 {
-    int previous = g_trace_ecalls;
-    g_trace_ecalls = enabled != 0;
+    int previous = trace_ecalls;
+    trace_ecalls = enabled != 0;
     return previous;
 }
 
@@ -102,7 +102,7 @@ void trap_dispatch(struct trap_context *tc)
          * The supplied Lab 4 image counts down a7, before any syscall ABI is
          * defined. Only its explicitly selected task uses this exercise path.
          */
-        if (task != 0 && task->tid == g_ecall_demo_tid) {
+        if (task != 0 && task->tid == ecall_demo_tid) {
             trap_print_tc(tc);
             uart_send_string("[trap] lab ecall a7=");
             uart_send_dec((unsigned long)tc->a7);
@@ -110,7 +110,7 @@ void trap_dispatch(struct trap_context *tc)
             tc->sepc += 4;
             return;
         }
-        if (g_trace_ecalls) {
+        if (trace_ecalls) {
             trap_print_tc(tc);
         }
         handle_user_ecall(tc);

@@ -1,29 +1,29 @@
 #include "plic.h"
 #include "utils.h"
 
-static uintptr_t g_plic_base;
+static uintptr_t plic_base;
 
 /* Called during platform discovery, before external interrupts are enabled. */
 void plic_set_base(uintptr_t base)
 {
-    g_plic_base = base;
+    plic_base = base;
 }
 
 static inline uintptr_t plic_priority_reg(uint32_t irq)
 {
-    return g_plic_base + PLIC_PRIORITY_OFFSET + ((uintptr_t)irq * 4UL);
+    return plic_base + PLIC_PRIORITY_OFFSET + ((uintptr_t)irq * 4UL);
 }
 
 static inline uintptr_t plic_enable_reg(uint32_t context, uint32_t irq)
 {
-    return g_plic_base + PLIC_ENABLE_OFFSET +
+    return plic_base + PLIC_ENABLE_OFFSET +
            ((uintptr_t)context * PLIC_ENABLE_STRIDE) +
            (((uintptr_t)irq / 32UL) * 4UL);
 }
 
 static inline uintptr_t plic_context_reg(uint32_t context, uintptr_t offset)
 {
-    return g_plic_base + PLIC_CONTEXT_OFFSET +
+    return plic_base + PLIC_CONTEXT_OFFSET +
            ((uintptr_t)context * PLIC_CONTEXT_STRIDE) + offset;
 }
 

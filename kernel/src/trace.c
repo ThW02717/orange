@@ -12,9 +12,9 @@ struct trace_event {
     uint8_t kind;
 };
 
-static struct trace_event g_trace[TRACE_CAPACITY];
-static unsigned int g_trace_head = 0;
-static unsigned int g_trace_count = 0;
+static struct trace_event trace[TRACE_CAPACITY];
+static unsigned int trace_head = 0;
+static unsigned int trace_count = 0;
 
 static const char *trace_kind_name(enum trace_kind kind)
 {
@@ -37,8 +37,8 @@ void trace_reset(void)
     uint64_t sstatus;
 
     sstatus = local_irq_save();
-    g_trace_head = 0U;
-    g_trace_count = 0U;
+    trace_head = 0U;
+    trace_count = 0U;
     local_irq_restore(sstatus);
 }
 
@@ -48,13 +48,13 @@ void trace_record(enum trace_kind kind, uint32_t aux)
     unsigned int slot;
 
     sstatus = local_irq_save();
-    slot = g_trace_head;
-    g_trace[slot].now = timer_read();
-    g_trace[slot].aux = aux;
-    g_trace[slot].kind = (uint8_t)kind;
-    g_trace_head = (slot + 1U) % TRACE_CAPACITY;
-    if (g_trace_count < TRACE_CAPACITY) {
-        g_trace_count++;
+    slot = trace_head;
+    trace[slot].now = timer_read();
+    trace[slot].aux = aux;
+    trace[slot].kind = (uint8_t)kind;
+    trace_head = (slot + 1U) % TRACE_CAPACITY;
+    if (trace_count < TRACE_CAPACITY) {
+        trace_count++;
     }
     local_irq_restore(sstatus);
 }
@@ -69,11 +69,11 @@ void trace_dump(void)
     unsigned int i;
 
     sstatus = local_irq_save();
-    count = g_trace_count;
-    head = g_trace_head;
+    count = trace_count;
+    head = trace_head;
     start = (head + TRACE_CAPACITY - count) % TRACE_CAPACITY;
     for (i = 0; i < count; i++) {
-        snapshot[i] = g_trace[(start + i) % TRACE_CAPACITY];
+        snapshot[i] = trace[(start + i) % TRACE_CAPACITY];
     }
     local_irq_restore(sstatus);
 
@@ -83,8 +83,8 @@ void trace_dump(void)
     for (i = 0; i < count; i++) {
         uint64_t ms = 0U;
 
-        if (g_timebase_freq != 0U) {
-            ms = ((snapshot[i].now - g_boot_time) * 1000ULL) / g_timebase_freq;
+        if (timebase_frequency != 0U) {
+            ms = ((snapshot[i].now - boot_time) * 1000ULL) / timebase_frequency;
         }
         uart_send_string("trace[");
         uart_send_dec(i);
@@ -101,13 +101,13 @@ void trace_dump(void)
 int trace_seen_since(enum trace_kind kind, uint64_t since)
 {
     uint64_t status = local_irq_save();
-    unsigned int start = (g_trace_head + TRACE_CAPACITY -
-                          g_trace_count) % TRACE_CAPACITY;
+    unsigned int start = (trace_head + TRACE_CAPACITY -
+                          trace_count) % TRACE_CAPACITY;
     int found = 0;
 
-    for (unsigned int i = 0; i < g_trace_count; i++) {
+    for (unsigned int i = 0; i < trace_count; i++) {
         const struct trace_event *event =
-            &g_trace[(start + i) % TRACE_CAPACITY];
+            &trace[(start + i) % TRACE_CAPACITY];
         if (event->kind == kind && event->now >= since) {
             found = 1;
             break;

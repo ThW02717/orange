@@ -109,9 +109,9 @@ RAM declared by the DTB (one or more regions)
 Accounting view, not physical address order; blocks need not be adjacent.
 ```
 
-`g_regions` describes RAM; `g_reserves` records occupied ranges. Neither array
+`regions` describes RAM; `reserves` records occupied ranges. Neither array
 is itself the memory it describes. Both are static kernel storage. Likewise,
-the `g_frame_array` pointer is static, but the metadata array it points to is
+the `frame_array` pointer is static, but the metadata array it points to is
 allocated during startup and reserved before buddy initialization.
 
 The initramfs is a CPIO archive containing files, including user binaries. Its
@@ -638,7 +638,7 @@ kernel stack, with hardware interrupts enabled outside protected sections.
 It does not get a worker thread or a separate stack.
 
 ```text
-Outer runner: g_deferred_work_running = 1
+Outer runner: deferred_work_running = 1
     |
     +-- Run callback A, rank 5
     |     SIE = 1 outside protected critical sections
@@ -652,7 +652,7 @@ Outer runner: g_deferred_work_running = 1
     |     |      Queue B's bottom half, rank 1
     |     |      |
     |     |      Call irq_run_bottom_halves()
-    |     |      g_deferred_work_running is already 1
+    |     |      deferred_work_running is already 1
     |     |      Leave B queued and return
     |     |      |
     |     |      Restore A's context
@@ -669,7 +669,7 @@ Outer runner: g_deferred_work_running = 1
     |
     +-- Continue until the queue is empty
     |
-    `-- g_deferred_work_running = 0
+    `-- deferred_work_running = 0
 
 Priority: 0 is highest, 7 is lowest; equal ranks are FIFO.
 Priority selects the next callback; it does not preempt one.

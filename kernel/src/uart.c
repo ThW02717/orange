@@ -13,35 +13,35 @@
 #include "deferred_work.h"
 #include "memory.h"
 
-static struct ringbuf g_uart_rx_buf;
-static struct ringbuf g_uart_tx_buf;
-static uintptr_t g_uart_mmio_base =
+static struct ringbuf uart_rx_buf;
+static struct ringbuf uart_tx_buf;
+static uintptr_t uart_base_addr =
 #ifdef QEMU
     0x10000000UL;
 #else
     0UL;
 #endif
-static uint32_t g_uart_irq_id = 0U;
-static int g_uart_irq_enabled = 0;
-static int g_uart_async_ready = 0;
-static volatile unsigned long g_uart_ext_irq_count = 0;
-static volatile unsigned long g_uart_rx_irq_count = 0;
-static volatile unsigned long g_uart_tx_irq_count = 0;
-static volatile unsigned long g_uart_rx_fallback_count = 0;
-static volatile unsigned long g_uart_tx_poll_count = 0;
-static void (*g_uart_tx_refill)(void);
+static uint32_t uart_irq_number = 0U;
+static int uart_irq_enabled = 0;
+static int uart_async_ready = 0;
+static volatile unsigned long uart_ext_irq_count = 0;
+static volatile unsigned long uart_rx_irq_count = 0;
+static volatile unsigned long uart_tx_irq_count = 0;
+static volatile unsigned long uart_rx_fallback_count = 0;
+static volatile unsigned long uart_tx_poll_count = 0;
+static void (*uart_tx_refill)(void);
 
 static int uart_rx_work_run(struct deferred_work *task);
 static int uart_tx_work_run(struct deferred_work *task);
 
-static struct deferred_work g_uart_rx_work = {
+static struct deferred_work uart_rx_work = {
     .type = DEFERRED_WORK_UART_RX,
     .prio = 0,
     .state = DEFERRED_WORK_IDLE,
     .next = 0,
     .run = uart_rx_work_run,
 };
-static struct deferred_work g_uart_tx_work = {
+static struct deferred_work uart_tx_work = {
     .type = DEFERRED_WORK_UART_TX,
     .prio = 0,
     .state = DEFERRED_WORK_IDLE,
@@ -53,12 +53,12 @@ static struct deferred_work g_uart_tx_work = {
 
 uintptr_t uart_mmio_base(void)
 {
-    return g_uart_mmio_base;
+    return uart_base_addr;
 }
 
 uint32_t uart_irq_id(void)
 {
-    return g_uart_irq_id;
+    return uart_irq_number;
 }
 
 /*
@@ -146,7 +146,7 @@ static int uart_rx_push_char(char c)
     int ret;
 
     sstatus = local_irq_save();
-    ret = ringbuf_push(&g_uart_rx_buf, c);
+    ret = ringbuf_push(&uart_rx_buf, c);
     local_irq_restore(sstatus);
     return ret;
 }
@@ -157,7 +157,7 @@ static int uart_rx_pop_char(char *out)
     int ret;
 
     sstatus = local_irq_save();
-    ret = ringbuf_pop(&g_uart_rx_buf, out);
+    ret = ringbuf_pop(&uart_rx_buf, out);
     local_irq_restore(sstatus);
     return ret;
 }
@@ -168,7 +168,7 @@ static int uart_tx_push_char(char c)
     int ret;
 
     sstatus = local_irq_save();
-    ret = ringbuf_push(&g_uart_tx_buf, c);
+    ret = ringbuf_push(&uart_tx_buf, c);
     local_irq_restore(sstatus);
     return ret;
 }
@@ -179,7 +179,7 @@ static int uart_tx_pop_char(char *out)
     int ret;
 
     sstatus = local_irq_save();
-    ret = ringbuf_pop(&g_uart_tx_buf, out);
+    ret = ringbuf_pop(&uart_tx_buf, out);
     local_irq_restore(sstatus);
     return ret;
 }
@@ -190,7 +190,7 @@ static int uart_tx_buf_is_empty(void)
     int ret;
 
     sstatus = local_irq_save();
-    ret = ringbuf_is_empty(&g_uart_tx_buf);
+    ret = ringbuf_is_empty(&uart_tx_buf);
     local_irq_restore(sstatus);
     return ret;
 }
@@ -264,15 +264,15 @@ static void uart_irq_ack_stale_status(void)
  */
 static void uart_reset_runtime_state(void)
 {
-    ringbuf_init(&g_uart_rx_buf);
-    ringbuf_init(&g_uart_tx_buf);
+    ringbuf_init(&uart_rx_buf);
+    ringbuf_init(&uart_tx_buf);
 
-    g_uart_async_ready = 0;
-    g_uart_rx_work.state = DEFERRED_WORK_IDLE;
-    g_uart_rx_work.next = 0;
-    g_uart_tx_work.state = DEFERRED_WORK_IDLE;
-    g_uart_tx_work.next = 0;
-    g_uart_tx_refill = 0;
+    uart_async_ready = 0;
+    uart_rx_work.state = DEFERRED_WORK_IDLE;
+    uart_rx_work.next = 0;
+    uart_tx_work.state = DEFERRED_WORK_IDLE;
+    uart_tx_work.next = 0;
+    uart_tx_refill = 0;
 
     uart_reset_stats();
 }
@@ -339,7 +339,7 @@ void uart_irq_init(void)
     uart_irq_ack_stale_status();
 
     /* Finally allow supervisor external interrupts to reach trap_entry. */
-    g_uart_irq_enabled = 1;
+    uart_irq_enabled = 1;
     asm volatile("csrs sie, %0" : : "r"(SIE_SEIE) : "memory");
     local_irq_enable();
 }
@@ -350,7 +350,7 @@ void uart_send(char c)
      * Once the first real UART IRQ is observed, all output is queued and
      * drained by TX-ready interrupts.
      */
-    if (g_uart_async_ready) {
+    if (uart_async_ready) {
         if (local_irqs_enabled()) {
             while (uart_tx_push_char(c) != 0) {
                 /*
@@ -378,7 +378,7 @@ void uart_send(char c)
      */
     while ((uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) == 0U) {
     }
-    g_uart_tx_poll_count++;
+    uart_tx_poll_count++;
     uart_reg_write(UART_THR_REG, (uint32_t)(uint8_t)c);
 }
 
@@ -388,7 +388,7 @@ char uart_recv(void)
      * Once IRQ delivery is confirmed, input is consumed purely from the RX
      * ring buffer that the ISR fills.
      */
-    if (g_uart_async_ready && local_irqs_enabled()) {
+    if (uart_async_ready && local_irqs_enabled()) {
         char c;
 
         while (1) {
@@ -414,7 +414,7 @@ char uart_recv(void)
      * directly. This keeps the shell usable even if the interrupt route is
      * not live yet during early boot.
      */
-    if (g_uart_irq_enabled && local_irqs_enabled()) {
+    if (uart_irq_enabled && local_irqs_enabled()) {
         unsigned long wait = 500000UL;
         char c;
 
@@ -428,7 +428,7 @@ char uart_recv(void)
 
     while ((uart_reg_read(UART_LSR_REG) & LSR_RX_READY) == 0U) {
     }
-    g_uart_rx_fallback_count++;
+    uart_rx_fallback_count++;
     return (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
 }
 
@@ -476,7 +476,7 @@ static void uart_rx_drain(unsigned int budget)
     while (budget > 0U && (uart_reg_read(UART_LSR_REG) & LSR_RX_READY) != 0U) {
         char c = (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
         (void)uart_rx_push_char(c);
-        g_uart_rx_irq_count++;
+        uart_rx_irq_count++;
         budget--;
     }
 }
@@ -486,8 +486,8 @@ void uart_irq_top(void)
     uint32_t status;
 
     status = uart_irq_status_snapshot();
-    if (!g_uart_async_ready) {
-        g_uart_async_ready = 1;
+    if (!uart_async_ready) {
+        uart_async_ready = 1;
     }
 
     if (uart_rx_ready_from_status(status)) {
@@ -495,13 +495,13 @@ void uart_irq_top(void)
         uart_rx_mask();
         /* Preserve a bounded batch before deferring the remaining RX work. */
         uart_rx_drain(UART_DEFERRED_WORK_BUDGET);
-        (void)deferred_work_enqueue(&g_uart_rx_work);
+        (void)deferred_work_enqueue(&uart_rx_work);
     }
 
     if (uart_tx_ready_from_status(status)) {
-        trace_record(TRACE_UART_TOP_TX, (uint32_t)g_uart_tx_buf.count);
+        trace_record(TRACE_UART_TOP_TX, (uint32_t)uart_tx_buf.count);
         uart_tx_mask();
-        (void)deferred_work_enqueue(&g_uart_tx_work);
+        (void)deferred_work_enqueue(&uart_tx_work);
     }
 }
 
@@ -527,16 +527,16 @@ static int uart_tx_work_run(struct deferred_work *task)
     unsigned int budget = UART_DEFERRED_WORK_BUDGET;
 
     (void)task;
-    trace_record(TRACE_UART_TX_BOTTOM, g_uart_tx_buf.count);
-    if (uart_tx_buf_is_empty() && g_uart_tx_refill != 0) {
-        g_uart_tx_refill();
+    trace_record(TRACE_UART_TX_BOTTOM, uart_tx_buf.count);
+    if (uart_tx_buf_is_empty() && uart_tx_refill != 0) {
+        uart_tx_refill();
     }
     while (budget > 0U && uart_tx_try_drain_one()) {
-        g_uart_tx_irq_count++;
+        uart_tx_irq_count++;
         budget--;
     }
-    if (uart_tx_buf_is_empty() && g_uart_tx_refill != 0) {
-        g_uart_tx_refill();
+    if (uart_tx_buf_is_empty() && uart_tx_refill != 0) {
+        uart_tx_refill();
     }
     if (!uart_tx_buf_is_empty()) {
         uart_tx_unmask();
@@ -550,7 +550,7 @@ static int uart_tx_work_run(struct deferred_work *task)
 void uart_note_external_irq(uint32_t irq)
 {
     if (irq == uart_irq_id()) {
-        g_uart_ext_irq_count++;
+        uart_ext_irq_count++;
     }
 }
 
@@ -559,11 +559,11 @@ void uart_reset_stats(void)
     uint64_t sstatus;
 
     sstatus = local_irq_save();
-    g_uart_ext_irq_count = 0;
-    g_uart_rx_irq_count = 0;
-    g_uart_tx_irq_count = 0;
-    g_uart_rx_fallback_count = 0;
-    g_uart_tx_poll_count = 0;
+    uart_ext_irq_count = 0;
+    uart_rx_irq_count = 0;
+    uart_tx_irq_count = 0;
+    uart_rx_fallback_count = 0;
+    uart_tx_poll_count = 0;
     local_irq_restore(sstatus);
 }
 
@@ -573,18 +573,18 @@ void uart_get_stats(struct uart_stats *stats)
         return;
     }
 
-    stats->async_ready = (unsigned long)g_uart_async_ready;
-    stats->ext_irq_count = g_uart_ext_irq_count;
-    stats->rx_irq_count = g_uart_rx_irq_count;
-    stats->tx_irq_count = g_uart_tx_irq_count;
-    stats->rx_fallback_count = g_uart_rx_fallback_count;
-    stats->tx_poll_count = g_uart_tx_poll_count;
+    stats->async_ready = (unsigned long)uart_async_ready;
+    stats->ext_irq_count = uart_ext_irq_count;
+    stats->rx_irq_count = uart_rx_irq_count;
+    stats->tx_irq_count = uart_tx_irq_count;
+    stats->rx_fallback_count = uart_rx_fallback_count;
+    stats->tx_poll_count = uart_tx_poll_count;
 }
 
 void uart_set_platform(uintptr_t base, uint32_t irq)
 {
-    g_uart_mmio_base = base;
-    g_uart_irq_id = irq;
+    uart_base_addr = base;
+    uart_irq_number = irq;
 }
 
 /* Queue the whole buffer or return -1. Never wait for room in the TX ring. */
@@ -592,12 +592,12 @@ int uart_write_async(const char *buf, unsigned int size)
 {
     uint64_t status = local_irq_save();
 
-    if (buf == 0 || !g_uart_irq_enabled || size > RINGBUF_CAPACITY - g_uart_tx_buf.count) {
+    if (buf == 0 || !uart_irq_enabled || size > RINGBUF_CAPACITY - uart_tx_buf.count) {
         local_irq_restore(status);
         return -1;
     }
     for (unsigned int i = 0; i < size; i++) {
-        ringbuf_push(&g_uart_tx_buf, buf[i]);
+        ringbuf_push(&uart_tx_buf, buf[i]);
     }
     if (size != 0) {
         uart_tx_kick();
@@ -611,12 +611,12 @@ int uart_tx_set_refill(void (*refill)(void))
 {
     uint64_t status = local_irq_save();
 
-    if (refill != 0 && (!g_uart_irq_enabled ||
-        (g_uart_tx_refill != 0 && g_uart_tx_refill != refill))) {
+    if (refill != 0 && (!uart_irq_enabled ||
+        (uart_tx_refill != 0 && uart_tx_refill != refill))) {
         local_irq_restore(status);
         return -1;
     }
-    g_uart_tx_refill = refill;
+    uart_tx_refill = refill;
     local_irq_restore(status);
     return 0;
 }
@@ -624,12 +624,12 @@ int uart_tx_set_refill(void (*refill)(void))
 #ifdef KERNEL_TEST
 void uart_test_async(int enabled)
 {
-    g_uart_async_ready = enabled;
-    g_uart_irq_enabled = enabled;
+    uart_async_ready = enabled;
+    uart_irq_enabled = enabled;
 }
 
 unsigned int uart_test_tx_count(void)
 {
-    return g_uart_tx_buf.count;
+    return uart_tx_buf.count;
 }
 #endif

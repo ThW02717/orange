@@ -61,17 +61,17 @@ struct slab_header {
  * One-page slab classes cover requests up to 2048 bytes. Larger requests go
  * straight to buddy, avoiding extra pages just to fit an in-block slab header.
  */
-static const uint16_t g_kmalloc_classes[] = {
+static const uint16_t kmalloc_classes[] = {
     16U, 32U, 64U, 128U, 256U, 512U, 1024U, 2048U
 };
-#define KMALLOC_CLASS_COUNT ((unsigned int)(sizeof(g_kmalloc_classes) / sizeof(g_kmalloc_classes[0])))
-static struct kmem_cache g_kmem_caches[KMALLOC_CLASS_COUNT];
+#define KMALLOC_CLASS_COUNT ((unsigned int)(sizeof(kmalloc_classes) / sizeof(kmalloc_classes[0])))
+static struct kmem_cache kmem_caches[KMALLOC_CLASS_COUNT];
 
-static uint64_t g_object_alloc_count;
-static uint64_t g_object_free_count;
-static uint64_t g_slab_reclaim_count;
+static uint64_t object_alloc_count;
+static uint64_t object_free_count;
+static uint64_t slab_reclaim_count;
 
-static int g_slab_ready;
+static int slab_ready;
 
 /* Align down/up. Alignment values used here are powers of two. */
 static uint64_t align_down_u64(uint64_t v, uint64_t a)
@@ -337,7 +337,7 @@ static int size_to_class(unsigned long size)
     }
 
     for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
-        if (size <= (unsigned long)g_kmalloc_classes[i]) {
+        if (size <= (unsigned long)kmalloc_classes[i]) {
             return (int)i;
         }
     }
@@ -394,7 +394,7 @@ static int kmalloc_refill_class(unsigned int class_idx)
     if (class_idx >= KMALLOC_CLASS_COUNT) {
         return -1;
     }
-    cache = &g_kmem_caches[class_idx];
+    cache = &kmem_caches[class_idx];
 
     page = p_alloc(1);
     if (page == 0) {
@@ -435,7 +435,7 @@ static int kmalloc_refill_class(unsigned int class_idx)
 
 static void *kmalloc_locked(unsigned long size)
 {
-    if (!g_slab_ready || size == 0UL) {
+    if (!slab_ready || size == 0UL) {
         return 0;
     }
 
@@ -450,7 +450,7 @@ static void *kmalloc_locked(unsigned long size)
             return 0;
         }
 
-        cache = &g_kmem_caches[(unsigned int)cls];
+        cache = &kmem_caches[(unsigned int)cls];
         if (cache->slabs_partial == 0) {
             if (cache->slabs_empty != 0) {
                 cache_move_empty_to_partial(cache, cache->slabs_empty);
@@ -507,7 +507,7 @@ static void *kmalloc_locked(unsigned long size)
             uart_send_string(")");
             uart_send_string("\n");
         }
-        g_object_alloc_count++;
+        object_alloc_count++;
         return obj;
     } else {
         /* Keep the byte API; buddy rounds the page count to a power of two. */
@@ -536,7 +536,7 @@ static void kfree_locked(void *ptr)
     uint64_t ptr_addr;
     enum page_kind kind;
 
-    if (!g_slab_ready || ptr == 0) {
+    if (!slab_ready || ptr == 0) {
         return;
     }
     ptr_addr = (uint64_t)(uintptr_t)ptr;
@@ -643,7 +643,7 @@ static void kfree_locked(void *ptr)
         poison_memory(ptr, cache->obj_size, POISON_FREE_OBJECT);
         slab_push_free(slab, ptr);
         slab->inuse--;
-        g_object_free_count++;
+        object_free_count++;
         if (slab->state == SLAB_FULL) {
             cache_move_full_to_partial(cache, slab);
         }
@@ -683,7 +683,7 @@ static void kfree_locked(void *ptr)
                     log_hex_u64(slab_base);
                     uart_send_string("\n");
                 }
-                g_slab_reclaim_count++;
+                slab_reclaim_count++;
                 p_free((void *)(uintptr_t)slab_base);
             }
             return;
@@ -791,13 +791,13 @@ int memory_check_slabs_ok(void)
     uint64_t status = local_irq_save();
 
     for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
-        if (!slab_check_list_invariants(i, "partial", g_kmem_caches[i].slabs_partial, SLAB_PARTIAL)) {
+        if (!slab_check_list_invariants(i, "partial", kmem_caches[i].slabs_partial, SLAB_PARTIAL)) {
             ok = 0;
         }
-        if (!slab_check_list_invariants(i, "full", g_kmem_caches[i].slabs_full, SLAB_FULL)) {
+        if (!slab_check_list_invariants(i, "full", kmem_caches[i].slabs_full, SLAB_FULL)) {
             ok = 0;
         }
-        if (!slab_check_list_invariants(i, "empty", g_kmem_caches[i].slabs_empty, SLAB_EMPTY)) {
+        if (!slab_check_list_invariants(i, "empty", kmem_caches[i].slabs_empty, SLAB_EMPTY)) {
             ok = 0;
         }
     }
@@ -817,7 +817,7 @@ int memory_get_slab_class_snapshot(unsigned int class_idx, struct memory_slab_cl
     }
     status = local_irq_save();
 
-    cache = &g_kmem_caches[class_idx];
+    cache = &kmem_caches[class_idx];
     out->obj_size = cache->obj_size;
     out->partial_count = slab_list_count(cache->slabs_partial);
     out->full_count = slab_list_count(cache->slabs_full);
@@ -883,19 +883,19 @@ void slab_init(void)
     unsigned int i;
 
     for (i = 0; i < KMALLOC_CLASS_COUNT; i++) {
-        g_kmem_caches[i].obj_size = (unsigned int)g_kmalloc_classes[i];
-        g_kmem_caches[i].slabs_partial = 0;
-        g_kmem_caches[i].slabs_full = 0;
-        g_kmem_caches[i].slabs_empty = 0;
+        kmem_caches[i].obj_size = (unsigned int)kmalloc_classes[i];
+        kmem_caches[i].slabs_partial = 0;
+        kmem_caches[i].slabs_full = 0;
+        kmem_caches[i].slabs_empty = 0;
     }
 
-    g_slab_ready = 1;
+    slab_ready = 1;
 }
 
 void slab_get_stats(struct memory_stats_snapshot *out)
 {
-    out->object_allocs = g_object_alloc_count;
-    out->object_frees = g_object_free_count;
-    out->slab_reclaims = g_slab_reclaim_count;
+    out->object_allocs = object_alloc_count;
+    out->object_frees = object_free_count;
+    out->slab_reclaims = slab_reclaim_count;
     out->empty_slab_limit = KMEM_CACHE_EMPTY_LIMIT;
 }

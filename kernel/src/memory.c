@@ -51,30 +51,30 @@ struct frame_meta {
 };
 
 /* Physical memory description and reserved ranges. */
-static struct mem_region_info g_regions[FDT_MAX_MEM_REGIONS];
-static unsigned int g_region_count = 0;
-static uint64_t g_total_pages = 0;
-static struct reserve_range g_reserves[MEMORY_MAX_RESERVES];
-static unsigned int g_reserve_count = 0;
+static struct mem_region_info regions[FDT_MAX_MEM_REGIONS];
+static unsigned int region_count = 0;
+static uint64_t managed_page_count = 0;
+static struct reserve_range reserves[MEMORY_MAX_RESERVES];
+static unsigned int reserve_count = 0;
 
 /* Early bump allocator used before buddy metadata has been allocated. */
-static uint64_t g_startup_cur = 0;
-static uint64_t g_startup_end = 0;
-static int g_startup_ready = 0;
+static uint64_t startup_cur = 0;
+static uint64_t startup_end = 0;
+static int startup_ready = 0;
 
 /* Buddy allocator state: one frame_meta per page plus one free list per order. */
-static struct frame_meta *g_frame_array = 0;
-static int32_t g_free_lists[MEMORY_BUDDY_MAX_ORDER + 1];
-static int g_regions_direct_map = 0;
-static uint64_t g_direct_map_base = 0;
-static uint64_t g_direct_map_first_idx = 0;
-static uint64_t g_direct_map_last_idx = 0;
+static struct frame_meta *frame_array = 0;
+static int32_t free_lists[MEMORY_BUDDY_MAX_ORDER + 1];
+static int regions_direct_map = 0;
+static uint64_t direct_map_base = 0;
+static uint64_t direct_map_first_idx = 0;
+static uint64_t direct_map_last_idx = 0;
 
 /* Runtime counters and debug flags shared by buddy and slab paths. */
-static int g_memory_ready = 0;
-static uint64_t g_page_alloc_count = 0;
-static uint64_t g_page_free_count = 0;
-static int g_allocator_log_enabled = 0;
+static int memory_ready = 0;
+static uint64_t page_alloc_count = 0;
+static uint64_t page_free_count = 0;
+static int allocator_log_enabled = 0;
 
 /* Linker-provided physical range occupied by the kernel image. */
 extern char _phys_start;
@@ -124,11 +124,11 @@ static void log_page_range(uint64_t start_idx, unsigned int order)
 static unsigned int freelist_count_order(unsigned int order)
 {
     unsigned int n = 0;
-    int32_t cur = g_free_lists[order];
+    int32_t cur = free_lists[order];
 
     while (cur >= 0) {
         n++;
-        cur = g_frame_array[(uint64_t)cur].free_next;
+        cur = frame_array[(uint64_t)cur].free_next;
     }
     return n;
 }
@@ -195,14 +195,14 @@ void memory_reserve(uint64_t start, uint64_t size)
         return;
     }
 
-    if (g_reserve_count >= MEMORY_MAX_RESERVES) {
+    if (reserve_count >= MEMORY_MAX_RESERVES) {
         log_prefix();
         uart_send_string("reserve table full\n");
         return;
     }
-    g_reserves[g_reserve_count].start = rs;
-    g_reserves[g_reserve_count].end = re;
-    g_reserve_count++;
+    reserves[reserve_count].start = rs;
+    reserves[reserve_count].end = re;
+    reserve_count++;
 
     log_prefix();
     uart_send_string("[Reserve] [");
@@ -227,8 +227,8 @@ void memory_reserve(uint64_t start, uint64_t size)
 static int is_reserved_pa(uint64_t pa)
 {
     unsigned int i;
-    for (i = 0; i < g_reserve_count; i++) {
-        if (pa >= g_reserves[i].start && pa < g_reserves[i].end) {
+    for (i = 0; i < reserve_count; i++) {
+        if (pa >= reserves[i].start && pa < reserves[i].end) {
             return 1;
         }
     }
@@ -241,12 +241,12 @@ static void startup_allocator_init(uint64_t base, uint64_t size)
     if (end < base) {
         end = (uint64_t)-1;
     }
-    g_startup_cur = base;
-    g_startup_end = end;
-    if (g_startup_cur < PAGE_SIZE) {
-        g_startup_cur = PAGE_SIZE;
+    startup_cur = base;
+    startup_end = end;
+    if (startup_cur < PAGE_SIZE) {
+        startup_cur = PAGE_SIZE;
     }
-    g_startup_ready = (g_startup_end > g_startup_cur) ? 1 : 0;
+    startup_ready = (startup_end > startup_cur) ? 1 : 0;
 }
 /*
  * Early bump allocator that skips reserved ranges and then reserves its result.
@@ -258,7 +258,7 @@ static void *startup_alloc(uint64_t size, uint64_t align)
     uint64_t end;
     unsigned int i;
     int moved;
-    if (!g_startup_ready || size == 0) {
+    if (!startup_ready || size == 0) {
         return 0;
     }
     if (align == 0) {
@@ -267,22 +267,22 @@ static void *startup_alloc(uint64_t size, uint64_t align)
     if ((align & (align - 1U)) != 0U) {
         return 0;
     }
-    if (g_startup_cur > UINT64_MAX - (align - 1U)) {
+    if (startup_cur > UINT64_MAX - (align - 1U)) {
         return 0;
     }
-    p = align_up_u64(g_startup_cur, align);
+    p = align_up_u64(startup_cur, align);
     for (;;) {
         moved = 0;
         end = p + size;
         if (end < p) {
             return 0;
         }
-        for (i = 0; i < g_reserve_count; i++) {
-            if (ranges_overlap(p, end, g_reserves[i].start, g_reserves[i].end)) {
-                if (g_reserves[i].end > UINT64_MAX - (align - 1U)) {
+        for (i = 0; i < reserve_count; i++) {
+            if (ranges_overlap(p, end, reserves[i].start, reserves[i].end)) {
+                if (reserves[i].end > UINT64_MAX - (align - 1U)) {
                     return 0;
                 }
-                p = align_up_u64(g_reserves[i].end, align);
+                p = align_up_u64(reserves[i].end, align);
                 moved = 1;
                 break;
             }
@@ -293,11 +293,11 @@ static void *startup_alloc(uint64_t size, uint64_t align)
     }
 
     end = p + size;
-    if (end < p || end > g_startup_end) {
+    if (end < p || end > startup_end) {
         return 0;
     }
 
-    g_startup_cur = end;
+    startup_cur = end;
     memory_reserve(p, size);
     return (void *)(uintptr_t)p;
 }
@@ -307,8 +307,8 @@ static int find_region_by_index(uint64_t idx, unsigned int *rid_out)
 {
     unsigned int rid;
 
-    if (g_regions_direct_map) {
-        if (idx >= g_direct_map_first_idx && idx < g_direct_map_last_idx) {
+    if (regions_direct_map) {
+        if (idx >= direct_map_first_idx && idx < direct_map_last_idx) {
             if (rid_out != 0) {
                 *rid_out = 0;
             }
@@ -317,9 +317,9 @@ static int find_region_by_index(uint64_t idx, unsigned int *rid_out)
         return -1;
     }
 
-    for (rid = 0; rid < g_region_count; rid++) {
-        uint64_t first = g_regions[rid].first_idx;
-        uint64_t last = first + g_regions[rid].page_count;
+    for (rid = 0; rid < region_count; rid++) {
+        uint64_t first = regions[rid].first_idx;
+        uint64_t last = first + regions[rid].page_count;
         if (idx >= first && idx < last) {
             if (rid_out != 0) {
                 *rid_out = rid;
@@ -338,18 +338,18 @@ static int index_to_pa(uint64_t idx, uint64_t *pa_out)
         return -1;
     }
 
-    if (g_regions_direct_map) {
-        if (idx < g_direct_map_first_idx || idx >= g_direct_map_last_idx) {
+    if (regions_direct_map) {
+        if (idx < direct_map_first_idx || idx >= direct_map_last_idx) {
             return -1;
         }
-        *pa_out = g_direct_map_base + (idx - g_direct_map_first_idx) * PAGE_SIZE;
+        *pa_out = direct_map_base + (idx - direct_map_first_idx) * PAGE_SIZE;
         return 0;
     }
 
     if (find_region_by_index(idx, &rid) != 0) {
         return -1;
     }
-    *pa_out = g_regions[rid].base + (idx - g_regions[rid].first_idx) * PAGE_SIZE;
+    *pa_out = regions[rid].base + (idx - regions[rid].first_idx) * PAGE_SIZE;
     return 0;
 }
 /* Convert a page-aligned physical address back into a global page index. */
@@ -361,29 +361,29 @@ static int pa_to_index(uint64_t pa, uint64_t *idx_out, unsigned int *rid_out)
         return -1;
     }
 
-    if (g_regions_direct_map) {
-        uint64_t end = g_direct_map_base + (g_direct_map_last_idx - g_direct_map_first_idx) * PAGE_SIZE;
+    if (regions_direct_map) {
+        uint64_t end = direct_map_base + (direct_map_last_idx - direct_map_first_idx) * PAGE_SIZE;
 
-        if (pa < g_direct_map_base || pa >= end || (pa & (PAGE_SIZE - 1U)) != 0U) {
+        if (pa < direct_map_base || pa >= end || (pa & (PAGE_SIZE - 1U)) != 0U) {
             return -1;
         }
-        *idx_out = g_direct_map_first_idx + ((pa - g_direct_map_base) / PAGE_SIZE);
+        *idx_out = direct_map_first_idx + ((pa - direct_map_base) / PAGE_SIZE);
         if (rid_out != 0) {
             *rid_out = 0;
         }
         return 0;
     }
 
-    for (rid = 0; rid < g_region_count; rid++) {
-        uint64_t base = g_regions[rid].base;
-        uint64_t end = base + g_regions[rid].size;
+    for (rid = 0; rid < region_count; rid++) {
+        uint64_t base = regions[rid].base;
+        uint64_t end = base + regions[rid].size;
         if (pa >= base && pa < end) {
             uint64_t off = pa - base;
             uint64_t page = off / PAGE_SIZE;
-            if ((off % PAGE_SIZE) != 0U || page >= g_regions[rid].page_count) {
+            if ((off % PAGE_SIZE) != 0U || page >= regions[rid].page_count) {
                 return -1;
             }
-            *idx_out = g_regions[rid].first_idx + page;
+            *idx_out = regions[rid].first_idx + page;
             if (rid_out != 0) {
                 *rid_out = rid;
             }
@@ -403,9 +403,9 @@ static void block_mark_free(uint64_t idx, unsigned int order)
 {
     uint64_t pages = 1ULL << order;
     uint64_t i;
-    g_frame_array[idx].state = (int16_t)order;
+    frame_array[idx].state = (int16_t)order;
     for (i = 1; i < pages; i++) {
-        g_frame_array[idx + i].state = FRAME_BUDDY;
+        frame_array[idx + i].state = FRAME_BUDDY;
     }
 }
 
@@ -417,25 +417,25 @@ static void block_mark_alloc(uint64_t idx, unsigned int order)
 {
     uint64_t pages = 1ULL << order;
     uint64_t i;
-    g_frame_array[idx].state = alloc_tag_from_order(order);
+    frame_array[idx].state = alloc_tag_from_order(order);
     for (i = 1; i < pages; i++) {
-        g_frame_array[idx + i].state = FRAME_USED;
+        frame_array[idx + i].state = FRAME_USED;
     }
 }
 /* Link free block heads by index. prev allows O(1) unlink during buddy merging. */
 static void freelist_push(unsigned int order, uint64_t idx)
 {
     int32_t i32 = (int32_t)idx;
-    int32_t old_head = g_free_lists[order];
+    int32_t old_head = free_lists[order];
 
-    g_frame_array[idx].free_prev = -1;
-    g_frame_array[idx].free_next = old_head;
+    frame_array[idx].free_prev = -1;
+    frame_array[idx].free_next = old_head;
     if (old_head >= 0) {
-        g_frame_array[(uint64_t)old_head].free_prev = i32;
+        frame_array[(uint64_t)old_head].free_prev = i32;
     }
-    g_free_lists[order] = i32;
+    free_lists[order] = i32;
 
-    if (g_allocator_log_enabled) {
+    if (allocator_log_enabled) {
         log_prefix();
         uart_send_string("[+] Add page ");
         uart_send_dec((unsigned long)idx);
@@ -447,21 +447,21 @@ static void freelist_push(unsigned int order, uint64_t idx)
     }
 }
 
-/* Pop the first free block head from g_free_lists[order]. */
+/* Pop the first free block head from free_lists[order]. */
 static int32_t freelist_pop(unsigned int order)
 {
-    int32_t head = g_free_lists[order];
+    int32_t head = free_lists[order];
     if (head >= 0) {
-        int32_t next = g_frame_array[(uint64_t)head].free_next;
+        int32_t next = frame_array[(uint64_t)head].free_next;
 
-        g_free_lists[order] = next;
+        free_lists[order] = next;
         if (next >= 0) {
-            g_frame_array[(uint64_t)next].free_prev = -1;
+            frame_array[(uint64_t)next].free_prev = -1;
         }
-        g_frame_array[(uint64_t)head].free_prev = -1;
-        g_frame_array[(uint64_t)head].free_next = -1;
+        frame_array[(uint64_t)head].free_prev = -1;
+        frame_array[(uint64_t)head].free_next = -1;
 
-        if (g_allocator_log_enabled) {
+        if (allocator_log_enabled) {
             log_prefix();
             uart_send_string("[-] Remove page ");
             uart_send_dec((unsigned long)head);
@@ -476,7 +476,7 @@ static int32_t freelist_pop(unsigned int order)
 }
 
 /*
- * Remove a known free block head from g_free_lists[order] in O(1).
+ * Remove a known free block head from free_lists[order] in O(1).
  * This is what buddy merging needs after it discovers that the adjacent buddy
  * block is also free. A singly linked list would need a scan to find prev.
  */
@@ -485,30 +485,30 @@ static int freelist_remove(unsigned int order, uint64_t idx)
     int32_t prev;
     int32_t next;
 
-    if (idx >= g_total_pages) {
+    if (idx >= managed_page_count) {
         return -1;
     }
-    if (g_frame_array[idx].state != (int16_t)order) {
+    if (frame_array[idx].state != (int16_t)order) {
         return -1;
     }
 
-    prev = g_frame_array[idx].free_prev;
-    next = g_frame_array[idx].free_next;
+    prev = frame_array[idx].free_prev;
+    next = frame_array[idx].free_next;
     if (prev < 0) {
-        if (g_free_lists[order] != (int32_t)idx) {
+        if (free_lists[order] != (int32_t)idx) {
             return -1;
         }
-        g_free_lists[order] = next;
+        free_lists[order] = next;
     } else {
-        g_frame_array[(uint64_t)prev].free_next = next;
+        frame_array[(uint64_t)prev].free_next = next;
     }
     if (next >= 0) {
-        g_frame_array[(uint64_t)next].free_prev = prev;
+        frame_array[(uint64_t)next].free_prev = prev;
     }
-    g_frame_array[idx].free_prev = -1;
-    g_frame_array[idx].free_next = -1;
+    frame_array[idx].free_prev = -1;
+    frame_array[idx].free_next = -1;
 
-    if (g_allocator_log_enabled) {
+    if (allocator_log_enabled) {
         log_prefix();
         uart_send_string("[-] Remove page ");
         uart_send_dec((unsigned long)idx);
@@ -537,14 +537,14 @@ static int buddy_index(uint64_t idx, unsigned int order, uint64_t *out)
         return -1;
     }
 
-    local_idx = idx - g_regions[rid].first_idx;
+    local_idx = idx - regions[rid].first_idx;
     buddy_local = local_idx ^ size;
-    if (buddy_local >= g_regions[rid].page_count) {
+    if (buddy_local >= regions[rid].page_count) {
         return -1;
     }
 
-    *out = g_regions[rid].first_idx + buddy_local;
-    if (g_allocator_log_enabled) {
+    *out = regions[rid].first_idx + buddy_local;
+    if (allocator_log_enabled) {
         log_prefix();
         uart_send_string("[*] Buddy found! buddy idx: ");
         uart_send_dec((unsigned long)*out);
@@ -588,7 +588,7 @@ static void add_free_run(unsigned int rid, uint64_t run_start_page, uint64_t run
             order--;
         }
 
-        idx = g_regions[rid].first_idx + run_start_page;
+        idx = regions[rid].first_idx + run_start_page;
         block_mark_free(idx, order);
         freelist_push(order, idx);
 
@@ -600,22 +600,22 @@ static void add_free_run(unsigned int rid, uint64_t run_start_page, uint64_t run
 /* Allocate and initialize allocator metadata using the early bump allocator. */
 static int buddy_setup_metadata(void)
 {
-    uint64_t frame_array_bytes = g_total_pages * sizeof(struct frame_meta);
+    uint64_t frame_array_bytes = managed_page_count * sizeof(struct frame_meta);
     uint64_t i;
 
-    g_frame_array = (struct frame_meta *)startup_alloc(frame_array_bytes, PAGE_SIZE);
-    if (g_frame_array == 0) {
+    frame_array = (struct frame_meta *)startup_alloc(frame_array_bytes, PAGE_SIZE);
+    if (frame_array == 0) {
         return -1;
     }
 
-    for (i = 0; i < g_total_pages; i++) {
-        g_frame_array[i].state = FRAME_USED;
-        g_frame_array[i].free_prev = -1;
-        g_frame_array[i].free_next = -1;
-        g_frame_array[i].kind = PAGE_KIND_NONE;
+    for (i = 0; i < managed_page_count; i++) {
+        frame_array[i].state = FRAME_USED;
+        frame_array[i].free_prev = -1;
+        frame_array[i].free_next = -1;
+        frame_array[i].kind = PAGE_KIND_NONE;
     }
     for (i = 0; i <= MEMORY_BUDDY_MAX_ORDER; i++) {
-        g_free_lists[i] = -1;
+        free_lists[i] = -1;
     }
     return 0;
 }
@@ -623,20 +623,20 @@ static int buddy_setup_metadata(void)
 static void buddy_build_initial_state(void)
 {
     unsigned int rid;
-    for (rid = 0; rid < g_region_count; rid++) {
+    for (rid = 0; rid < region_count; rid++) {
         uint64_t p;
         uint64_t run_start = 0;
         uint64_t run_len = 0;
 
-        for (p = 0; p < g_regions[rid].page_count; p++) {
-            uint64_t idx = g_regions[rid].first_idx + p;
-            uint64_t pa = g_regions[rid].base + p * PAGE_SIZE;
+        for (p = 0; p < regions[rid].page_count; p++) {
+            uint64_t idx = regions[rid].first_idx + p;
+            uint64_t pa = regions[rid].base + p * PAGE_SIZE;
             if (is_reserved_pa(pa)) {
                 if (run_len > 0) {
                     add_free_run(rid, run_start, run_len);
                     run_len = 0;
                 }
-                g_frame_array[idx].state = FRAME_USED;
+                frame_array[idx].state = FRAME_USED;
                 continue;
             }
 
@@ -659,7 +659,7 @@ static void *p_alloc_locked(unsigned int pages)
     uint64_t idx;
     uint64_t pa = 0;
 
-    if (!g_memory_ready || pages == 0) {
+    if (!memory_ready || pages == 0) {
         return 0;
     }
     /* Round the requested page count up to a buddy order. */
@@ -671,7 +671,7 @@ static void *p_alloc_locked(unsigned int pages)
     }
     /* Find the smallest available block that can satisfy the request. */
     cur_order = need_order;
-    while (cur_order <= MEMORY_BUDDY_MAX_ORDER && g_free_lists[cur_order] < 0) {
+    while (cur_order <= MEMORY_BUDDY_MAX_ORDER && free_lists[cur_order] < 0) {
         cur_order++;
     }
     if (cur_order > MEMORY_BUDDY_MAX_ORDER) {
@@ -694,7 +694,7 @@ static void *p_alloc_locked(unsigned int pages)
         block_mark_free(buddy_idx, cur_order);
         freelist_push(cur_order, buddy_idx);
 
-        if (index_to_pa(buddy_idx, &buddy_pa) == 0 && g_allocator_log_enabled) {
+        if (index_to_pa(buddy_idx, &buddy_pa) == 0 && allocator_log_enabled) {
             log_prefix();
             uart_send_string("[+] Add split page ");
             uart_send_dec((unsigned long)buddy_idx);
@@ -715,7 +715,7 @@ static void *p_alloc_locked(unsigned int pages)
         return 0;
     }
 
-    if (g_allocator_log_enabled) {
+    if (allocator_log_enabled) {
         log_prefix();
         uart_send_string("[Page] Allocate ");
         log_hex_u64(pa);
@@ -737,7 +737,7 @@ static void *p_alloc_locked(unsigned int pages)
     if (index_to_pa(idx, &pa) != 0) {
         return 0;
     }
-    g_page_alloc_count++;
+    page_alloc_count++;
     return (void *)(uintptr_t)pa;
 }
 
@@ -750,7 +750,7 @@ static void p_free_locked(void *ptr)
     uint64_t merged_idx;
     unsigned int merged_order;
     /* p_free only accepts page-aligned pointers returned by p_alloc(). */
-    if (!g_memory_ready || ptr == 0) {
+    if (!memory_ready || ptr == 0) {
         return;
     }
 
@@ -762,7 +762,7 @@ static void p_free_locked(void *ptr)
         return;
     }
 
-    tag = g_frame_array[idx].state;
+    tag = frame_array[idx].state;
     if (!is_alloc_head_tag(tag)) {
         return;
     }
@@ -777,7 +777,7 @@ static void p_free_locked(void *ptr)
         if (buddy_index(merged_idx, merged_order, &buddy) != 0) {
             break;
         }
-        if (g_frame_array[buddy].state != (int16_t)merged_order) {
+        if (frame_array[buddy].state != (int16_t)merged_order) {
             break;
         }
         if (freelist_remove(merged_order, buddy) != 0) {
@@ -792,7 +792,7 @@ static void p_free_locked(void *ptr)
     block_mark_free(merged_idx, merged_order);
     freelist_push(merged_order, merged_idx);
 
-    if (g_allocator_log_enabled) {
+    if (allocator_log_enabled) {
         log_prefix();
         uart_send_string("[Page] Free ");
         log_hex_u64(pa);
@@ -803,9 +803,9 @@ static void p_free_locked(void *ptr)
         uart_send_string(". Next address at order ");
         uart_send_dec(merged_order);
         uart_send_string(": ");
-        if (g_free_lists[merged_order] >= 0) {
+        if (free_lists[merged_order] >= 0) {
             uint64_t next_pa = 0;
-            if (index_to_pa((uint64_t)g_free_lists[merged_order], &next_pa) == 0) {
+            if (index_to_pa((uint64_t)free_lists[merged_order], &next_pa) == 0) {
                 log_hex_u64(next_pa);
             } else {
                 uart_send_string("none");
@@ -815,7 +815,7 @@ static void p_free_locked(void *ptr)
         }
         uart_send_string("\n");
     }
-    g_page_free_count++;
+    page_free_count++;
 }
 
 void *p_alloc(unsigned int pages)
@@ -877,9 +877,9 @@ void memory_get_stats(struct memory_stats_snapshot *out)
     }
     status = local_irq_save();
 
-    out->page_allocs = g_page_alloc_count;
-    out->page_frees = g_page_free_count;
-    out->total_pages = g_total_pages;
+    out->page_allocs = page_alloc_count;
+    out->page_frees = page_free_count;
+    out->total_pages = managed_page_count;
     out->free_pages = total_free_pages_count();
     slab_get_stats(out);
     local_irq_restore(status);
@@ -888,7 +888,7 @@ void memory_get_stats(struct memory_stats_snapshot *out)
 /* Enable verbose allocator logging during bring-up/tests. */
 void memory_set_allocator_log_enabled(int enabled)
 {
-    g_allocator_log_enabled = (enabled != 0);
+    allocator_log_enabled = (enabled != 0);
 }
 
 /* Discover RAM, reserve occupied pages, then build buddy and slab state. */
@@ -905,16 +905,16 @@ void memory_init(const void *fdt, uint64_t initrd_start, uint64_t initrd_end)
     uint64_t k_start;
     uint64_t k_size;
 
-    if (g_memory_ready) {
+    if (memory_ready) {
         return;
     }
 
-    g_allocator_log_enabled = 1;
+    allocator_log_enabled = 1;
 
-    g_regions_direct_map = 0;
-    g_direct_map_base = 0;
-    g_direct_map_first_idx = 0;
-    g_direct_map_last_idx = 0;
+    regions_direct_map = 0;
+    direct_map_base = 0;
+    direct_map_first_idx = 0;
+    direct_map_last_idx = 0;
 
     /* The devicetree is the source of truth for physical RAM on OrangePi RV2. */
     dt_count = fdt_get_memory_regions(fdt, dt_regions, FDT_MAX_MEM_REGIONS);
@@ -924,8 +924,8 @@ void memory_init(const void *fdt, uint64_t initrd_start, uint64_t initrd_end)
         return;
     }
 
-    g_region_count = 0;
-    for (i = 0; i < dt_count && g_region_count < FDT_MAX_MEM_REGIONS; i++) {
+    region_count = 0;
+    for (i = 0; i < dt_count && region_count < FDT_MAX_MEM_REGIONS; i++) {
         if (dt_regions[i].base > UINT64_MAX - (PAGE_SIZE - 1U)) {
             return;
         }
@@ -949,21 +949,21 @@ void memory_init(const void *fdt, uint64_t initrd_start, uint64_t initrd_end)
         if (pages > INT32_MAX - total_pages) {
             log_prefix(); uart_send_string("too many pages for frame indices\n"); return;
         }
-        for (unsigned int r = 0; r < g_region_count; r++) {
-            if (ranges_overlap(start, end, g_regions[r].base, g_regions[r].base + g_regions[r].size)) {
+        for (unsigned int r = 0; r < region_count; r++) {
+            if (ranges_overlap(start, end, regions[r].base, regions[r].base + regions[r].size)) {
                 log_prefix(); uart_send_string("overlapping RAM regions\n"); return;
             }
         }
 
-        g_regions[g_region_count].base = start;
-        g_regions[g_region_count].size = end - start;
-        g_regions[g_region_count].first_idx = total_pages;
-        g_regions[g_region_count].page_count = pages;
+        regions[region_count].base = start;
+        regions[region_count].size = end - start;
+        regions[region_count].first_idx = total_pages;
+        regions[region_count].page_count = pages;
         total_pages += pages;
-        g_region_count++;
+        region_count++;
     }
 
-    if (g_region_count == 0 || total_pages == 0) {
+    if (region_count == 0 || total_pages == 0) {
         log_prefix();
         uart_send_string("no usable page-aligned memory\n");
         return;
@@ -971,17 +971,17 @@ void memory_init(const void *fdt, uint64_t initrd_start, uint64_t initrd_end)
 
     /*
      * Common case: one contiguous RAM range. Direct mapping avoids scanning
-     * g_regions for every page/address conversion.
+     * regions for every page/address conversion.
      */
-    if (g_region_count == 1) {
-        g_regions_direct_map = 1;
-        g_direct_map_base = g_regions[0].base;
-        g_direct_map_first_idx = g_regions[0].first_idx;
-        g_direct_map_last_idx = g_regions[0].first_idx + g_regions[0].page_count;
+    if (region_count == 1) {
+        regions_direct_map = 1;
+        direct_map_base = regions[0].base;
+        direct_map_first_idx = regions[0].first_idx;
+        direct_map_last_idx = regions[0].first_idx + regions[0].page_count;
     }
 
-    g_total_pages = total_pages;
-    startup_allocator_init(g_regions[0].base, g_regions[0].size);
+    managed_page_count = total_pages;
+    startup_allocator_init(regions[0].base, regions[0].size);
 
     /*
      * Never allocate physical page 0; a null/low address is too easy to misuse
@@ -1040,13 +1040,13 @@ void memory_init(const void *fdt, uint64_t initrd_start, uint64_t initrd_end)
     slab_init();
 
     buddy_build_initial_state();
-    g_memory_ready = 1;
+    memory_ready = 1;
 
     log_prefix();
     uart_send_string("memory init done regions=");
-    uart_send_dec(g_region_count);
+    uart_send_dec(region_count);
     uart_send_string(" pages=");
-    uart_send_dec((unsigned long)g_total_pages);
+    uart_send_dec((unsigned long)managed_page_count);
     uart_send_string("\n");
 
     /*
@@ -1054,19 +1054,19 @@ void memory_init(const void *fdt, uint64_t initrd_start, uint64_t initrd_end)
      * runu/fork/thread demos are too noisy; memory tests re-enable them
      * explicitly around allocator validation.
      */
-    g_allocator_log_enabled = 0;
+    allocator_log_enabled = 0;
 }
 
 int page_query(uintptr_t base, struct page_info *out)
 {
     uint64_t idx;
 
-    if (out == 0 || !g_memory_ready || pa_to_index(base, &idx, 0) != 0) {
+    if (out == 0 || !memory_ready || pa_to_index(base, &idx, 0) != 0) {
         return -1;
     }
     out->index = idx;
-    out->kind = g_frame_array[idx].kind;
-    out->allocated_head = is_alloc_head_tag(g_frame_array[idx].state);
+    out->kind = frame_array[idx].kind;
+    out->allocated_head = is_alloc_head_tag(frame_array[idx].state);
     return 0;
 }
 
@@ -1074,13 +1074,13 @@ void page_set_kind(uintptr_t base, enum page_kind kind)
 {
     uint64_t idx;
 
-    if (g_memory_ready && pa_to_index(base, &idx, 0) == 0 &&
-        is_alloc_head_tag(g_frame_array[idx].state)) {
-        g_frame_array[idx].kind = kind;
+    if (memory_ready && pa_to_index(base, &idx, 0) == 0 &&
+        is_alloc_head_tag(frame_array[idx].state)) {
+        frame_array[idx].kind = kind;
     }
 }
 
 int memory_allocator_log_enabled(void)
 {
-    return g_allocator_log_enabled;
+    return allocator_log_enabled;
 }

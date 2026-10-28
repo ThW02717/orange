@@ -69,11 +69,11 @@ static void timer_probe_state(void)
      * wired in so later regressions have a clear baseline.
      */
     uart_send_string("timer state: boot=");
-    uart_send_dec(g_boot_time);
+    uart_send_dec(boot_time);
     uart_send_string(" next=");
-    uart_send_dec(g_next_deadline);
+    uart_send_dec(next_deadline);
     uart_send_string(" uptime=");
-    uart_send_dec(g_uptime_seconds);
+    uart_send_dec(uptime_seconds);
     uart_send_string("\n");
 }
 
@@ -187,10 +187,10 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
      * Print the DT-provided timer frequency after the multi-core greeting
      * burst settles down so the value is easier to read on the shared UART.
      */
-    if (fdt_get_timebase_frequency((const void *)dtb_addr, &g_timebase_freq) == 0) {
-        timer_init_state(g_timebase_freq);
+    if (fdt_get_timebase_frequency((const void *)dtb_addr, &timebase_frequency) == 0) {
+        timer_init_state(timebase_frequency);
         uart_send_string("timer freq = ");
-        uart_send_dec(g_timebase_freq);
+        uart_send_dec(timebase_frequency);
         uart_send_string("\n");
     } else {
         uart_send_string("timer freq = <unavailable>\n");

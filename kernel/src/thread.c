@@ -16,9 +16,9 @@
 /* Kernel calls and nested traps share this stack. */
 #define THREAD_STACK_SIZE 16384UL
 
-static struct thread *g_zombie_head;
-static struct thread *g_all_threads;
-static uint32_t g_next_tid = 1;
+static struct thread *zombie_head;
+static struct thread *all_threads;
+static uint32_t next_tid = 1;
 
 static void thread_bootstrap(void);
 
@@ -28,8 +28,8 @@ static int32_t thread_next_tid(void)
     int32_t tid = -1;
 
     /* Do not wrap an ID into an existing task or a negative error value. */
-    if (g_next_tid <= INT32_MAX) {
-        tid = (int32_t)g_next_tid++;
+    if (next_tid <= INT32_MAX) {
+        tid = (int32_t)next_tid++;
     }
     local_irq_restore(status);
     return tid;
@@ -40,8 +40,8 @@ static void thread_list_add(struct thread *t)
     uint64_t sstatus;
 
     sstatus = local_irq_save();
-    t->all_next = g_all_threads;
-    g_all_threads = t;
+    t->all_next = all_threads;
+    all_threads = t;
     local_irq_restore(sstatus);
 }
 
@@ -52,11 +52,11 @@ static void thread_list_remove(struct thread *t)
     struct thread *cur;
 
     sstatus = local_irq_save();
-    cur = g_all_threads;
+    cur = all_threads;
     while (cur != 0) {
         if (cur == t) {
             if (prev == 0) {
-                g_all_threads = cur->all_next;
+                all_threads = cur->all_next;
             } else {
                 prev->all_next = cur->all_next;
             }
@@ -239,7 +239,7 @@ static struct thread *thread_find_by_tid(int32_t tid)
     uint64_t sstatus;
 
     sstatus = local_irq_save();
-    cur = g_all_threads;
+    cur = all_threads;
     while (cur != 0) {
         if (cur->tid == tid) {
             break;
@@ -266,8 +266,8 @@ void thread_mark_current_zombie(int exit_status)
     }
     cur->state = THREAD_ZOMBIE;
     cur->exit_status = exit_status;
-    cur->znext = g_zombie_head;
-    g_zombie_head = cur;
+    cur->znext = zombie_head;
+    zombie_head = cur;
     local_irq_restore(sstatus);
 }
 
@@ -293,8 +293,8 @@ int thread_stop_tid(int32_t tid, int exit_status)
     sched_remove(target);
     target->state = THREAD_ZOMBIE;
     target->exit_status = exit_status;
-    target->znext = g_zombie_head;
-    g_zombie_head = target;
+    target->znext = zombie_head;
+    zombie_head = target;
     local_irq_restore(sstatus);
     return 0;
 }
@@ -306,7 +306,7 @@ int thread_stop_process(int32_t tgid, int exit_status)
     int found = 0;
 
     /* Search by group, not by its first thread: the leader may have exited. */
-    for (cur = g_all_threads; cur != 0; cur = cur->all_next) {
+    for (cur = all_threads; cur != 0; cur = cur->all_next) {
         if (cur->kind == THREAD_USER && cur->tgid == tgid) {
             (void)thread_stop_tid(cur->tid, exit_status);
             found = 1;
@@ -349,9 +349,9 @@ void thread_reap_zombies(void)
         uint64_t sstatus;
 
         sstatus = local_irq_save();
-        z = g_zombie_head;
+        z = zombie_head;
         if (z != 0 && z != thread_current()) {
-            g_zombie_head = z->znext;
+            zombie_head = z->znext;
         }
         local_irq_restore(sstatus);
 
@@ -380,7 +380,7 @@ int thread_user_group_size(const struct thread *task)
     int count = 0;
 
     if (task != 0 && task->kind == THREAD_USER) {
-        for (cur = g_all_threads; cur != 0; cur = cur->all_next) {
+        for (cur = all_threads; cur != 0; cur = cur->all_next) {
             if (cur->kind == THREAD_USER && cur->tgid == task->tgid &&
                 cur->state != THREAD_ZOMBIE) {
                 count++;
@@ -402,7 +402,7 @@ int thread_user_stack_contains(const struct thread *task, uintptr_t start, uintp
      * still ends with the owner: detached thread stacks are not shared heaps.
      */
     if (task != 0 && task->kind == THREAD_USER && end > start) {
-        for (cur = g_all_threads; cur != 0; cur = cur->all_next) {
+        for (cur = all_threads; cur != 0; cur = cur->all_next) {
             if (cur->kind == THREAD_USER && cur->tgid == task->tgid &&
                 cur->state != THREAD_ZOMBIE && start >= cur->user_stack_base &&
                 end <= cur->user_stack_top) {
@@ -422,7 +422,7 @@ int thread_user_stack_contains(const struct thread *task, uintptr_t start, uintp
 int thread_user_image_busy(const struct thread *except)
 {
     uint64_t status = local_irq_save();
-    struct thread *cur = g_all_threads;
+    struct thread *cur = all_threads;
     int busy = 0;
     while (cur != 0) {
         if (cur != except && cur->kind == THREAD_USER && cur->state != THREAD_ZOMBIE) {
@@ -443,8 +443,8 @@ struct thread *thread_test_find(int32_t tid)
 
 uint32_t thread_test_next_tid(uint32_t next)
 {
-    uint32_t old = g_next_tid;
-    g_next_tid = next;
+    uint32_t old = next_tid;
+    next_tid = next;
     return old;
 }
 #endif

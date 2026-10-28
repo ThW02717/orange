@@ -4,7 +4,7 @@
 #include "uart.h"
 #include "plic.h"
 
-static struct boot_info g_boot_info;
+static struct boot_info boot_info;
 
 static int platform_init_devices(const void *fdt)
 {
@@ -47,8 +47,8 @@ int platform_init(unsigned long hartid, uintptr_t dtb,
     if (platform_init_devices((const void *)dtb) != 0) {
         return -1;
     }
-    g_boot_info.hartid = hartid;
-    g_boot_info.dtb = dtb;
+    boot_info.hartid = hartid;
+    boot_info.dtb = dtb;
     if (fdt_get_initrd_range((const void *)dtb, &start, &end) != 0 ||
         start == 0 || end <= start) {
         start = 0;
@@ -60,12 +60,12 @@ int platform_init(unsigned long hartid, uintptr_t dtb,
             end = initrd_hint_end;
         }
     }
-    g_boot_info.initrd_start = start;
-    g_boot_info.initrd_end = end;
+    boot_info.initrd_start = start;
+    boot_info.initrd_end = end;
     return 0;
 }
 
 const struct boot_info *platform_boot_info(void)
 {
-    return &g_boot_info;
+    return &boot_info;
 }

@@ -3,11 +3,11 @@
 #include "uart.h"
 #include "irqflags.h"
 
-static uint64_t g_uart_stress_next = 0;
-static uint64_t g_uart_stress_remaining = 0;
-static unsigned long g_uart_timer_marker_ids[16];
-static unsigned int g_uart_timer_marker_head = 0U;
-static unsigned int g_uart_timer_marker_tail = 0U;
+static uint64_t uart_stress_next = 0;
+static uint64_t uart_stress_remaining = 0;
+static unsigned long uart_timer_marker_ids[16];
+static unsigned int uart_timer_marker_head = 0U;
+static unsigned int uart_timer_marker_tail = 0U;
 
 static void demo_uart_refill(void);
 
@@ -21,11 +21,11 @@ static unsigned int demo_queue_tx_marker(void)
     unsigned int i;
     uint64_t marker;
 
-    if (g_uart_stress_remaining == 0U) {
+    if (uart_stress_remaining == 0U) {
         return 0;
     }
 
-    marker = g_uart_stress_next;
+    marker = uart_stress_next;
 
     buf[len++] = '[';
     buf[len++] = 'U';
@@ -55,29 +55,29 @@ static unsigned int demo_queue_tx_marker(void)
     if (uart_write_async(buf, len) != 0) {
         return 0;
     }
-    g_uart_stress_next++;
-    g_uart_stress_remaining--;
+    uart_stress_next++;
+    uart_stress_remaining--;
     return 1;
 }
 
 static int demo_timer_pending(void)
 {
-    return g_uart_timer_marker_head != g_uart_timer_marker_tail;
+    return uart_timer_marker_head != uart_timer_marker_tail;
 }
 
 static int demo_queue_timer_marker(unsigned long id)
 {
     unsigned int next_tail;
-    unsigned int capacity = (unsigned int)(sizeof(g_uart_timer_marker_ids) /
-                                           sizeof(g_uart_timer_marker_ids[0]));
+    unsigned int capacity = (unsigned int)(sizeof(uart_timer_marker_ids) /
+                                           sizeof(uart_timer_marker_ids[0]));
 
-    next_tail = (g_uart_timer_marker_tail + 1U) % capacity;
-    if (next_tail == g_uart_timer_marker_head) {
+    next_tail = (uart_timer_marker_tail + 1U) % capacity;
+    if (next_tail == uart_timer_marker_head) {
         return -1;
     }
 
-    g_uart_timer_marker_ids[g_uart_timer_marker_tail] = id;
-    g_uart_timer_marker_tail = next_tail;
+    uart_timer_marker_ids[uart_timer_marker_tail] = id;
+    uart_timer_marker_tail = next_tail;
     return 0;
 }
 
@@ -88,8 +88,8 @@ static int demo_queue_pending_timer_marker(void)
     unsigned int len = 0;
     unsigned int rev_len = 0;
     unsigned int i;
-    unsigned int capacity = (unsigned int)(sizeof(g_uart_timer_marker_ids) /
-                                           sizeof(g_uart_timer_marker_ids[0]));
+    unsigned int capacity = (unsigned int)(sizeof(uart_timer_marker_ids) /
+                                           sizeof(uart_timer_marker_ids[0]));
     unsigned long id;
     unsigned long value;
 
@@ -97,7 +97,7 @@ static int demo_queue_pending_timer_marker(void)
         return 0;
     }
 
-    id = g_uart_timer_marker_ids[g_uart_timer_marker_head];
+    id = uart_timer_marker_ids[uart_timer_marker_head];
 
     buf[len++] = '\r';
     buf[len++] = '\n';
@@ -125,7 +125,7 @@ static int demo_queue_pending_timer_marker(void)
     if (uart_write_async(buf, len) != 0) {
         return 0;
     }
-    g_uart_timer_marker_head = (g_uart_timer_marker_head + 1U) % capacity;
+    uart_timer_marker_head = (uart_timer_marker_head + 1U) % capacity;
     return 1;
 }
 
@@ -140,7 +140,7 @@ static void demo_fill_tx(unsigned int budget_markers)
             }
             continue;
         }
-        if (g_uart_stress_remaining == 0U) {
+        if (uart_stress_remaining == 0U) {
             break;
         }
         if (demo_queue_tx_marker() == 0U) {
@@ -160,7 +160,7 @@ int demo_uart_stress_start(uint64_t count)
     }
 
     sstatus = local_irq_save();
-    if (g_uart_stress_remaining != 0U || demo_timer_pending()) {
+    if (uart_stress_remaining != 0U || demo_timer_pending()) {
         local_irq_restore(sstatus);
         return -1;
     }
@@ -168,10 +168,10 @@ int demo_uart_stress_start(uint64_t count)
         local_irq_restore(sstatus);
         return -1;
     }
-    g_uart_stress_next = 0;
-    g_uart_stress_remaining = count;
-    g_uart_timer_marker_head = 0U;
-    g_uart_timer_marker_tail = 0U;
+    uart_stress_next = 0;
+    uart_stress_remaining = count;
+    uart_timer_marker_head = 0U;
+    uart_timer_marker_tail = 0U;
     demo_fill_tx(16U);
     local_irq_restore(sstatus);
 
@@ -184,7 +184,7 @@ int demo_uart_stress_active(void)
     int active;
 
     sstatus = local_irq_save();
-    active = (g_uart_stress_remaining != 0U) ||
+    active = (uart_stress_remaining != 0U) ||
              demo_timer_pending();
     local_irq_restore(sstatus);
     return active;
@@ -196,7 +196,7 @@ int demo_uart_stress_note_timer(unsigned long id)
     int ret;
 
     sstatus = local_irq_save();
-    if (g_uart_stress_remaining == 0U && !demo_timer_pending()) {
+    if (uart_stress_remaining == 0U && !demo_timer_pending()) {
         local_irq_restore(sstatus);
         return -1;
     }

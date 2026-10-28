@@ -21,8 +21,8 @@
 #include "uart.h"
 #include "string.h"
 
-static unsigned long g_hartid = 0;
-static unsigned long g_dtb = 0;
+static unsigned long boot_hartid = 0;
+static unsigned long dtb = 0;
 
 /* protocol magic: "BOO2" = 0x324F4F42 */
 #define UART_BOOT_BUNDLE_MAGIC 0x324F4F42UL
@@ -41,13 +41,13 @@ static unsigned long g_dtb = 0;
 /* initrd loaded at 0x46100000 (matches kernel.its ramdisk load addr) */
 #define UART_INITRD_LOAD_ADDR 0x46100000UL
 #endif
-static unsigned long g_initrd_start = 0;
-static unsigned long g_initrd_end = 0;
+static unsigned long initrd_start = 0;
+static unsigned long initrd_end = 0;
 
 void shell_set_context(unsigned long hartid, unsigned long dtb_addr)
 {
-    g_hartid = hartid;
-    g_dtb = dtb_addr;
+    boot_hartid = hartid;
+    dtb = dtb_addr;
 }
 
 /* check if character is whitespace */
@@ -306,11 +306,11 @@ static void boot_load_and_jump(void)
         copy_bytes((uint8_t *)UART_BOOT_LOAD_ADDR, kernel_src, (unsigned long)kernel_size);
         copy_bytes((uint8_t *)UART_INITRD_LOAD_ADDR, initrd_src, (unsigned long)initrd_size);
 
-        g_initrd_start = UART_INITRD_LOAD_ADDR;
-        g_initrd_end = UART_INITRD_LOAD_ADDR + (unsigned long)initrd_size;
-        if (g_initrd_end < g_initrd_start) {
-            g_initrd_start = 0;
-            g_initrd_end = 0;
+        initrd_start = UART_INITRD_LOAD_ADDR;
+        initrd_end = UART_INITRD_LOAD_ADDR + (unsigned long)initrd_size;
+        if (initrd_end < initrd_start) {
+            initrd_start = 0;
+            initrd_end = 0;
             uart_send_string("load fail: initrd range overflow\n");
             return;
         }
@@ -328,11 +328,11 @@ static void boot_load_and_jump(void)
 
     uart_send_string("load ok, jump ");
     uart_send_hex(UART_BOOT_LOAD_ADDR);
-    if (g_initrd_end > g_initrd_start) {
+    if (initrd_end > initrd_start) {
         uart_send_string(" (initrd ");
-        uart_send_hex(g_initrd_start);
+        uart_send_hex(initrd_start);
         uart_send_string("-");
-        uart_send_hex(g_initrd_end);
+        uart_send_hex(initrd_end);
         uart_send_string(")");
     }
     uart_send_string("\n");
@@ -354,7 +354,7 @@ static void boot_load_and_jump(void)
      *   a3 = initrd end address
      */
     next_kernel = (void (*)(unsigned long, unsigned long, unsigned long, unsigned long))UART_BOOT_LOAD_ADDR;
-    next_kernel(g_hartid, g_dtb, g_initrd_start, g_initrd_end);
+    next_kernel(boot_hartid, dtb, initrd_start, initrd_end);
     uart_send_string("loaded image returned\n");
 }
 

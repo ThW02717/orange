@@ -544,7 +544,7 @@ void (*next_kernel)(unsigned long, unsigned long, unsigned long, unsigned long);
 next_kernel = (void (*)(...))0x20000000;
 
 // 呼叫 → compiler 自動把參數塞進 a0~a3，然後 jalr 跳過去
-next_kernel(g_hartid, g_dtb, g_initrd_start, g_initrd_end);
+next_kernel(boot_hartid, dtb, initrd_start, initrd_end);
 ```
 
 傳的四個參數：

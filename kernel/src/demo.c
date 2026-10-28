@@ -119,16 +119,16 @@ static struct {
     int failed;
     unsigned int count;
     unsigned int events[8];
-} g_task_demo;
+} task_demo;
 
 static void demo_task_event(unsigned int event)
 {
     uint64_t status = local_irq_save();
 
-    if (g_task_demo.count < 8U) {
-        g_task_demo.events[g_task_demo.count++] = event;
+    if (task_demo.count < 8U) {
+        task_demo.events[task_demo.count++] = event;
     } else {
-        g_task_demo.failed = 1;
+        task_demo.failed = 1;
     }
     local_irq_restore(status);
 }
@@ -137,7 +137,7 @@ static void demo_task_high(void *arg)
 {
     (void)arg;
     demo_task_event(5);
-    g_task_demo.high_done = 1;
+    task_demo.high_done = 1;
 }
 
 static void demo_task_equal(void *arg)
@@ -154,26 +154,26 @@ static void demo_task_lower(void *arg)
 
 static void demo_task_timer(void *arg)
 {
-    if (!g_task_demo.active ||
-        (unsigned long)(uintptr_t)arg != g_task_demo.generation) {
+    if (!task_demo.active ||
+        (unsigned long)(uintptr_t)arg != task_demo.generation) {
         return;
     }
     demo_task_event(4);
     if (deferred_work_add(demo_task_high, 0, 0) != 0 ||
         deferred_work_add(demo_task_equal, 0, 5) != 0 ||
         deferred_work_add(demo_task_lower, 0, 7) != 0) {
-        g_task_demo.failed = 1;
+        task_demo.failed = 1;
     }
 }
 
 static void demo_task_low(void *arg)
 {
     uint64_t start = timer_read();
-    uint64_t delay = g_timebase_freq / 100U;
+    uint64_t delay = timebase_frequency / 100U;
 
     demo_task_event(1);
     if (add_timer(demo_task_timer, arg, 0) != 0) {
-        g_task_demo.failed = 1;
+        task_demo.failed = 1;
         return;
     }
     /*
@@ -186,10 +186,10 @@ static void demo_task_low(void *arg)
     if (trace_seen_since(TRACE_TIMER_TOP, start)) {
         demo_task_event(2);
     } else {
-        g_task_demo.failed = 1;
+        task_demo.failed = 1;
     }
-    if (g_task_demo.high_done) {
-        g_task_demo.failed = 1;
+    if (task_demo.high_done) {
+        task_demo.failed = 1;
     }
     demo_task_event(3);
 }
@@ -201,35 +201,35 @@ static int demo_tasks(void)
         "high", "equal", "lower"
     };
 
-    if (g_timebase_freq == 0) {
+    if (timebase_frequency == 0) {
         uart_send_string("[tasks] timer unavailable\n");
         return -1;
     }
-    g_task_demo.generation++;
-    g_task_demo.active = 1;
-    g_task_demo.high_done = 0;
-    g_task_demo.failed = 0;
-    g_task_demo.count = 0;
+    task_demo.generation++;
+    task_demo.active = 1;
+    task_demo.high_done = 0;
+    task_demo.failed = 0;
+    task_demo.count = 0;
     trace_reset();
-    if (deferred_work_add(demo_task_low, (void *)(uintptr_t)g_task_demo.generation, 5) != 0) {
-        g_task_demo.active = 0;
+    if (deferred_work_add(demo_task_low, (void *)(uintptr_t)task_demo.generation, 5) != 0) {
+        task_demo.active = 0;
         uart_send_string("[tasks] callback queue full\n");
         return -1;
     }
     irq_run_bottom_halves();
-    g_task_demo.active = 0;
+    task_demo.active = 0;
 
     uart_send_string("[tasks] ");
-    for (unsigned int i = 0; i < g_task_demo.count; i++) {
-        unsigned int event = g_task_demo.events[i];
+    for (unsigned int i = 0; i < task_demo.count; i++) {
+        unsigned int event = task_demo.events[i];
         if (i != 0) { uart_send_string(" -> "); }
         uart_send_string(event < 8U ? names[event] : "?");
         if (event != i + 1U) {
-            g_task_demo.failed = 1;
+            task_demo.failed = 1;
         }
     }
     uart_send_string("\n");
-    if (g_task_demo.failed || g_task_demo.count != 7U || !g_task_demo.high_done) {
+    if (task_demo.failed || task_demo.count != 7U || !task_demo.high_done) {
         uart_send_string("[tasks] FAIL\n");
         return -1;
     }

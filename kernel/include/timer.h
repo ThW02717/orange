@@ -11,16 +11,16 @@ typedef void (*timer_callback_t)(void *arg);
 
 /* Minimal timer subsystem state used by early bring-up and later interrupt
  * handling.
- * - g_timebase_freq: platform timer ticks per second from DT
- * - g_boot_time: raw timer value used as the uptime baseline
- * - g_next_deadline: absolute timer deadline currently programmed via SBI
- * - g_uptime_seconds: uptime already converted into seconds for logging
+ * - timebase_frequency: platform timer ticks per second from DT
+ * - boot_time: raw timer value used as the uptime baseline
+ * - next_deadline: absolute timer deadline currently programmed via SBI
+ * - uptime_seconds: uptime already converted into seconds for logging
  */
-extern uint32_t g_timebase_freq;
-extern uint64_t g_boot_time;
-extern uint64_t g_next_deadline;
-extern uint64_t g_uptime_seconds;
-extern uint64_t g_timer_irq_count;
+extern uint32_t timebase_frequency;
+extern uint64_t boot_time;
+extern uint64_t next_deadline;
+extern uint64_t uptime_seconds;
+extern uint64_t timer_irq_count;
 
 /* Read the raw platform counter used as the kernel clocksource. */
 uint64_t timer_read(void);
