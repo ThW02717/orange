@@ -42,6 +42,7 @@ static unsigned char user_kstack[16384] __attribute__((aligned(16)));
 
 extern void supervisor_roundtrip(void);
 extern void user_roundtrip(void);
+extern const char *test_uart_races(void);
 
 static void puts_raw(const char *s)
 {
@@ -318,6 +319,41 @@ static void submit_next_batch(void *arg)
     record_task((void *)30);
     raise_bottom_half(BH_TIMER);
     check(defer_callback(record_task, (void *)32) == 0, "submit next batch");
+}
+
+static void test_irq_flags(void)
+{
+    const uint64_t sum = 1UL << 18;
+    uint64_t original_status, original_sources, outer, inner, current;
+
+    /* No device IRQ may run while this test deliberately changes SIE/SUM. */
+    asm volatile("csrr %0, sstatus" : "=r"(original_status) :: "memory");
+    asm volatile("csrrw %0, sie, zero" : "=r"(original_sources) :: "memory");
+    local_irq_disable();
+    asm volatile("csrc sstatus, %0" :: "r"(sum) : "memory");
+    local_irq_enable();
+
+    outer = local_irq_save();
+    check((outer & SSTATUS_SIE) && !local_irqs_enabled(), "IRQ save lost enabled state");
+    asm volatile("csrs sstatus, %0" :: "r"(sum) : "memory");
+    inner = local_irq_save();
+    check(!(inner & SSTATUS_SIE), "nested IRQ save lost disabled state");
+    asm volatile("csrc sstatus, %0" :: "r"(sum) : "memory");
+    local_irq_restore(inner);
+    asm volatile("csrr %0, sstatus" : "=r"(current) :: "memory");
+    check(!(current & (sum | SSTATUS_SIE)), "IRQ restore overwrote cleared SUM or enabled nested IRQs");
+
+    asm volatile("csrs sstatus, %0" :: "r"(sum) : "memory");
+    local_irq_restore(outer);
+    asm volatile("csrr %0, sstatus" : "=r"(current) :: "memory");
+    check((current & (sum | SSTATUS_SIE)) == (sum | SSTATUS_SIE),
+          "IRQ restore overwrote set SUM or lost enabled SIE");
+
+    /* Restore the complete test fixture state, not just interrupt flags. */
+    local_irq_disable();
+    asm volatile("csrw sstatus, %0" :: "r"(original_status) : "memory");
+    asm volatile("csrw sie, %0" :: "r"(original_sources) : "memory");
+    puts_raw("[REGRESSION] IRQ flags preserve SUM changes and nested SIE state: PASS\n");
 }
 
 static void test_bitmap_rounds(void)
@@ -721,6 +757,7 @@ void regression_main(void)
     test_user_groups();
 
     supervisor_roundtrip();
+    test_irq_flags();
     bottom_half_init();
     check(defer_callback(callback_a, 0) == 0, "enqueue callback A");
     run_bottom_halves();
@@ -759,6 +796,12 @@ void regression_main(void)
     puts_raw("[REGRESSION] timer queued-stop/callback-stop: PASS\n");
     test_timer_ownership();
     test_timer_budget();
+
+    {
+        const char *error = test_uart_races();
+        check(error == 0, error);
+        puts_raw("[REGRESSION] UART RX/TX IRQ interleaving, polling handoff and FIFO order: PASS\n");
+    }
 
     asm volatile("csrci sstatus, 2" ::: "memory");
     uart_test_async(1);

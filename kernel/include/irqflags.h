@@ -14,10 +14,13 @@ static inline uint64_t local_irq_save(void)
     return status;
 }
 
-/* Restore the saved status, including an already-disabled SIE. */
+/* Pair with save() while IRQs remain disabled. Restore only SIE; keep any
+ * changes to the other status bits made inside the critical section.
+ */
 static inline void local_irq_restore(uint64_t status)
 {
-    asm volatile("csrw sstatus, %0" : : "r"(status) : "memory");
+    asm volatile("csrs sstatus, %0"
+                 : : "r"(status & SSTATUS_SIE) : "memory");
 }
 
 static inline void local_irq_enable(void)
@@ -34,7 +37,7 @@ static inline int local_irqs_enabled(void)
 {
     uint64_t status;
 
-    asm volatile("csrr %0, sstatus" : "=r"(status));
+    asm volatile("csrr %0, sstatus" : "=r"(status) : : "memory");
     return (status & SSTATUS_SIE) != 0;
 }
 

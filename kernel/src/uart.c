@@ -49,7 +49,9 @@ uint32_t uart_irq_id(void)
  */
 static inline uint32_t uart_reg_read(uintptr_t reg)
 {
-#ifdef QEMU
+#ifdef UART_MMIO_TEST
+    return uart_test_reg_read(reg);
+#elif defined(QEMU)
     return (uint32_t)(*(volatile uint8_t *)reg);
 #else
     return get32(reg);
@@ -58,7 +60,9 @@ static inline uint32_t uart_reg_read(uintptr_t reg)
 
 static inline void uart_reg_write(uintptr_t reg, uint32_t value)
 {
-#ifdef QEMU
+#ifdef UART_MMIO_TEST
+    uart_test_reg_write(reg, value);
+#elif defined(QEMU)
     *(volatile uint8_t *)reg = (uint8_t)value;
 #else
     put32(reg, value);
@@ -122,17 +126,6 @@ static int uart_tx_ready_from_status(uint32_t status)
  * code. Keep every head/tail/count update inside a tiny local critical
  * section so concurrent push/pop pairs cannot corrupt the FIFO state.
  */
-static int uart_rx_push_char(char c)
-{
-    uint64_t sstatus;
-    int ret;
-
-    sstatus = local_irq_save();
-    ret = ringbuf_push(&uart_rx_buf, c);
-    local_irq_restore(sstatus);
-    return ret;
-}
-
 static int uart_rx_pop_char(char *out)
 {
     uint64_t sstatus;
@@ -182,13 +175,17 @@ static int uart_tx_try_drain_one(void);
 void uart_tx_wait_idle(void)
 {
     for (;;) {
-        if (uart_tx_buf_is_empty() && (uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) != 0U) {
+        uint64_t status = local_irq_save();
+        int idle = ringbuf_is_empty(&uart_tx_buf) &&
+                   (uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) != 0U;
+
+        if (idle) {
+            local_irq_restore(status);
             return;
         }
         /* This synchronous flush also works inside IRQ-off/deferred paths. */
-        if (!uart_tx_buf_is_empty()) {
-            (void)uart_tx_try_drain_one();
-        }
+        (void)uart_tx_try_drain_one();
+        local_irq_restore(status);
     }
 }
 
@@ -284,6 +281,8 @@ void uart_init(void)
 
 void uart_irq_init(void)
 {
+    /* Keep the handler out while rings and UART registers are reset. */
+    local_irq_disable();
     /*
      * Start from a clean console state every boot/load so an earlier stress
      * run cannot leave backlog in the software rings or deferred-task state.
@@ -356,10 +355,22 @@ void uart_send(char c)
      * Early boot fallback: keep console output alive until the first real
      * UART interrupt proves that the asynchronous path is active.
      */
-    while ((uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) == 0U) {
+    for (;;) {
+        uint64_t status = local_irq_save();
+
+        /* IRQ delivery may have started while polling. Drain older bytes
+         * before checking THR, and keep that check paired with the write.
+         */
+        if (!ringbuf_is_empty(&uart_tx_buf)) {
+            (void)uart_tx_try_drain_one();
+        } else if ((uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) != 0U) {
+            uart_tx_poll_count++;
+            uart_reg_write(UART_THR_REG, (uint32_t)(uint8_t)c);
+            local_irq_restore(status);
+            return;
+        }
+        local_irq_restore(status);
     }
-    uart_tx_poll_count++;
-    uart_reg_write(UART_THR_REG, (uint32_t)(uint8_t)c);
 }
 
 char uart_recv(void)
@@ -406,10 +417,25 @@ char uart_recv(void)
         }
     }
 
-    while ((uart_reg_read(UART_LSR_REG) & LSR_RX_READY) == 0U) {
+    for (;;) {
+        uint64_t status = local_irq_save();
+        char c;
+
+        /* An IRQ may have moved the byte into the ring while we waited.
+         * Check both sources with IRQs off; RBR consumes the hardware byte.
+         */
+        if (ringbuf_pop(&uart_rx_buf, &c) == 0) {
+            local_irq_restore(status);
+            return c;
+        }
+        if ((uart_reg_read(UART_LSR_REG) & LSR_RX_READY) != 0U) {
+            c = (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
+            uart_rx_fallback_count++;
+            local_irq_restore(status);
+            return c;
+        }
+        local_irq_restore(status);
     }
-    uart_rx_fallback_count++;
-    return (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
 }
 
 void uart_send_string(const char *str)
@@ -453,11 +479,21 @@ void uart_send_dec(unsigned long value)
 
 static void uart_rx_drain(unsigned int budget)
 {
-    while (budget > 0U && (uart_reg_read(UART_LSR_REG) & LSR_RX_READY) != 0U) {
-        char c = (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
-        (void)uart_rx_push_char(c);
+    while (budget-- > 0U) {
+        uint64_t status = local_irq_save();
+        char c;
+
+        /* A TX interrupt uses the same handler and can drain RX too.
+         * Protect readiness, RBR consumption and ring insertion together.
+         */
+        if ((uart_reg_read(UART_LSR_REG) & LSR_RX_READY) == 0U) {
+            local_irq_restore(status);
+            break;
+        }
+        c = (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
+        (void)ringbuf_push(&uart_rx_buf, c);
         uart_rx_irq_count++;
-        budget--;
+        local_irq_restore(status);
     }
 }
 
@@ -504,6 +540,7 @@ void uart_rx_run_bottom_half(void)
 void uart_tx_run_bottom_half(void)
 {
     unsigned int budget = UART_DEFERRED_WORK_BUDGET;
+    uint64_t status;
 
     trace_record(TRACE_UART_TX_BOTTOM, uart_tx_buf.count);
     if (uart_tx_buf_is_empty() && uart_tx_refill != 0) {
@@ -516,14 +553,17 @@ void uart_tx_run_bottom_half(void)
     if (uart_tx_buf_is_empty() && uart_tx_refill != 0) {
         uart_tx_refill();
     }
-    if (!uart_tx_buf_is_empty()) {
+    /* Decide whether to arm TX from the same protected queue state. */
+    status = local_irq_save();
+    if (!ringbuf_is_empty(&uart_tx_buf)) {
         uart_tx_unmask();
         /* Wait for TX-ready rather than spinning the runner on a busy device. */
         if ((uart_reg_read(UART_LSR_REG) & LSR_TX_IDLE) != 0)
             raise_bottom_half(BH_UART_TX);
-        return;
+    } else {
+        uart_tx_mask();
     }
-    uart_tx_mask();
+    local_irq_restore(status);
 }
 
 void uart_note_external_irq(uint32_t irq)
@@ -548,16 +588,20 @@ void uart_reset_stats(void)
 
 void uart_get_stats(struct uart_stats *stats)
 {
+    uint64_t status;
+
     if (stats == 0) {
         return;
     }
 
+    status = local_irq_save();
     stats->async_ready = (unsigned long)uart_async_ready;
     stats->ext_irq_count = uart_ext_irq_count;
     stats->rx_irq_count = uart_rx_irq_count;
     stats->tx_irq_count = uart_tx_irq_count;
     stats->rx_fallback_count = uart_rx_fallback_count;
     stats->tx_poll_count = uart_tx_poll_count;
+    local_irq_restore(status);
 }
 
 void uart_set_platform(uintptr_t base, uint32_t irq)

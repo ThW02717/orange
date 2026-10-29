@@ -40,11 +40,12 @@ def main() -> int:
             "-ffunction-sections", "-fdata-sections", "-I", str(ROOT / "kernel/include"),
         ]
         sources = [ROOT / "tests/trap_roundtrip.S", ROOT / "tests/kernel_regression.c",
+                   ROOT / "tests/uart_race.c",
                    args.trap_source]
         sources += [ROOT / "kernel/src" / name for name in (
             "switch_to.S", "context_layout.c", "thread.c", "sched.c", "user.c",
             "syscall.c", "trap.c", "exec.c", "demo.c", "demo_uart.c", "trace.c",
-            "timer.c", "uart.c", "bottom_half.c", "custom_work.c", "ringbuf.c", "sbi.c", "string.c", "plic.c",
+            "timer.c", "bottom_half.c", "custom_work.c", "ringbuf.c", "sbi.c", "string.c", "plic.c",
         )]
         objects = []
         for index, source in enumerate(sources):
