@@ -404,8 +404,8 @@ static int demo_uart(void)
     uart_send(c);
     uart_send_string("'\n");
 
-    uart_send_string("uartdemo: stats async_ready=");
-    uart_send_dec(stats.async_ready);
+    uart_send_string("uartdemo: stats irq_enabled=");
+    uart_send_dec(stats.irq_enabled);
     uart_send_string(" ext_irq=");
     uart_send_dec(stats.ext_irq_count);
     uart_send_string(" rx_irq=");
@@ -418,7 +418,7 @@ static int demo_uart(void)
     uart_send_dec(stats.tx_poll_count);
     uart_send_string("\n");
 
-    pass = (stats.async_ready != 0UL) &&
+    pass = (stats.irq_enabled != 0UL) &&
            (stats.ext_irq_count != 0UL) &&
            (stats.rx_irq_count != 0UL) &&
            (stats.tx_irq_count != 0UL) &&

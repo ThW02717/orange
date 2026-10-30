@@ -5,7 +5,6 @@ struct thread;
 
 /* Register the boot flow once. It remains the fallback when the queue is empty. */
 void thread_system_bootstrap_init(void);
-int thread_system_active(void);
 struct thread *thread_current(void);
 
 void schedule(void);

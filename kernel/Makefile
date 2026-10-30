@@ -37,6 +37,9 @@ USER_PREEMPT_BIN := $(USER_ROOTFS_DIR)/preempt.bin
 USER_THREADS_SRCS := $(USER_DIR)/threads_start.S $(USER_DIR)/threads.c
 USER_THREADS_ELF := $(USER_BUILD_DIR)/threads.elf
 USER_THREADS_BIN := $(USER_ROOTFS_DIR)/threads.bin
+USER_IOWAIT_SRCS := $(USER_DIR)/threads_start.S $(USER_DIR)/iowait.c
+USER_IOWAIT_ELF := $(USER_BUILD_DIR)/iowait.elf
+USER_IOWAIT_BIN := $(USER_ROOTFS_DIR)/iowait.bin
 USER_API_HEADERS := $(USER_DIR)/user_api.h $(INC_DIR)/syscall.h
 
 C_SRCS    := $(wildcard $(SRC_DIR)/*.c)
@@ -54,7 +57,8 @@ BOARD_LDFLAGS := --defsym=KERNEL_LOAD_ADDR=0x20000000
 QEMU_LDFLAGS  := --defsym=KERNEL_LOAD_ADDR=0x82000000
 USER_LINK_ADDR := 0x32000000
 QEMU_USER_LINK_ADDR := 0x83000000
-QEMU_USER_BINS := $(addprefix $(USER_BUILD_DIR)/qemu_,$(addsuffix .bin,test badinst fork preempt threads prog))
+USER_PROGRAM_NAMES := test badinst fork preempt threads iowait prog
+QEMU_USER_BINS := $(addprefix $(USER_BUILD_DIR)/qemu_,$(addsuffix .bin,$(USER_PROGRAM_NAMES)))
 QEMU_ROOTFS_DIR := $(BUILD_DIR)/rootfs_qemu
 QEMU_INITRAMFS := $(BUILD_DIR)/initramfs_qemu.cpio
 
@@ -133,6 +137,12 @@ $(USER_THREADS_ELF): $(USER_THREADS_SRCS) $(USER_API_HEADERS) | $(USER_BUILD_DIR
 $(USER_THREADS_BIN): $(USER_THREADS_ELF) | $(USER_ROOTFS_DIR)
 	$(OBJCOPY) -O binary -S $< $@
 
+$(USER_IOWAIT_ELF): $(USER_IOWAIT_SRCS) $(USER_API_HEADERS) | $(USER_BUILD_DIR)
+	$(CC) $(BOARD_CFLAGS) -DUSER_ENTRY=iowait_main -msmall-data-limit=0 -mno-relax -nostartfiles -Wl,-Ttext=$(USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_IOWAIT_SRCS)
+
+$(USER_IOWAIT_BIN): $(USER_IOWAIT_ELF) | $(USER_ROOTFS_DIR)
+	$(OBJCOPY) -O binary -S $< $@
+
 # Board binaries contain absolute references to 0x32000000. QEMU loads user
 # code at 0x83000000, so it needs separately linked binaries and an archive.
 $(USER_BUILD_DIR)/qemu_%.elf: $(USER_DIR)/%.S $(INC_DIR)/syscall.h | $(USER_BUILD_DIR)
@@ -147,16 +157,19 @@ $(USER_BUILD_DIR)/qemu_preempt.elf: $(USER_PREEMPT_START_SRC) $(USER_PREEMPT_SRC
 $(USER_BUILD_DIR)/qemu_threads.elf: $(USER_THREADS_SRCS) $(USER_API_HEADERS) | $(USER_BUILD_DIR)
 	$(CC) $(QEMU_CFLAGS) -msmall-data-limit=0 -mno-relax -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_THREADS_SRCS)
 
+$(USER_BUILD_DIR)/qemu_iowait.elf: $(USER_IOWAIT_SRCS) $(USER_API_HEADERS) | $(USER_BUILD_DIR)
+	$(CC) $(QEMU_CFLAGS) -DUSER_ENTRY=iowait_main -msmall-data-limit=0 -mno-relax -nostartfiles -Wl,-Ttext=$(QEMU_USER_LINK_ADDR) -Wl,-e,_start -o $@ $(USER_IOWAIT_SRCS)
+
 $(USER_BUILD_DIR)/qemu_%.bin: $(USER_BUILD_DIR)/qemu_%.elf
 	$(OBJCOPY) -O binary -S $< $@
 
-$(QEMU_INITRAMFS): $(ROOTFS_FILES) $(QEMU_USER_BINS)
+$(QEMU_INITRAMFS): Makefile $(ROOTFS_FILES) $(QEMU_USER_BINS)
 	mkdir -p $(QEMU_ROOTFS_DIR)/bin
 	cp -a $(ROOTFS_DIR)/. $(QEMU_ROOTFS_DIR)/
-	$(foreach name,test badinst fork preempt threads prog,cp $(USER_BUILD_DIR)/qemu_$(name).bin $(QEMU_ROOTFS_DIR)/bin/$(name).bin;)
+	$(foreach name,$(USER_PROGRAM_NAMES),cp $(USER_BUILD_DIR)/qemu_$(name).bin $(QEMU_ROOTFS_DIR)/bin/$(name).bin;)
 	cd $(QEMU_ROOTFS_DIR) && find . -print0 | LC_ALL=C sort -z | cpio --null -o -H newc --owner=0:0 > ../initramfs_qemu.cpio
 
-$(INITRAMFS): $(ROOTFS_FILES) $(USER_TEST_BIN) $(USER_BADINST_BIN) $(USER_FORK_BIN) $(USER_PREEMPT_BIN) $(USER_THREADS_BIN) $(USER_PROG_BIN)
+$(INITRAMFS): $(ROOTFS_FILES) $(USER_TEST_BIN) $(USER_BADINST_BIN) $(USER_FORK_BIN) $(USER_PREEMPT_BIN) $(USER_THREADS_BIN) $(USER_IOWAIT_BIN) $(USER_PROG_BIN)
 	@if [ ! -d "$(ROOTFS_DIR)" ]; then \
 		echo "Missing $(ROOTFS_DIR)/ directory"; \
 		exit 1; \

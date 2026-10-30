@@ -20,6 +20,11 @@ static inline long gettid(void) { return user_syscall(SYS_gettid, 0, 0, 0); }
 static inline long fork(void) { return user_syscall(SYS_fork, 0, 0, 0); }
 static inline long exec(const char *name) { return user_syscall(SYS_exec, (long)name, 0, 0); }
 static inline long stop(long pid) { return user_syscall(SYS_stop, pid, 0, 0); }
+static inline long uart_read(char *buf, long size)
+{
+    return user_syscall(SYS_uart_read, (long)buf, size, 0);
+}
+
 static inline long uart_write(const char *buf, long size)
 {
     return user_syscall(SYS_uart_write, (long)buf, size, 0);
@@ -27,13 +32,13 @@ static inline long uart_write(const char *buf, long size)
 
 static inline __attribute__((noreturn)) void thread_exit(int status)
 {
-    (void)user_syscall(SYS_exit, status, 0, 0);
+    (void)user_syscall(SYS_thread_exit, status, 0, 0);
     for (;;) {}
 }
 
 static inline __attribute__((noreturn)) void exit_group(int status)
 {
-    (void)user_syscall(SYS_exit_group, status, 0, 0);
+    (void)user_syscall(SYS_exit, status, 0, 0);
     for (;;) {}
 }
 

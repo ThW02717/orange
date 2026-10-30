@@ -25,6 +25,20 @@ def command_output(proc, command, done, timeout=30, include_prior=False):
 
 
 def test_lab_commands(proc):
+    # Paste several lines together while their echoes/replies are transmitting.
+    # This exercises repeated RX IRQs and the shared RX/TX path, not just typing
+    # one byte then waiting for its echo. It is not a physical FIFO timing test.
+    assert proc.stdin is not None
+    for _ in range(3):
+        proc.stdin.write(b"hello\r" * 8)
+        proc.stdin.flush()
+        output = b""
+        while output.count(b"Hello World!") < 8:
+            output += read_until(proc, b"Hello World!", 5, False)
+        assert output.count(b"Hello World!") == 8, output
+        assert b"Unknown command:" not in output and b"fatal kernel fault" not in output, output
+    print("[SYSTEM] pasted RX command batches with concurrent TX echo/replies: PASS")
+
     # Shorter timeouts added later must fire first. Each command reuses the
     # shell input buffer, so this also checks that messages were copied.
     output = b""
@@ -143,6 +157,15 @@ def main() -> int:
                 ):
                     assert marker in output, output.decode(errors="replace")
             print(f"[SYSTEM] {command}: PASS")
+        output = command_output(proc, "runu iowait", b"type R")
+        assert b"user task finished" not in output, output
+        assert proc.stdin is not None
+        proc.stdin.write(b"R")
+        proc.stdin.flush()
+        output += read_until(proc, b"user task finished, back to shell", 5, False)
+        assert b"[iowait] reader resumed: PASS" in output, output
+        assert output.index(b"reader resumed: PASS") < output.index(b"user task finished"), output
+        print("[SYSTEM] U-mode UART read sleeps, sibling progresses, last sleeper wakes before shell resumes: PASS")
         test_lab_commands(proc)
         print("[SYSTEM] SUMMARY: PASS")
         return 0

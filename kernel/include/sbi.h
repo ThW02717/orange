@@ -55,7 +55,6 @@ long sbi_get_impl_version();
 long sbi_get_mimpid();
 
 long sbi_probe_extension(long extension_id);
-int sbi_err_map_errno(long err);
 long sbi_hart_start(unsigned long hartid, unsigned long start_addr, unsigned long opaque);
 long sbi_hart_get_status(unsigned long hartid);
 

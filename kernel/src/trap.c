@@ -80,7 +80,6 @@ void trap_dispatch(struct trap_context *tc)
 
             irq = plic_claim();
             if (irq == uart_irq_id()) {
-                uart_note_external_irq(irq);
                 uart_irq_top();
             }
             if (irq != 0U) {

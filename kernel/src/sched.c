@@ -95,11 +95,6 @@ struct thread *thread_current(void)
     return threading_started ? thread_current_from_tp() : 0;
 }
 
-int thread_system_active(void)
-{
-    return threading_started;
-}
-
 void thread_system_bootstrap_init(void)
 {
     uint64_t status = local_irq_save();
@@ -142,6 +137,7 @@ void schedule(void)
      * stack and tp are still executing.
      */
     sstatus = local_irq_save();
+    need_resched = 0;
 
     /*
      * RR policy is just FIFO: pop the head, and later push the yielding
@@ -225,7 +221,19 @@ void thread_enter_idle(void)
     }
 
     for (;;) {
+        uint64_t status;
+
         thread_reap_zombies();
+        status = local_irq_save();
+        if (run_head == 0) {
+            /* WFI observes pending sources even with global SIE clear.
+             * Enable delivery afterward, without a check-to-WFI race.
+             */
+            asm volatile("wfi" ::: "memory");
+            local_irq_enable();
+        } else {
+            local_irq_restore(status);
+        }
         schedule();
     }
 }
@@ -233,26 +241,35 @@ void thread_enter_idle(void)
 /* Return to the shell after runnable work has finished and zombies are freed. */
 void thread_run_until_idle(void)
 {
+    uint64_t caller_status;
+
     if (threading_started == 0) {
         return;
     }
 
+    caller_status = local_irq_save();
+    local_irq_restore(caller_status);
     for (;;) {
         uint64_t sstatus;
         struct thread *cur;
-        int has_runnable;
 
         thread_reap_zombies();
 
         sstatus = local_irq_save();
         cur = thread_current();
-        has_runnable = (run_head != 0);
-        local_irq_restore(sstatus);
 
-        if (cur != 0 && cur->is_idle != 0 && !has_runnable) {
+        if (cur != 0 && cur->is_idle != 0 && run_head == 0 &&
+            !thread_has_live_workers()) {
+            local_irq_restore(caller_status);
             return;
         }
 
+        if (run_head == 0 && cur != 0 && cur->is_idle != 0) {
+            asm volatile("wfi" ::: "memory");
+            local_irq_enable();
+        } else {
+            local_irq_restore(sstatus);
+        }
         schedule();
     }
 }

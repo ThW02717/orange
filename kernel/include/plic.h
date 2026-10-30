@@ -42,7 +42,6 @@
 void plic_set_base(uintptr_t base);
 void plic_set_priority(uint32_t irq, uint32_t priority);
 void plic_enable_irq(uint32_t irq);
-void plic_disable_irq(uint32_t irq);
 void plic_set_threshold(uint32_t threshold);
 uint32_t plic_claim(void);
 void plic_complete(uint32_t irq);

@@ -754,24 +754,6 @@ int fdt_get_memreserve_regions(const void *fdt, struct fdt_mem_region *regions, 
     return -1;
 }
 
-// deliver usable RAM base/size
-int fdt_get_memory_region(const void *fdt, uint64_t *base, uint64_t *size) {
-    struct fdt_mem_region r[FDT_MAX_MEM_REGIONS];
-    int n;
-
-    if (base == 0 || size == 0) {
-        return -1;
-    }
-
-    n = fdt_get_memory_regions(fdt, r, FDT_MAX_MEM_REGIONS);
-    if (n <= 0) {
-        return -1;
-    }
-
-    *base = r[0].base;
-    *size = r[0].size;
-    return 0;
-}
 // find initramfs/initrd in RAM
 int fdt_get_initrd_range(const void *fdt, uint64_t *start, uint64_t *end) {
     int node;

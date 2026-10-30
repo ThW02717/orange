@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 struct uart_stats {
-    unsigned long async_ready;
+    unsigned long irq_enabled;
     unsigned long ext_irq_count;
     unsigned long rx_irq_count;
     unsigned long tx_irq_count;
@@ -15,7 +15,6 @@ struct uart_stats {
 void uart_set_platform(uintptr_t base, uint32_t irq);
 uint32_t uart_irq_id(void);
 
-void uart_init(void);
 void uart_send(char c);
 char uart_recv(void);
 void uart_send_string(const char *str);
@@ -29,7 +28,6 @@ void uart_irq_init(void);
 void uart_irq_top(void);
 void uart_rx_run_bottom_half(void);
 void uart_tx_run_bottom_half(void);
-void uart_note_external_irq(uint32_t irq);
 void uart_reset_stats(void);
 void uart_get_stats(struct uart_stats *stats);
 

@@ -16,6 +16,7 @@ void thread_reap_zombies(void);
 /* Scheduler/lifecycle boundary. Caller keeps local IRQs disabled. */
 void sched_enqueue(struct thread *task);
 void sched_remove(struct thread *task);
+void wait_queue_cancel_locked(struct thread *task);
 void switch_to(struct thread *prev, struct thread *next);
 
 #endif

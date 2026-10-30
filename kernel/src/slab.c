@@ -868,16 +868,6 @@ void memory_print_memstat(void)
     uart_send_string("\n");
 }
 
-/* Shell command helper for checking slab list invariants. */
-void memory_debug_check_slabs(void)
-{
-    if (memory_check_slabs_ok()) {
-        uart_send_string("slabcheck: OK\n");
-    } else {
-        uart_send_string("slabcheck: FAILED\n");
-    }
-}
-
 void slab_init(void)
 {
     unsigned int i;

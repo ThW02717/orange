@@ -50,7 +50,6 @@ void kfree(void *ptr);
 void memory_print_memstat(void);
 void memory_print_slabinfo(void);
 void memory_print_buddyinfo(void);
-void memory_debug_check_slabs(void);
 int memory_check_slabs_ok(void);
 void memory_get_stats(struct memory_stats_snapshot *out);
 int memory_get_slab_class_snapshot(unsigned int class_idx, struct memory_slab_class_snapshot *out);

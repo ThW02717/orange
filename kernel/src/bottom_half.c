@@ -47,6 +47,11 @@ int bottom_halves_pending(void)
     return any;
 }
 
+int bottom_half_running(void)
+{
+    return running;
+}
+
 void run_bottom_halves(void)
 {
     uint64_t status = local_irq_save();

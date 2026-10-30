@@ -26,71 +26,6 @@ static volatile unsigned int started_cores = 1;
 static unsigned char secondary_stacks[MAX_CORES - 1][SECONDARY_STACK_SIZE] __attribute__((aligned(16)));
 extern void secondary_start(void);
 
-/*
- * Boot-time rdtime probe only: add a little distance between reads so the
- * monotonic counter is visible on a fast CPU.
- */
-static void timer_probe_delay(unsigned long count)
-{
-    while (count-- > 0) {
-        asm volatile("nop");
-    }
-}
-
-static void timer_probe_readout(void)
-{
-    uint64_t t1;
-    uint64_t t2;
-    uint64_t t3;
-
-    /*
-     * Read the raw time counter a few times to confirm it is increasing
-     * before building interrupt scheduling on top of it.
-     */
-    t1 = timer_read();
-    timer_probe_delay(10000UL);
-    t2 = timer_read();
-    timer_probe_delay(10000UL);
-    t3 = timer_read();
-
-    uart_send_string("timer read: t1=");
-    uart_send_dec(t1);
-    uart_send_string(" t2=");
-    uart_send_dec(t2);
-    uart_send_string(" t3=");
-    uart_send_dec(t3);
-    uart_send_string("\n");
-}
-
-static void timer_probe_state(void)
-{
-    /*
-     * Dump the timer subsystem's initial bookkeeping before interrupts are
-     * wired in so later regressions have a clear baseline.
-     */
-    uart_send_string("timer state: boot=");
-    uart_send_dec(boot_time);
-    uart_send_string(" next=");
-    uart_send_dec(next_deadline);
-    uart_send_string(" uptime=");
-    uart_send_dec(uptime_seconds);
-    uart_send_string("\n");
-}
-
-static void timer_probe_sbi_support(void)
-{
-    long supported;
-
-    /*
-     * Probe the SBI TIME extension explicitly so we can distinguish
-     * "deadline math is wrong" from "firmware does not implement TIME".
-     */
-    supported = sbi_probe_extension(SBI_EXT_TIMER);
-    uart_send_string("sbi TIME ext = ");
-    uart_send_dec((unsigned long)supported);
-    uart_send_string("\n");
-}
-
 static void greet_once(unsigned long core_id)
 {
     unsigned int my_ticket = __sync_fetch_and_add(&greet_ticket, 1);
@@ -196,20 +131,11 @@ void kernel_main(unsigned long hartid, unsigned long dtb_addr,
         uart_send_string("timer freq = <unavailable>\n");
     }
 
-    timer_probe_state();
-    timer_probe_readout();
-    timer_probe_sbi_support();
-
     bottom_half_init();
 
     /* One SBI timer serves scheduler ticks and queued timeout events. */
     timer_init();
-    /*
-     * Arm the UART external-interrupt route during boot so shell I/O can
-     * transition to the asynchronous path without a manual enable command.
-     * uart_recv() still keeps a polling fallback until the first real RX IRQ
-     * is observed, which keeps bring-up interactive on real hardware.
-     */
+    /* Arm UART interrupts before the shell starts using the RX/TX rings. */
     uart_irq_init();
     uart_send_string("uart: interrupt-driven I/O armed at boot\n");
 

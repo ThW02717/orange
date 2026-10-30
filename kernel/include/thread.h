@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 struct trap_context;
+struct wait_entry;
 
 /*
  * Single-active-hart scheduler:
@@ -21,6 +22,7 @@ enum thread_state {
     THREAD_RUNNING = 0,
     THREAD_RUNNABLE,
     THREAD_NEW,      /* private construction state; not waiting for I/O */
+    THREAD_WAITING,  /* waiting on resources, not on the run queue */
     THREAD_ZOMBIE,
 };
 
@@ -69,6 +71,7 @@ struct thread {
     struct thread *next;   /* run queue linkage */
     struct thread *znext;  /* zombie list linkage */
     struct thread *all_next; /* global task list linkage */
+    struct wait_entry *wait_entries; /* active registrations; nodes live outside the TCB */
 
     int is_idle;
 
@@ -96,5 +99,6 @@ int thread_stop_process(int32_t tgid, int exit_status);
 int thread_user_group_size(const struct thread *task);
 int thread_user_stack_contains(const struct thread *task, uintptr_t start, uintptr_t end);
 int thread_user_image_busy(const struct thread *except);
+int thread_has_live_workers(void);
 
 #endif

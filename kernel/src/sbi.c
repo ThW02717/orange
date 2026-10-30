@@ -64,23 +64,6 @@ long sbi_probe_extension(long extension_id) {
     return ret.value;
 }
 
-int sbi_err_map_errno(long err) {
-    switch (err) {
-        case SBI_SUCCESS:
-            return 0;
-        case SBI_ERR_DENIED:
-            return -1;
-        case SBI_ERR_INVALID_PARAM:
-            return -2;
-        case SBI_ERR_INVALID_ADDRESS:
-            return -3;
-        case SBI_ERR_NOT_SUPPORTED:
-        case SBI_ERR_FAILED:
-        default:
-            return -4;
-    }
-}
-
 long sbi_hart_start(unsigned long hartid, unsigned long start_addr, unsigned long opaque) {
     struct sbiret ret = sbi_ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_START,
                                   hartid, start_addr, opaque, 0, 0, 0);

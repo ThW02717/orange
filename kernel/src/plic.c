@@ -45,19 +45,6 @@ void plic_enable_irq(uint32_t irq)
     put32(reg, value | bit);
 }
 
-void plic_disable_irq(uint32_t irq)
-{
-    uintptr_t reg;
-    uint32_t value;
-    uint32_t bit;
-
-    /* Mask this source from hart0's supervisor context. */
-    reg = plic_enable_reg(PLIC_HART0_SCTX, irq);
-    value = get32(reg);
-    bit = 1U << (irq % 32U);
-    put32(reg, value & ~bit);
-}
-
 void plic_set_threshold(uint32_t threshold)
 {
     put32(plic_context_reg(PLIC_HART0_SCTX, PLIC_THRESHOLD_OFFSET), threshold);

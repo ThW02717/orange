@@ -264,6 +264,7 @@ void thread_mark_current_zombie(int exit_status)
         local_irq_restore(sstatus);
         return;
     }
+    wait_queue_cancel_locked(cur);
     cur->state = THREAD_ZOMBIE;
     cur->exit_status = exit_status;
     cur->znext = zombie_head;
@@ -291,6 +292,7 @@ int thread_stop_tid(int32_t tid, int exit_status)
         return 0;
     }
     sched_remove(target);
+    wait_queue_cancel_locked(target);
     target->state = THREAD_ZOMBIE;
     target->exit_status = exit_status;
     target->znext = zombie_head;
@@ -371,6 +373,22 @@ void thread_reap_zombies(void)
         }
         kfree(z);
     }
+}
+
+int thread_has_live_workers(void)
+{
+    uint64_t status = local_irq_save();
+    struct thread *task;
+    int found = 0;
+
+    for (task = all_threads; task != 0; task = task->all_next) {
+        if (!task->is_idle && task->state != THREAD_ZOMBIE) {
+            found = 1;
+            break;
+        }
+    }
+    local_irq_restore(status);
+    return found;
 }
 
 int thread_user_group_size(const struct thread *task)

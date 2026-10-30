@@ -12,6 +12,10 @@
 #include "utils.h"
 #include "bottom_half.h"
 #include "memory.h"
+#include "wait.h"
+
+static struct wait_queue uart_rx_wait;
+static struct wait_queue uart_tx_wait;
 
 static struct ringbuf uart_rx_buf;
 static struct ringbuf uart_tx_buf;
@@ -23,7 +27,6 @@ static uintptr_t uart_base_addr =
 #endif
 static uint32_t uart_irq_number = 0U;
 static int uart_irq_enabled = 0;
-static int uart_async_ready = 0;
 static volatile unsigned long uart_ext_irq_count = 0;
 static volatile unsigned long uart_rx_irq_count = 0;
 static volatile unsigned long uart_tx_irq_count = 0;
@@ -103,62 +106,6 @@ static void uart_tx_unmask(void)
     uart_ier_set_bits(UART_IER_TX_ENABLE);
 }
 
-static uint32_t uart_irq_status_snapshot(void)
-{
-    return uart_reg_read(UART_LSR_REG);
-}
-
-static int uart_rx_ready_from_status(uint32_t status)
-{
-    return (status & LSR_RX_READY) != 0U;
-}
-
-static int uart_tx_ready_from_status(uint32_t status)
-{
-    uint32_t ier;
-
-    ier = uart_reg_read(UART_IER_REG);
-    return ((status & LSR_TX_IDLE) != 0U) && ((ier & UART_IER_TX_ENABLE) != 0U);
-}
-
-/*
- * RX/TX ring buffers are shared between interrupt context and normal shell
- * code. Keep every head/tail/count update inside a tiny local critical
- * section so concurrent push/pop pairs cannot corrupt the FIFO state.
- */
-static int uart_rx_pop_char(char *out)
-{
-    uint64_t sstatus;
-    int ret;
-
-    sstatus = local_irq_save();
-    ret = ringbuf_pop(&uart_rx_buf, out);
-    local_irq_restore(sstatus);
-    return ret;
-}
-
-static int uart_tx_push_char(char c)
-{
-    uint64_t sstatus;
-    int ret;
-
-    sstatus = local_irq_save();
-    ret = ringbuf_push(&uart_tx_buf, c);
-    local_irq_restore(sstatus);
-    return ret;
-}
-
-static int uart_tx_pop_char(char *out)
-{
-    uint64_t sstatus;
-    int ret;
-
-    sstatus = local_irq_save();
-    ret = ringbuf_pop(&uart_tx_buf, out);
-    local_irq_restore(sstatus);
-    return ret;
-}
-
 static int uart_tx_buf_is_empty(void)
 {
     uint64_t sstatus;
@@ -200,7 +147,7 @@ static int uart_tx_try_drain_one(void)
         return 0;
     }
 
-    if (uart_tx_pop_char(&c) != 0) {
+    if (ringbuf_pop(&uart_tx_buf, &c) != 0) {
         local_irq_restore(status);
         return 0;
     }
@@ -210,19 +157,9 @@ static int uart_tx_try_drain_one(void)
      * piece of serial output.
      */
     uart_reg_write(UART_THR_REG, (uint32_t)(uint8_t)c);
+    wait_queue_wake_one(&uart_tx_wait);
     local_irq_restore(status);
     return 1;
-}
-
-static void uart_tx_kick(void)
-{
-    /*
-     * TX interrupts stay disabled while the queue is empty. Once new data is
-     * queued, enable TX-ready interrupts and opportunistically push one byte
-     * so the hardware pipeline starts moving immediately.
-     */
-    uart_tx_unmask();
-    (void)uart_tx_try_drain_one();
 }
 
 static void uart_irq_ack_stale_status(void)
@@ -237,16 +174,13 @@ static void uart_irq_ack_stale_status(void)
     (void)uart_reg_read(UART_MSR_REG);
 }
 
-/*
- * Drop any software-side backlog from a previous demo run and drain stale
- * hardware RX state before re-arming the interrupt-driven console path.
- */
+/* Reset software queues before arming UART interrupts. */
 static void uart_reset_runtime_state(void)
 {
     ringbuf_init(&uart_rx_buf);
     ringbuf_init(&uart_tx_buf);
 
-    uart_async_ready = 0;
+    uart_irq_enabled = 0;
     clear_bottom_half(BH_UART_RX);
     clear_bottom_half(BH_UART_TX);
     uart_tx_refill = 0;
@@ -264,29 +198,10 @@ static void uart_flush_hardware_rx_fifo(void)
     }
 }
 
-void uart_init(void)
-{
-#ifdef QEMU
-    uart_reg_write(UART_IER_REG, 0);
-    uart_reg_write(UART_LCR_REG, 0x80);
-    uart_reg_write(UART_DLL_REG, 0x01);
-    uart_reg_write(UART_DLH_REG, 0x00);
-    uart_reg_write(UART_LCR_REG, 0x03);
-    uart_reg_write(UART_FCR_REG, 0x07);
-    uart_reg_write(UART_MCR_REG, 0x03);
-#else
-    /* Preserve the UART configuration established by the bootloader. */
-#endif
-}
-
 void uart_irq_init(void)
 {
     /* Keep the handler out while rings and UART registers are reset. */
     local_irq_disable();
-    /*
-     * Start from a clean console state every boot/load so an earlier stress
-     * run cannot leave backlog in the software rings or deferred-task state.
-     */
     uart_reset_runtime_state();
 
     /* Route the DT-discovered UART IRQ into hart0's S-mode context. */
@@ -325,36 +240,30 @@ void uart_irq_init(void)
 
 void uart_send(char c)
 {
-    /*
-     * Once the first real UART IRQ is observed, all output is queued and
-     * drained by TX-ready interrupts.
-     */
-    if (uart_async_ready) {
-        if (local_irqs_enabled()) {
-            while (uart_tx_push_char(c) != 0) {
-                /*
-                 * A deferred callback may be the current producer. It cannot
-                 * wait for its own runner to return and service TX work.
-                 */
+    if (uart_irq_enabled && local_irqs_enabled()) {
+        int sleepable = thread_can_sleep();
+
+        for (;;) {
+            uint64_t status = local_irq_save();
+
+            if (ringbuf_push(&uart_tx_buf, c) == 0) {
+                uart_tx_unmask();
+                local_irq_restore(status);
+                return;
+            }
+            uart_tx_unmask();
+            if (sleepable) {
+                /* Enqueue before IRQ delivery can free space and wake us. */
+                (void)wait_queue_sleep_locked(&uart_tx_wait);
+            } else {
+                /* Idle and bottom-half callbacks cannot block this runner. */
                 (void)uart_tx_try_drain_one();
             }
-            uart_tx_kick();
-            return;
-        }
-
-        /*
-         * Preserve FIFO order before IRQ-off direct output. Otherwise newer
-         * syscall/log bytes would overtake text already queued by the shell.
-         */
-        while (!uart_tx_buf_is_empty()) {
-            (void)uart_tx_try_drain_one();
+            local_irq_restore(status);
         }
     }
 
-    /*
-     * Early boot fallback: keep console output alive until the first real
-     * UART interrupt proves that the asynchronous path is active.
-     */
+    /* Before IRQ setup, or with SIE clear, output must make progress here. */
     for (;;) {
         uint64_t status = local_irq_save();
 
@@ -375,48 +284,27 @@ void uart_send(char c)
 
 char uart_recv(void)
 {
-    /*
-     * Once IRQ delivery is confirmed, input is consumed purely from the RX
-     * ring buffer that the ISR fills.
-     */
-    if (uart_async_ready && local_irqs_enabled()) {
-        char c;
+    if (uart_irq_enabled && local_irqs_enabled()) {
+        int sleepable = thread_can_sleep();
 
         while (1) {
-            if (uart_rx_pop_char(&c) == 0) {
+            uint64_t status = local_irq_save();
+            char c;
+
+            if (ringbuf_pop(&uart_rx_buf, &c) == 0) {
+                local_irq_restore(status);
                 return c;
             }
+            if (sleepable)
+                (void)wait_queue_sleep_locked(&uart_rx_wait);
+            local_irq_restore(status);
         }
     }
 
     /*
-     * Syscalls enter with SIE clear. Consume buffered input first, then poll
-     * hardware instead of waiting for an RX bottom half that cannot run.
+     * Before IRQ setup or inside an IRQ-off caller, consume buffered input
+     * first, then poll hardware. Normal user reads enable IRQs and can sleep.
      */
-    {
-        char c;
-        if (uart_rx_pop_char(&c) == 0) {
-            return c;
-        }
-    }
-
-    /*
-     * Bring-up fallback: briefly wait for an RX IRQ before polling the UART
-     * directly. This keeps the shell usable even if the interrupt route is
-     * not live yet during early boot.
-     */
-    if (uart_irq_enabled && local_irqs_enabled()) {
-        unsigned long wait = 500000UL;
-        char c;
-
-        while (wait-- > 0UL) {
-            if (uart_rx_pop_char(&c) == 0) {
-                return c;
-            }
-            asm volatile("nop");
-        }
-    }
-
     for (;;) {
         uint64_t status = local_irq_save();
         char c;
@@ -483,15 +371,16 @@ static void uart_rx_drain(unsigned int budget)
         uint64_t status = local_irq_save();
         char c;
 
-        /* A TX interrupt uses the same handler and can drain RX too.
-         * Protect readiness, RBR consumption and ring insertion together.
+        /* Pair the readiness check with the consuming RBR read. Keep ring
+         * insertion and the reader wakeup in the same IRQ-off section.
          */
         if ((uart_reg_read(UART_LSR_REG) & LSR_RX_READY) == 0U) {
             local_irq_restore(status);
             break;
         }
         c = (char)(uart_reg_read(UART_RBR_REG) & 0xFFU);
-        (void)ringbuf_push(&uart_rx_buf, c);
+        if (ringbuf_push(&uart_rx_buf, c) == 0)
+            wait_queue_wake_one(&uart_rx_wait);
         uart_rx_irq_count++;
         local_irq_restore(status);
     }
@@ -501,20 +390,17 @@ void uart_irq_top(void)
 {
     uint32_t status;
 
-    status = uart_irq_status_snapshot();
-    if (!uart_async_ready) {
-        uart_async_ready = 1;
-    }
+    uart_ext_irq_count++;
+    status = uart_reg_read(UART_LSR_REG);
 
-    if (uart_rx_ready_from_status(status)) {
+    if (status & LSR_RX_READY) {
         trace_record(TRACE_UART_TOP_RX, 0U);
         uart_rx_mask();
-        /* Preserve a bounded batch before deferring the remaining RX work. */
-        uart_rx_drain(UART_DEFERRED_WORK_BUDGET);
+        /* Keep bytes in the hardware FIFO until the RX bottom half runs. */
         raise_bottom_half(BH_UART_RX);
     }
 
-    if (uart_tx_ready_from_status(status)) {
+    if ((status & LSR_TX_IDLE) && (uart_reg_read(UART_IER_REG) & UART_IER_TX_ENABLE)) {
         trace_record(TRACE_UART_TOP_TX, (uint32_t)uart_tx_buf.count);
         uart_tx_mask();
         raise_bottom_half(BH_UART_TX);
@@ -566,13 +452,6 @@ void uart_tx_run_bottom_half(void)
     local_irq_restore(status);
 }
 
-void uart_note_external_irq(uint32_t irq)
-{
-    if (irq == uart_irq_id()) {
-        uart_ext_irq_count++;
-    }
-}
-
 void uart_reset_stats(void)
 {
     uint64_t sstatus;
@@ -595,7 +474,7 @@ void uart_get_stats(struct uart_stats *stats)
     }
 
     status = local_irq_save();
-    stats->async_ready = (unsigned long)uart_async_ready;
+    stats->irq_enabled = (unsigned long)uart_irq_enabled;
     stats->ext_irq_count = uart_ext_irq_count;
     stats->rx_irq_count = uart_rx_irq_count;
     stats->tx_irq_count = uart_tx_irq_count;
@@ -623,7 +502,7 @@ int uart_write_async(const char *buf, unsigned int size)
         ringbuf_push(&uart_tx_buf, buf[i]);
     }
     if (size != 0) {
-        uart_tx_kick();
+        uart_tx_unmask();
     }
     local_irq_restore(status);
     return 0;
@@ -645,9 +524,8 @@ int uart_tx_set_refill(void (*refill)(void))
 }
 
 #ifdef KERNEL_TEST
-void uart_test_async(int enabled)
+void uart_test_set_irq_enabled(int enabled)
 {
-    uart_async_ready = enabled;
     uart_irq_enabled = enabled;
 }
 

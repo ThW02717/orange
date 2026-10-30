@@ -15,6 +15,7 @@ void raise_bottom_half(enum bottom_half type);
 /* Clear a future notification; a handler already selected may still run. */
 void clear_bottom_half(enum bottom_half type);
 int bottom_halves_pending(void);
+int bottom_half_running(void);
 /* Single-hart runner. Callbacks must not sleep, schedule or wait for work. */
 void run_bottom_halves(void);
 

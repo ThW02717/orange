@@ -18,6 +18,7 @@
 #include "syscall.h"
 #include "syscall_dispatch.h"
 #include "irqflags.h"
+#include "wait.h"
 
 /* Link production modules normally. Allocation, archive input, the trap
  * dispatcher and optional bottom-half arrival probes are fixtures.
@@ -43,6 +44,7 @@ static unsigned char user_kstack[16384] __attribute__((aligned(16)));
 extern void supervisor_roundtrip(void);
 extern void user_roundtrip(void);
 extern const char *test_uart_races(void);
+extern void test_uart_waits(void);
 
 static void puts_raw(const char *s)
 {
@@ -60,7 +62,7 @@ static void finish(int ok)
     for (;;) { asm volatile("wfi"); }
 }
 
-static void check(int ok, const char *reason)
+void check(int ok, const char *reason)
 {
     if (!ok) {
         puts_raw(reason);
@@ -239,7 +241,14 @@ static void sequential_callback(void *arg)
 {
     unsigned int step = (unsigned int)(uintptr_t)arg;
     unsigned int before;
+    struct wait_queue forbidden = {0};
+    uint64_t status;
 
+    check(!thread_can_sleep(), "bottom-half callback allowed to sleep");
+    status = local_irq_save();
+    check(wait_queue_sleep_locked(&forbidden) == -1 && forbidden.head == 0,
+          "bottom-half callback entered a wait queue");
+    local_irq_restore(status);
     record_task((void *)(uintptr_t)step);
     before = task_event_count;
     if (step != 0) {
@@ -556,6 +565,326 @@ static void test_timer_budget(void)
     puts_raw("[REGRESSION] real timer event budget and continuation: PASS\n");
 }
 
+static struct wait_queue resource_wait;
+static int resource_ready;
+static int waiting_tids[3];
+static unsigned int cancelled_waiter;
+static unsigned int resumed_waiters[3];
+static unsigned int resumed_count;
+
+static void resource_waiter(void *arg)
+{
+    unsigned int id = (unsigned int)(uintptr_t)arg;
+    uint64_t status;
+
+    check(thread_can_sleep(), "worker cannot sleep");
+    status = local_irq_save();
+    while (!resource_ready)
+        check(wait_queue_sleep_locked(&resource_wait) == 0, "resource wait failed");
+    local_irq_restore(status);
+    check(local_irqs_enabled(), "resource wait lost enabled IRQ state");
+    resumed_waiters[resumed_count++] = id;
+}
+
+static void resource_producer(void *arg)
+{
+    struct thread *first;
+    (void)arg;
+
+    for (unsigned int i = 0; i < 3; i++) {
+        struct thread *task = thread_test_find(waiting_tids[i]);
+        check(task && task->state == THREAD_WAITING && task->wait_entries &&
+              task->wait_entries->queue == &resource_wait,
+              "resource waiter remained runnable");
+    }
+    check(thread_stop_tid(waiting_tids[cancelled_waiter], 0) == 0, "stop sleeper");
+    thread_reap_zombies();
+    check(thread_test_find(waiting_tids[cancelled_waiter]) == 0, "sleeper not reclaimed");
+
+    /* A wakeup is a reason to recheck, not a grant of the resource. */
+    first = resource_wait.head->task;
+    wait_queue_wake_one(&resource_wait);
+    thread_yield();
+    check(resumed_count == 0 && resource_wait.tail->task == first &&
+          first->state == THREAD_WAITING, "spurious wake skipped the resource check");
+    resource_ready = 1;
+    wait_queue_wake_all(&resource_wait);
+    wait_queue_wake_all(&resource_wait);
+    check(resource_wait.head && resource_wait.head->task->state == THREAD_RUNNABLE,
+          "wake-all did not make sleepers runnable");
+}
+
+static void test_resource_waits(void)
+{
+    check(!thread_can_sleep(), "idle thread must stay available as fallback");
+    for (cancelled_waiter = 0; cancelled_waiter < 3; cancelled_waiter++) {
+        unsigned int expected[2];
+        unsigned int n = 0;
+
+        check(!thread_has_live_workers(), "resource fixture has live workers");
+        heap_used = 0;
+        resource_ready = 0;
+        resumed_count = 0;
+        for (unsigned int i = 0; i < 3; i++) {
+            waiting_tids[i] = thread_create_kernel(resource_waiter, (void *)(uintptr_t)i);
+            check(waiting_tids[i] > 0, "create resource waiter");
+            if (i != cancelled_waiter)
+                expected[n++] = i;
+        }
+        check(thread_create_kernel(resource_producer, 0) > 0, "create resource producer");
+        thread_run_until_idle();
+        check(resumed_count == 2 && resumed_waiters[0] == expected[1] &&
+              resumed_waiters[1] == expected[0] && !thread_has_live_workers() &&
+              resource_wait.head == 0 && resource_wait.tail == 0,
+              "wait FIFO, repeated wake or cancelled sleeper cleanup");
+    }
+    puts_raw("[REGRESSION] resource sleep/wake, condition recheck, FIFO and head/middle/tail cancellation: PASS\n");
+}
+
+static struct wait_queue multi_wait[2];
+static int multi_ready[2];
+static unsigned int multi_resumed;
+static unsigned int multi_rechecks;
+static unsigned int multi_cancel;
+static unsigned int multi_wake_before_stop;
+static int multi_tids[3];
+
+static void check_wait_links(struct wait_queue *queue, unsigned int expected)
+{
+    struct wait_entry *prev = 0;
+    unsigned int count = 0;
+
+    for (struct wait_entry *entry = queue->head; entry; entry = entry->next) {
+        check(entry->prev == prev && entry->queue == queue && entry->task &&
+              entry->task->state != THREAD_ZOMBIE, "broken resource wait links");
+        prev = entry;
+        check(++count <= 3, "wait queue cycle or duplicate registration");
+    }
+    check(count == expected && queue->tail == prev, "wrong wait queue size/tail");
+}
+
+static void multi_waiter(void *arg)
+{
+    unsigned int id = (unsigned int)(uintptr_t)arg;
+    struct wait_entry entries[2] = {0};
+    struct wait_queue early_wait = {0};
+    uint64_t status;
+
+    check(wait_queue_prepare_locked(&early_wait, &entries[0]) == -1,
+          "wait registration accepted enabled IRQs");
+    status = local_irq_save();
+
+    check(wait_queue_wait_locked() == -1, "slept without a registration");
+    /* Already-ready conditions finish without calling schedule(). */
+    check(wait_queue_prepare_locked(&early_wait, &entries[0]) == 0 &&
+          wait_queue_prepare_locked(&early_wait, &entries[1]) == 0,
+          "prepare immediate condition");
+    wait_queue_finish_locked(&entries[0]);
+    wait_queue_finish_locked(&entries[1]);
+    check(thread_current()->state == THREAD_RUNNING && early_wait.head == 0 &&
+          thread_current()->wait_entries == 0, "ready condition left task waiting");
+    /* A producer can notify after prepare but before schedule. No self-enqueue. */
+    check(wait_queue_prepare_locked(&early_wait, &entries[0]) == 0,
+          "prepare early wake");
+    wait_queue_wake_one(&early_wait);
+    check(thread_current()->state == THREAD_RUNNING &&
+          wait_queue_wait_locked() == 0, "early wake put current task on run queue");
+    wait_queue_finish_locked(&entries[0]);
+
+    while (!multi_ready[0] && !multi_ready[1]) {
+        check(wait_queue_prepare_locked(&multi_wait[id & 1], &entries[id & 1]) == 0 &&
+              wait_queue_prepare_locked(&multi_wait[(id & 1) ^ 1], &entries[(id & 1) ^ 1]) == 0,
+              "prepare two-resource wait");
+        check(wait_queue_prepare_locked(&multi_wait[0], &entries[0]) == -1,
+              "duplicate wait entry linked twice");
+        check(wait_queue_wait_locked() == 0 && !local_irqs_enabled(),
+              "multi wait failed or reopened IRQs");
+        /* Finish in fixed order, independent of registration order. */
+        wait_queue_finish_locked(&entries[0]);
+        wait_queue_finish_locked(&entries[1]);
+        wait_queue_finish_locked(&entries[0]);
+        check(thread_current()->wait_entries == 0 &&
+              thread_current()->state == THREAD_RUNNING, "multi wait cleanup");
+        multi_rechecks++;
+    }
+    multi_resumed++;
+    local_irq_restore(status);
+}
+
+static void multi_producer(void *arg)
+{
+    struct thread *target;
+    uint64_t status;
+    (void)arg;
+
+    status = local_irq_save();
+    check_wait_links(&multi_wait[0], 3);
+    check_wait_links(&multi_wait[1], 3);
+    target = thread_test_find(multi_tids[multi_cancel]);
+    check(target && target->state == THREAD_WAITING && target->wait_entries &&
+          target->wait_entries->task_next, "task lost its second registration");
+
+    if (multi_wake_before_stop) {
+        wait_queue_wake_all(&multi_wait[0]);
+        check(target->state == THREAD_RUNNABLE, "target not woken before stop");
+    }
+    check(thread_stop_tid(target->tid, 0) == 0, "stop multi-resource waiter");
+    thread_reap_zombies();
+    check(thread_test_find(multi_tids[multi_cancel]) == 0, "multi waiter not reclaimed");
+    check_wait_links(&multi_wait[0], 2);
+    check_wait_links(&multi_wait[1], 2);
+
+    /* Both sources notify before either survivor resumes. Enqueue each once. */
+    wait_queue_wake_all(&multi_wait[0]);
+    wait_queue_wake_all(&multi_wait[1]);
+    wait_queue_wake_all(&multi_wait[0]);
+    local_irq_restore(status);
+    thread_yield();
+    check(multi_resumed == 0 && multi_rechecks == 2,
+          "spurious multi wake skipped recheck or scheduled a task twice");
+
+    status = local_irq_save();
+    check_wait_links(&multi_wait[0], 2);
+    check_wait_links(&multi_wait[1], 2);
+    /* Alternate which resource becomes ready; either queue can wake them. */
+    multi_ready[multi_cancel & 1] = 1;
+    wait_queue_wake_one(&multi_wait[multi_cancel & 1]);
+    wait_queue_wake_one(&multi_wait[multi_cancel & 1]);
+    wait_queue_wake_one(&multi_wait[(multi_cancel & 1) ^ 1]);
+    local_irq_restore(status);
+}
+
+static void exiting_waiter(void *arg)
+{
+    struct wait_entry entries[2] = {0};
+    (void)arg;
+
+    (void)local_irq_save();
+    check(wait_queue_prepare_locked(&multi_wait[0], &entries[0]) == 0 &&
+          wait_queue_prepare_locked(&multi_wait[1], &entries[1]) == 0,
+          "prepare exiting wait owner");
+    /* thread_exit must cancel these nodes while their stack is still live. */
+    thread_exit();
+}
+
+static void test_multi_resource_waits(void)
+{
+    for (multi_wake_before_stop = 0; multi_wake_before_stop < 2; multi_wake_before_stop++) {
+        for (multi_cancel = 0; multi_cancel < 3; multi_cancel++) {
+            check(!thread_has_live_workers(), "multi fixture has live workers");
+            heap_used = 0;
+            multi_ready[0] = multi_ready[1] = 0;
+            multi_resumed = multi_rechecks = 0;
+            for (unsigned int i = 0; i < 3; i++) {
+                multi_tids[i] = thread_create_kernel(multi_waiter, (void *)(uintptr_t)i);
+                check(multi_tids[i] > 0, "create multi-resource waiter");
+            }
+            check(thread_create_kernel(multi_producer, 0) > 0, "create multi producer");
+            thread_run_until_idle();
+            check(multi_resumed == 2 && multi_rechecks == 4 && !thread_has_live_workers(),
+                  "multi-resource condition or duplicate enqueue failure");
+            check_wait_links(&multi_wait[0], 0);
+            check_wait_links(&multi_wait[1], 0);
+        }
+    }
+    heap_used = 0;
+    check(thread_create_kernel(exiting_waiter, 0) > 0, "create exiting wait owner");
+    thread_run_until_idle();
+    check_wait_links(&multi_wait[0], 0);
+    check_wait_links(&multi_wait[1], 0);
+    puts_raw("[REGRESSION] multi-resource wait, early/spurious/duplicate wake and full cancellation: PASS\n");
+}
+
+/* Use literal numbers so a shared, incorrectly renumbered header cannot make
+ * both sides of the test agree on the wrong ABI.
+ */
+static void test_syscall_abi(void)
+{
+    const unsigned int reserved[] = {5, 8, 9, 10, 11, 12};
+    struct thread *idle = thread_current();
+    struct thread *parent;
+    struct thread *child;
+    struct thread *sibling;
+    uintptr_t stack;
+    int tid;
+
+    check(!thread_has_runnable_tasks(), "ABI fixture has live workers");
+    heap_used = 0;
+    stack = (uintptr_t)kmalloc(USER_STACK_SIZE);
+    tid = user_process_create(USER_CODE_BASE, stack, stack + USER_STACK_SIZE);
+    parent = thread_test_find(tid);
+    check(parent != 0, "create ABI parent");
+    sched_test_set_current(parent);
+
+    parent->tc->a7 = 0;
+    handle_user_ecall(parent->tc);
+    check(parent->tc->a0 == (uint64_t)tid, "lab getpid number");
+    for (unsigned int nr = 1; nr <= 2; nr++) {
+        parent->tc->a7 = nr;
+        parent->tc->a0 = parent->tc->a1 = 0;
+        handle_user_ecall(parent->tc);
+        check(parent->tc->a0 == 0, "lab zero-length UART syscall numbers");
+    }
+    parent->tc->a7 = 3;
+    parent->tc->a0 = 0;
+    handle_user_ecall(parent->tc);
+    check((long)parent->tc->a0 == -1, "lab exec rejected null path");
+
+    parent->tc->a7 = 4;
+    handle_user_ecall(parent->tc);
+    child = thread_test_find((int32_t)parent->tc->a0);
+    check(child && child->tgid != parent->tgid && child->tc->a0 == 0,
+          "lab fork number or child return");
+    parent->tc->a7 = 7;
+    parent->tc->a0 = child->tgid;
+    handle_user_ecall(parent->tc);
+    check(parent->tc->a0 == 0 && child->state == THREAD_ZOMBIE &&
+          parent->state == THREAD_RUNNING, "lab stop number");
+
+    for (unsigned int i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++) {
+        uint64_t pc = parent->tc->sepc;
+
+        parent->tc->a7 = reserved[i];
+        parent->tc->a0 = USER_CODE_BASE;
+        parent->tc->a1 = parent->user_stack_base;
+        parent->tc->a2 = USER_CODE_BASE + 4;
+        handle_user_ecall(parent->tc);
+        check((long)parent->tc->a0 == -1 && parent->tc->sepc == pc + 4 &&
+              parent->state == THREAD_RUNNING && thread_user_group_size(parent) == 1,
+              "reserved lab call executed a P1 extension or exited the caller");
+    }
+    parent->tc->a7 = 13;
+    handle_user_ecall(parent->tc);
+    check(parent->tc->a0 == (uint64_t)tid, "gettid extension number");
+    parent->tc->a7 = 14;
+    parent->tc->a0 = USER_CODE_BASE;
+    parent->tc->a1 = parent->user_stack_base;
+    parent->tc->a2 = USER_CODE_BASE + 4;
+    handle_user_ecall(parent->tc);
+    sibling = thread_test_find((int32_t)parent->tc->a0);
+    check(sibling && sibling->tgid == parent->tgid, "thread-create extension number");
+    sched_test_set_current(sibling);
+    sibling->tc->a7 = 15;
+    sibling->tc->a0 = 23;
+    handle_user_ecall(sibling->tc);
+    check(sibling->state == THREAD_ZOMBIE && sibling->exit_status == 23 &&
+          parent->state == THREAD_RUNNING, "thread exit terminated its process");
+    sched_test_set_current(parent);
+    tid = thread_create_user(USER_CODE_BASE, 0, USER_CODE_BASE + 4);
+    sibling = thread_test_find(tid);
+    check(sibling != 0, "create process-exit sibling");
+    parent->tc->a7 = 6;
+    parent->tc->a0 = 42;
+    handle_user_ecall(parent->tc);
+    check(parent->state == THREAD_ZOMBIE && sibling->state == THREAD_ZOMBIE &&
+          parent->exit_status == 42 && sibling->exit_status == 42,
+          "lab exit failed to terminate the whole process");
+    sched_test_set_current(idle);
+    thread_run_until_idle();
+    check(!thread_has_runnable_tasks() && !thread_user_image_busy(0), "ABI cleanup");
+    puts_raw("[REGRESSION] literal Lab 5 syscall ABI, reserved calls and process/thread exit: PASS\n");
+}
+
 static void test_user_groups(void)
 {
     struct thread *idle = thread_current();
@@ -754,6 +1083,11 @@ void regression_main(void)
         }
     }
     puts_raw("[REGRESSION] kernel demo allocation-failure rollback (6 + 6 positions): PASS\n");
+    test_resource_waits();
+    test_multi_resource_waits();
+    test_uart_waits();
+    puts_raw("[REGRESSION] UART RX/TX sleepers, cancellation, syscall IRQ state and expired shared buffers: PASS\n");
+    test_syscall_abi();
     test_user_groups();
 
     supervisor_roundtrip();
@@ -800,19 +1134,20 @@ void regression_main(void)
     {
         const char *error = test_uart_races();
         check(error == 0, error);
-        puts_raw("[REGRESSION] UART RX/TX IRQ interleaving, polling handoff and FIFO order: PASS\n");
+        puts_raw("[REGRESSION] UART deferred-only RX, budget/rearm, IRQ-only TX and RX/TX races: PASS\n");
     }
 
     asm volatile("csrci sstatus, 2" ::: "memory");
-    uart_test_async(1);
+    uart_test_set_irq_enabled(1);
     puts_raw("[REGRESSION] UART masked read ready\n");
     check(uart_recv() == 'Z', "UART masked read failed");
     check(demo_uart_test_marker(UINT64_MAX) == 0,
           "maximum UART marker did not fit");
-    check(uart_test_tx_count() == 26, "UART marker length");
+    check(uart_test_tx_count() == sizeof("\r\n[T18446744073709551615]\r\n") - 1U,
+          "UART marker length before the first TX interrupt");
     uart_tx_wait_idle();
     check(uart_test_tx_count() == 0, "UART IRQ-off flush stalled");
-    uart_test_async(0);
+    uart_test_set_irq_enabled(0);
     puts_raw("[REGRESSION] UART masked hardware RX/TX flush/64-bit marker: PASS\n");
 
     tc = (struct trap_context *)(user_kstack + sizeof(user_kstack) - TRAP_CONTEXT_ALLOC_SIZE);

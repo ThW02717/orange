@@ -76,6 +76,7 @@ static long sys_uart_write(const char *buf, long count)
     struct thread *task = current_user_task();
     uint64_t sstatus;
     long i;
+    long ret;
 
     if (task == 0 || count < 0) {
         return -1;
@@ -84,20 +85,32 @@ static long sys_uart_write(const char *buf, long count)
         return -1;
     }
     sstatus = local_irq_save();
+    /* UART may block on its ring. IRQs must be able to service that wait. */
+    local_irq_enable();
     for (i = 0; i < count; i++) {
-        if (buf[i] == '\n') {
+        char c;
+
+        /* A previous byte may have slept while a sibling owning buf exited. */
+        if (!user_range_ok(task, (uintptr_t)(buf + i), 1, 0))
+            break;
+        c = buf[i];
+        if (c == '\n') {
             uart_send('\r');
         }
-        uart_send(buf[i]);
+        uart_send(c);
     }
+    ret = (i != 0 || count == 0) ? i : -1;
+    local_irq_disable();
     local_irq_restore(sstatus);
-    return count;
+    return ret;
 }
 
 static long sys_uart_read(char *buf, long count)
 {
     struct thread *task = current_user_task();
+    uint64_t status;
     long i;
+    long ret;
 
     if (task == 0 || count < 0) {
         return -1;
@@ -105,10 +118,20 @@ static long sys_uart_read(char *buf, long count)
     if (!user_range_ok(task, (uintptr_t)buf, (uint64_t)count, 1)) {
         return -1;
     }
+    status = local_irq_save();
+    local_irq_enable();
     for (i = 0; i < count; i++) {
-        buf[i] = uart_recv();
+        char c = uart_recv();
+
+        /* The buffer owner can exit while this reader sleeps. */
+        if (!user_range_ok(task, (uintptr_t)(buf + i), 1, 1))
+            break;
+        buf[i] = c;
     }
-    return count;
+    ret = (i != 0 || count == 0) ? i : -1;
+    local_irq_disable();
+    local_irq_restore(status);
+    return ret;
 }
 
 static long sys_exec(const char *path, struct trap_context *tc)
@@ -326,10 +349,10 @@ void handle_user_ecall(struct trap_context *tc)
     case SYS_fork:
         ret = sys_fork(tc);
         break;
-    case SYS_exit:
+    case SYS_thread_exit:
         thread_mark_current_zombie((int)tc->a0);
         return;
-    case SYS_exit_group:
+    case SYS_exit:
         ret = thread_stop_process((int32_t)sys_getpid(), (int)tc->a0);
         if (ret == 0) {
             return;

@@ -43,7 +43,7 @@ def main() -> int:
                    ROOT / "tests/uart_race.c",
                    args.trap_source]
         sources += [ROOT / "kernel/src" / name for name in (
-            "switch_to.S", "context_layout.c", "thread.c", "sched.c", "user.c",
+            "switch_to.S", "context_layout.c", "thread.c", "sched.c", "wait.c", "user.c",
             "syscall.c", "trap.c", "exec.c", "demo.c", "demo_uart.c", "trace.c",
             "timer.c", "bottom_half.c", "custom_work.c", "ringbuf.c", "sbi.c", "string.c", "plic.c",
         )]
